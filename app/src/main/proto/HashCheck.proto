@@ -1,0 +1,16 @@
+syntax = "proto3";
+package gphotos;
+option java_package = "gphotos";
+option java_outer_classname = "HashCheckOuterClass";
+
+message HashCheck {
+  message Field1Type {
+    message InnerField1Type {
+      bytes sha1_hash = 1;
+    }
+    InnerField1Type field1 = 1;
+    message InnerField2Type {}
+    InnerField2Type field2 = 2;
+  }
+  Field1Type field1 = 1;
+}

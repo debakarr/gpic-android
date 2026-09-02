@@ -1,0 +1,9 @@
+syntax = "proto3";
+package gphotos;
+option java_package = "gphotos";
+option java_outer_classname = "CommitTokenOuterClass";
+
+message CommitToken {
+  int64 field1 = 1;
+  bytes field2 = 2;
+}

@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.GPic" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/gpic_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@color/gpic_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

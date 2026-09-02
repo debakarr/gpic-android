@@ -1,0 +1,31 @@
+syntax = "proto3";
+package gphotos;
+option java_package = "gphotos";
+option java_outer_classname = "RemoteMatchesOuterClass";
+
+// Renamed nested types to avoid Java duplicate class names – wire format unchanged.
+message RemoteMatches {
+  message RMField1Type {
+    message RMField2Type {
+      message RMField1Inner {
+        bytes sha1_hash = 1;
+      }
+      RMField1Inner field1 = 1;
+      message RMField2Inner {
+        string media_key = 1;
+        message RMField6Type {
+          string media_key = 1;
+          message RMField2SubType {
+            string field1 = 1;
+            string field3 = 3;
+          }
+          RMField2SubType field2 = 2;
+        }
+        RMField6Type field6 = 6;
+      }
+      RMField2Inner field2 = 2;
+    }
+    RMField2Type field2 = 2;
+  }
+  RMField1Type field1 = 1;
+}

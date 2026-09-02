@@ -1,0 +1,20 @@
+syntax = "proto3";
+package gphotos;
+option java_package = "gphotos";
+option java_outer_classname = "AddMediaToAlbumOuterClass";
+
+message AddMediaToAlbum {
+  repeated string media_keys = 1;
+  string album_media_key = 2;
+  message Field5Type {
+    int64 field1 = 1;
+  }
+  Field5Type field5 = 5;
+  message Field6Type {
+    string model = 3;
+    string make = 4;
+    int64 android_api_version = 5;
+  }
+  Field6Type device_info = 6;
+  int64 timestamp = 7;
+}

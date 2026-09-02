@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+
+# Android Studio
+.idea/
+*.jks
+*.keystore
+!app/debug.keystore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Upload cache
+*.apk
+!debug.keystore
+
+# Env
+.env
