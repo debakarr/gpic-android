@@ -1,0 +1,33 @@
+syntax = "proto3";
+package gphotos;
+option java_package = "gphotos";
+option java_outer_classname = "CommitUploadOuterClass";
+option java_multiple_files = false;
+
+message CommitUpload {
+  message Field1Type {
+    message InnerField1Type {
+      int64 field1 = 1;
+      bytes field2 = 2;
+    }
+    InnerField1Type field1 = 1;
+    string file_name = 2;
+    bytes sha1_hash = 3;
+    message Field4Type {
+      int64 file_last_modified_timestamp = 1;
+      int64 field2 = 2;
+    }
+    Field4Type field4 = 4;
+    int64 quality = 7;
+    int64 field10 = 10;
+    int64 field17 = 17;
+  }
+  Field1Type field1 = 1;
+  message Field2Type {
+    string model = 3;
+    string make = 4;
+    int64 android_api_version = 5;
+  }
+  Field2Type field2 = 2;
+  bytes field3 = 3;
+}

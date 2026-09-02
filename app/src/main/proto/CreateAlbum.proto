@@ -1,0 +1,27 @@
+syntax = "proto3";
+package gphotos;
+option java_package = "gphotos";
+option java_outer_classname = "CreateAlbumOuterClass";
+
+message CreateAlbum {
+  string album_name = 1;
+  int64 timestamp = 2;
+  int64 field3 = 3;
+  message Field4Type {
+    message Field1Type {
+      string media_key = 1;
+    }
+    Field1Type field1 = 1;
+  }
+  repeated Field4Type media_keys = 4;
+  message Field7Type {
+    int64 field1 = 1;
+  }
+  Field7Type field7 = 7;
+  message Field8Type {
+    string model = 3;
+    string make = 4;
+    int64 android_api_version = 5;
+  }
+  Field8Type device_info = 8;
+}

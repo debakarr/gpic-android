@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Generic MTP device filter: DJI Action 4 advertises as still image / MTP -->
+    <!-- VendorId for DJI is 0x2ca3 (11427). ProductId varies – catch all when empty. -->
+    <usb-device />
+</resources>
