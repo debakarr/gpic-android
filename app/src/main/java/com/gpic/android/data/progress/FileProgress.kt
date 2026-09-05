@@ -4,7 +4,7 @@ package com.gpic.android.data.progress
  * Port of gphotos/progress.py FileProgress
  */
 enum class UploadStatus {
-    PENDING, HASHING, CHECKING, UPLOADING, RESUMING, COMMITTING, COMPLETED, ERROR, SKIPPED, QUEUED
+    PENDING, PREPARING, HASHING, CHECKING, UPLOADING, RESUMING, COMMITTING, COMPLETED, ERROR, SKIPPED, QUEUED
 }
 
 data class FileProgress(
@@ -35,6 +35,7 @@ data class FileProgress(
         get() = when (status) {
             UploadStatus.PENDING -> "Queued"
             UploadStatus.QUEUED -> "Queued"
+            UploadStatus.PREPARING -> "Preparing"
             UploadStatus.HASHING -> "Hashing"
             UploadStatus.CHECKING -> "Checking"
             UploadStatus.UPLOADING -> "Uploading"
@@ -47,22 +48,26 @@ data class FileProgress(
 }
 
 class ProgressTracker {
-    private val _files = mutableMapOf<String, FileProgress>()
+    private val _files = java.util.concurrent.ConcurrentHashMap<String, FileProgress>()
     val files: Map<String, FileProgress> get() = _files
 
-    var totalFiles: Int = 0
+    @Volatile var totalFiles: Int = 0
         private set
-    var totalBytes: Long = 0L
+    @Volatile var totalBytes: Long = 0L
         private set
-    var completed: Int = 0
-    var failed: Int = 0
-    var skipped: Int = 0
+    @Volatile var completed: Int = 0
+        private set
+    @Volatile var failed: Int = 0
+        private set
+    @Volatile var skipped: Int = 0
+        private set
 
     val doneCount: Int get() = completed + failed + skipped
 
     val overallPercentage: Float
         get() = if (totalFiles == 0) 0f else (doneCount.toFloat() / totalFiles.toFloat()) * 100f
 
+    @Synchronized
     fun addFile(filePath: String, fileSize: Long) {
         val name = filePath.substringAfterLast("/").substringAfterLast("\\")
         _files[filePath] = FileProgress(filePath = filePath, fileName = name, totalBytes = fileSize)
@@ -72,6 +77,19 @@ class ProgressTracker {
 
     fun get(filePath: String): FileProgress = _files[filePath]!!
 
+    /**
+     * Deep-copy snapshot for StateFlow emission.
+     * Required because FileProgress is mutable: emitting a shallow toMap()
+     * shares the same object refs, so StateFlow's structural-equality check
+     * sees old == new and drops the update (UI stuck at "Queued").
+     */
+    fun snapshot(): Map<String, FileProgress> = _files.mapValues { (_, v) -> v.copy() }
+
+    @Synchronized fun incCompleted() { completed++ }
+    @Synchronized fun incFailed() { failed++ }
+    @Synchronized fun incSkipped() { skipped++ }
+
+    @Synchronized
     fun reset() {
         _files.clear()
         totalFiles = 0; totalBytes = 0; completed = 0; failed = 0; skipped = 0

@@ -14,11 +14,11 @@ import com.gpic.android.data.progress.UploadStatus
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.io.FileOutputStream
-import java.security.MessageDigest
 import java.util.Base64
-import java.util.concurrent.Semaphore
 import kotlin.coroutines.cancellation.CancellationException
 
 /**
@@ -49,6 +49,16 @@ class UploadManager(
     val progressFlow: StateFlow<Map<String, FileProgress>> = _progressFlow
 
     @Volatile private var cancelled = false
+
+    /**
+     * Snapshot tracker into StateFlow with deep copies.
+     * Must copy each FileProgress: FileProgress is mutable, so a shallow
+     * toMap() shares object refs and StateFlow's equality check treats
+     * old == new and drops the emission (UI stuck at "Queued").
+     */
+    private fun emitProgress() {
+        _progressFlow.value = progress.snapshot()
+    }
 
     sealed class UploadEvent {
         data class FileProgressEvent(val fp: FileProgress): UploadEvent()
@@ -100,7 +110,7 @@ class UploadManager(
         _results.clear()
         progress.reset()
         files.forEach { f -> progress.addFile(f.uri?.toString() ?: f.file?.absolutePath ?: f.displayName, f.sizeBytes) }
-        _progressFlow.value = progress.files.toMap()
+        emitProgress()
         _events.value = UploadEvent.BatchStart(progress.totalFiles, progress.totalBytes)
 
         api = GooglePhotosApi(
@@ -113,32 +123,37 @@ class UploadManager(
         val effectiveThreads = if (threads <= 0) autoThreads(files) else threads
         Log.i("UploadManager","Starting ${files.size} files with $effectiveThreads threads force=$force")
 
-        // For large sets, process in parallel using semaphore within coroutineScope
+        // Non-blocking coroutine semaphore: each file runs in async + withPermit.
+        // (Old code used blocking java Semaphore.acquire() in the launch loop,
+        // which blocks the parent IO thread and serializes startup.)
         val semaphore = Semaphore(effectiveThreads)
         coroutineScope {
-            val jobs = mutableListOf<Job>()
-            for (djiFile in files) {
-                if (cancelled) break
-                semaphore.acquire()
-                val job = launch {
-                    try {
-                        val result = if (force) uploadForce(djiFile) else uploadWithHash(djiFile)
-                        synchronized(_results) { _results.add(result) }
-                        _events.value = UploadEvent.FileResult(result)
-                    } finally {
-                        semaphore.release()
-                        _progressFlow.value = progress.files.toMap()
+            val deferreds = files.map { djiFile ->
+                async {
+                    if (cancelled) return@async
+                    semaphore.withPermit {
+                        try {
+                            val result = if (force) uploadForce(djiFile) else uploadWithHash(djiFile)
+                            synchronized(_results) { _results.add(result) }
+                            _events.value = UploadEvent.FileResult(result)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.e("UploadManager", "job failed ${e.message}")
+                        } finally {
+                            emitProgress()
+                        }
                     }
                 }
-                jobs.add(job)
             }
-            jobs.forEach { job ->
-                try { job.join() } catch (e: CancellationException) {} catch (e: Exception) { Log.e("UploadManager","job failed ${e.message}") }
+            deferreds.forEach { d ->
+                try { d.await() } catch (e: CancellationException) {} catch (e: Exception) { Log.e("UploadManager","job failed ${e.message}") }
             }
         }
 
         // Album handling could be added here if needed
 
+        emitProgress()
         _events.value = UploadEvent.UploadDone
     }
 
@@ -150,25 +165,41 @@ class UploadManager(
         val fp = progress.get(key)
         val api = api!!
 
-        // Resolve file: copy SAF Uri to cache file if needed
-        val (file, tempFile) = resolveToFile(djiFile) ?: return UploadResult(key, djiFile.displayName, false, error = "Cannot open file")
+        // Show preparing BEFORE the (potentially slow, GB-scale) SAF -> cache copy,
+        // otherwise the file sits at "Queued" with no feedback during the copy.
+        fp.status = UploadStatus.PREPARING
+        fp.message = "Preparing…"
+        emitProgress()
+        val (file, tempFile) = resolveToFile(djiFile) ?: run {
+            fp.status = UploadStatus.ERROR
+            fp.message = "Cannot open file"
+            fp.error = "Cannot open file"
+            progress.incFailed()
+            emitProgress()
+            return UploadResult(key, djiFile.displayName, false, error = "Cannot open file")
+        }
 
         try {
             fp.status = UploadStatus.UPLOADING
             fp.message = "Requesting upload token…"
-            _progressFlow.value = progress.files.toMap()
+            emitProgress()
 
             val uploadId = api.getUploadTokenSkipHash(file.length())
 
             fp.message = "Uploading…"
             val sha1Out = mutableListOf<ByteArray>()
+            var lastEmit = 0L
             val commitToken = api.uploadFile(
                 file = file,
                 uploadId = uploadId,
                 fileSize = file.length(),
                 onProgress = { read, total ->
                     fp.updateBytes(read, total)
-                    _progressFlow.value = progress.files.toMap()
+                    val now = System.currentTimeMillis()
+                    if (now - lastEmit > 200) {
+                        lastEmit = now
+                        emitProgress()
+                    }
                 },
                 resumeOffset = 0,
                 computeHash = true,
@@ -176,15 +207,18 @@ class UploadManager(
             )
             val sha1 = sha1Out.firstOrNull() ?: api.calculateSha1(file)
             fp.bytesUploaded = file.length()
+            emitProgress()
 
             fp.status = UploadStatus.COMMITTING
             fp.message = "Finalizing…"
+            emitProgress()
             val mediaKey = api.commitUpload(commitToken, djiFile.displayName, sha1, (file.lastModified()/1000).toInt().toLong() + 0)
 
             fp.status = UploadStatus.COMPLETED
             fp.message = "Uploaded"
             fp.bytesUploaded = file.length()
-            progress.completed++
+            progress.incCompleted()
+            emitProgress()
 
             if (deleteAfter) tryDeleteOriginal(djiFile)
 
@@ -193,7 +227,8 @@ class UploadManager(
             fp.status = UploadStatus.ERROR
             fp.message = e.message ?: "Failed"
             fp.error = e.message
-            progress.failed++
+            progress.incFailed()
+            emitProgress()
             Log.e("UploadManager","Force upload failed ${djiFile.displayName}: ${e.message}", e)
             return UploadResult(key, djiFile.displayName, false, error = e.message ?: "Failed")
         } finally {
@@ -209,13 +244,23 @@ class UploadManager(
         val fp = progress.get(key)
         val api = api!!
 
-        val (file, tempFile) = resolveToFile(djiFile) ?: return UploadResult(key, djiFile.displayName, false, error="Cannot open file")
+        fp.status = UploadStatus.PREPARING
+        fp.message = "Preparing…"
+        emitProgress()
+        val (file, tempFile) = resolveToFile(djiFile) ?: run {
+            fp.status = UploadStatus.ERROR
+            fp.message = "Cannot open file"
+            fp.error = "Cannot open file"
+            progress.incFailed()
+            emitProgress()
+            return UploadResult(key, djiFile.displayName, false, error = "Cannot open file")
+        }
 
         try {
             // Phase 1: hash
             fp.status = UploadStatus.HASHING
             fp.message = "Calculating hash…"
-            _progressFlow.value = progress.files.toMap()
+            emitProgress()
             val sha1 = api.calculateSha1(file)
             val sha1B64 = Base64.getEncoder().encodeToString(sha1)
 
@@ -225,12 +270,13 @@ class UploadManager(
             if (!force) {
                 fp.status = UploadStatus.CHECKING
                 fp.message = "Checking if already backed up…"
-                _progressFlow.value = progress.files.toMap()
+                emitProgress()
                 val existingKey = api.findMediaByHash(sha1)
                 if (existingKey.isNotEmpty()) {
                     fp.status = UploadStatus.SKIPPED
                     fp.message = "Already in library"
-                    progress.skipped++
+                    progress.incSkipped()
+                    emitProgress()
                     if (deleteAfter) tryDeleteOriginal(djiFile)
                     return UploadResult(key, djiFile.displayName, true, existingKey, skipped = true)
                 }
@@ -257,13 +303,14 @@ class UploadManager(
                     fp.updateBytes(offset, fileSize)
                     val pct = if (fileSize>0) offset.toFloat()/fileSize.toFloat()*100f else 0f
                     fp.message = "Resuming from ${"%.1f".format(pct)}%"
+                    emitProgress()
                 }
             }
 
             if (uploadId == null && commitToken == null) {
                 fp.status = UploadStatus.UPLOADING
                 fp.message = "Requesting upload token…"
-                _progressFlow.value = progress.files.toMap()
+                emitProgress()
                 uploadId = api.getUploadToken(sha1B64, fileSize)
                 cache.set(key, uploadId, fileSize)
             }
@@ -271,6 +318,8 @@ class UploadManager(
             if (commitToken == null) {
                 if (fp.status != UploadStatus.RESUMING) fp.status = UploadStatus.UPLOADING
                 fp.message = "Uploading…"
+                emitProgress()
+                var lastEmit = 0L
                 commitToken = api.uploadFile(
                     file = file,
                     uploadId = uploadId!!,
@@ -280,23 +329,29 @@ class UploadManager(
                         if (fp.status == UploadStatus.RESUMING && read >= (fp.resumeOffset + 1024*1024)) {
                             fp.status = UploadStatus.UPLOADING
                         }
-                        _progressFlow.value = progress.files.toMap()
+                        val now = System.currentTimeMillis()
+                        if (now - lastEmit > 200) {
+                            lastEmit = now
+                            emitProgress()
+                        }
                     },
                     resumeOffset = resumeOffset ?: 0
                 )
                 fp.bytesUploaded = fileSize
+                emitProgress()
             }
 
             cache.remove(key)
 
             fp.status = UploadStatus.COMMITTING
             fp.message = "Finalizing…"
-            _progressFlow.value = progress.files.toMap()
+            emitProgress()
             val mediaKey = api.commitUpload(commitToken!!, djiFile.displayName, sha1, file.lastModified()/1000)
 
             fp.status = UploadStatus.COMPLETED
             fp.message = "Uploaded"
-            progress.completed++
+            progress.incCompleted()
+            emitProgress()
 
             if (deleteAfter) tryDeleteOriginal(djiFile)
 
@@ -306,7 +361,8 @@ class UploadManager(
         } catch (e: Exception) {
             fp.status = UploadStatus.ERROR
             fp.message = e.message ?: "Failed"
-            progress.failed++
+            progress.incFailed()
+            emitProgress()
             Log.e("UploadManager","Upload failed ${djiFile.displayName}: ${e.message}", e)
             return UploadResult(key, djiFile.displayName, false, error = e.message ?: "Failed")
         } finally {
@@ -322,7 +378,8 @@ class UploadManager(
         djiFile.file?.let { return it to null }
         val uri = djiFile.uri ?: return null
         return try {
-            val temp = File(context.cacheDir, "upload_${System.currentTimeMillis()}_${djiFile.displayName}")
+            val safeName = djiFile.displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            val temp = File(context.cacheDir, "upload_${System.nanoTime()}_${keyHash(uri.toString())}_$safeName")
             context.contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(temp).use { output ->
                     input.copyTo(output)
@@ -335,6 +392,11 @@ class UploadManager(
             Log.e("UploadManager","resolveToFile failed $uri: ${e.message}")
             null
         }
+    }
+
+    private fun keyHash(key: String): String {
+        // Short stable hash to disambiguate same displayName in different folders.
+        return key.hashCode().toUInt().toString(16)
     }
 
     private fun tryDeleteOriginal(djiFile: DjiFile) {
