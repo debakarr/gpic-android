@@ -118,7 +118,22 @@ class GooglePhotosApi(
         throw RuntimeException("[$endpoint] Request failed after ${retryConfig.maxRetries+1} attempts: $lastError")
     }
     private fun readPreview(resp: okhttp3.Response): String {
-        return try { resp.body?.bytes()?.take(800)?.toByteArray()?.let { String(it) } } catch (_: Exception) { "" } ?: ""
+        return try {
+            val bytes = resp.body?.bytes()?.take(800)?.toByteArray() ?: return ""
+            previewBytes(bytes)
+        } catch (_: Exception) { "" } ?: ""
+    }
+
+    private fun previewBytes(bytes: ByteArray): String {
+        if (bytes.isEmpty()) return ""
+        // Internal API errors are often protobuf/binary — String() shows as encrypted garbage.
+        // Show readable text when possible, else compact hex for copy/paste debugging.
+        val printable = bytes.count { it.toInt() in 32..126 || it.toInt() == 10 || it.toInt() == 13 } 
+        return if (printable * 100 / bytes.size > 70) {
+            String(bytes).take(500)
+        } else {
+            "bin:" + bytes.take(64).joinToString("") { "%02x".format(it) } + "...(${bytes.size}B)"
+        }
     }
 
     private fun isNonRetryable(e: Exception): Boolean {
@@ -324,7 +339,7 @@ class GooglePhotosApi(
 
         client.newCall(req).execute().use { resp ->
             if (resp.code >= 400) {
-                val preview = try { resp.body?.bytes()?.take(500)?.toByteArray()?.let { String(it) } } catch (_: Exception) { "" } ?: ""
+                val preview = try { resp.body?.bytes()?.take(800)?.toByteArray()?.let { previewBytes(it) } } catch (_: Exception) { "" } ?: ""
                 Log.e("GooglePhotosApi", "Stream upload failed ${resp.code}: $preview")
                 throw RuntimeException("Upload rejected (${resp.code}): $preview")
             }
@@ -442,7 +457,7 @@ class GooglePhotosApi(
 
         client.newCall(req).execute().use { resp ->
             if (resp.code >= 400) {
-                val preview = resp.body?.bytes()?.take(500)?.joinToString("") { it.toInt().toChar().toString() } ?: ""
+                val preview = try { resp.body?.bytes()?.take(800)?.toByteArray()?.let { previewBytes(it) } } catch (_: Exception) { "" } ?: ""
                 Log.e("GooglePhotosApi","Upload failed ${resp.code}: $preview")
                 throw RuntimeException("Upload rejected (${resp.code}): $preview")
             }
