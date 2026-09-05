@@ -138,6 +138,18 @@ class UploadManager(
         _events.value = UploadEvent.UploadDone
     }
 
+    private fun authService(): String {
+        return try {
+            credential.authString.split("&").firstOrNull { it.startsWith("service=") }?.substringAfter("=")?.let { java.net.URLDecoder.decode(it, "UTF-8") } ?: "(none)"
+        } catch (_: Exception) { "(unknown)" }
+    }
+
+    private fun hint403(base: String?, phase: String): String {
+        val b = base ?: "Failed"
+        if (!b.contains("403")) return b
+        return b + " | 403 Forbidden at " + phase + " (service=" + authService() + "). Bearer OK but scope denied: re-copy FULL Photos line with photos.native service, reopen Photos, retry."
+    }
+
     private fun openStreamFor(djiFile: DjiFile): () -> java.io.InputStream {
         val uri = djiFile.uri ?: throw RuntimeException("No Uri for ${djiFile.displayName}")
         return {
@@ -249,7 +261,7 @@ class UploadManager(
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             fp.status = UploadStatus.ERROR
-            fp.message = e.message ?: "Failed"
+            fp.message = hint403(e.message, fp.status.name)
             fp.error = e.message
             progress.incFailed()
             emitProgress()
@@ -309,7 +321,7 @@ class UploadManager(
         } catch (e: Exception) {
             if (e is CancellationException) throw e
             fp.status = UploadStatus.ERROR
-            fp.message = e.message ?: "Failed"
+            fp.message = hint403(e.message, fp.status.name)
             fp.error = e.message
             progress.incFailed()
             emitProgress()
@@ -471,7 +483,7 @@ class UploadManager(
             throw e
         } catch (e: Exception) {
             fp.status = UploadStatus.ERROR
-            fp.message = e.message ?: "Failed"
+            fp.message = hint403(e.message, fp.status.name)
             progress.incFailed()
             emitProgress()
             Log.e("UploadManager","Upload failed ${djiFile.displayName}: ${e.message}", e)
@@ -582,7 +594,7 @@ class UploadManager(
             throw e
         } catch (e: Exception) {
             fp.status = UploadStatus.ERROR
-            fp.message = e.message ?: "Failed"
+            fp.message = hint403(e.message, fp.status.name)
             progress.incFailed()
             emitProgress()
             return UploadResult(key, djiFile.displayName, false, error = e.message ?: "Failed")

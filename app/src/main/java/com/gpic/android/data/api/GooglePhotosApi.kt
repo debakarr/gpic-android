@@ -71,6 +71,7 @@ class GooglePhotosApi(
         url: String,
         data: ByteArray,
         extraHeaders: Map<String, String> = emptyMap(),
+        endpoint: String = "request",
     ): okhttp3.Response {
         val headers = mutableMapOf(
             "Content-Type" to "application/x-protobuf",
@@ -92,35 +93,53 @@ class GooglePhotosApi(
                 val resp = client.newCall(req).execute()
                 if (resp.isSuccessful) return resp
                 val code = resp.code
-                val bodyPreview = resp.body?.bytes()?.take(500)?.toByteArray()?.let { String(it) } ?: ""
+                val bodyPreview = readPreview(resp)
                 resp.close()
                 if (!shouldRetry(code)) {
-                    throw RuntimeException("Request failed $code: $bodyPreview")
+                    throw RuntimeException("[$endpoint] Request failed $code: $bodyPreview")
                 }
-                lastError = RuntimeException("HTTP $code: $bodyPreview")
+                lastError = RuntimeException("[$endpoint] HTTP $code: $bodyPreview")
                 if (attempt < retryConfig.maxRetries) {
                     val delay = calculateBackoff(attempt, retryConfig)
-                    Log.i("GooglePhotosApi", "Retrying $url in ${delay}ms attempt ${attempt+2}")
+                    Log.i("GooglePhotosApi", "Retrying [$endpoint] $url in ${delay}ms attempt ${attempt+2}")
                     Thread.sleep(delay)
                 }
             } catch (e: Exception) {
                 lastError = e
-                if (e is RuntimeException && e.message?.contains("HTTP") == true && !shouldRetry(
-                    // couldn't parse code, don't retry on our RuntimeExceptions with HTTP?
-                    500
-                )) {
-                    // but we already checked
-                }
-                // For network errors, retry
+                if (isNonRetryable(e as? Exception ?: RuntimeException(e.toString()))) throw e
+                // Network errors / 5xx / 429 retry; 4xx already rethrown above
                 if (attempt < retryConfig.maxRetries) {
                     val delay = calculateBackoff(attempt, retryConfig)
-                    Log.i("GooglePhotosApi", "Retrying due to ${e.message} in ${delay}ms")
+                    Log.i("GooglePhotosApi", "Retrying [$endpoint] due to ${e.message} in ${delay}ms")
                     Thread.sleep(delay)
                 }
             }
         }
-        throw RuntimeException("Request failed after ${retryConfig.maxRetries+1} attempts: $lastError")
+        throw RuntimeException("[$endpoint] Request failed after ${retryConfig.maxRetries+1} attempts: $lastError")
     }
+    private fun readPreview(resp: okhttp3.Response): String {
+        return try { resp.body?.bytes()?.take(800)?.toByteArray()?.let { String(it) } } catch (_: Exception) { "" } ?: ""
+    }
+
+    private fun isNonRetryable(e: Exception): Boolean {
+        val m = e.message ?: return false
+        var code: Int? = null
+        var idx = m.indexOf("Request failed ")
+        if (idx >= 0) {
+            val num = m.substring(idx + 15).trim().take(3)
+            code = num.toIntOrNull()
+        }
+        if (code == null) {
+            idx = m.indexOf("Upload rejected (")
+            if (idx >= 0) {
+                val num = m.substring(idx + 17).trim().take(3)
+                code = num.toIntOrNull()
+            }
+        }
+        if (code != null) return !shouldRetry(code)
+        return false
+    }
+
 
     fun getUploadToken(sha1B64: String, fileSize: Long): String {
         val msg = GetUploadTokenOuterClass.GetUploadToken.newBuilder()
@@ -130,7 +149,8 @@ class GooglePhotosApi(
         val resp = postProtoRaw(
             "https://photos.googleapis.com/data/upload/uploadmedia/interactive",
             msg.toByteArray(),
-            mapOf("X-Goog-Hash" to "sha1=$sha1B64", "X-Upload-Content-Length" to fileSize.toString())
+            mapOf("X-Goog-Hash" to "sha1=$sha1B64", "X-Upload-Content-Length" to fileSize.toString()),
+        endpoint = "getUploadToken"
         )
         resp.use {
             val id = it.header("X-GUploader-UploadID") ?: it.header("x-gUploader-uploadID")
@@ -147,7 +167,8 @@ class GooglePhotosApi(
         val resp = postProtoRaw(
             "https://photos.googleapis.com/data/upload/uploadmedia/interactive",
             msg.toByteArray(),
-            mapOf("X-Upload-Content-Length" to fileSize.toString())
+            mapOf("X-Upload-Content-Length" to fileSize.toString()),
+        endpoint = "getUploadToken"
         )
         resp.use {
             val id = it.header("X-GUploader-UploadID") ?: it.header("x-gUploader-uploadID")
@@ -185,10 +206,7 @@ class GooglePhotosApi(
                 return doUploadAttempt(file, uploadUrl, fileSize, onProgress, attemptOffset, computeHash, hashOut)
             } catch (e: Exception) {
                 lastError = e
-                val isHttp = e.message?.contains("HTTP") == true
-                // Determine if retryable – for now retry on IO / 5xx / 429
-                // e already handles HTTP non-retry shouldn't retry, but we treat all as retryable except if message contains 4xx?
-                if (e.message?.contains("Upload rejected") == true && e.message?.contains("400") == true) throw e
+                if (isNonRetryable(e as? Exception ?: RuntimeException(e.toString()))) throw e
                 if (attempt < retryConfig.maxRetries) {
                     val delay = calculateBackoff(attempt, retryConfig)
                     Log.i("GooglePhotosApi","Upload retry in ${delay}ms attempt ${attempt+2} due to ${e.message}")
@@ -230,7 +248,7 @@ class GooglePhotosApi(
                 return doUploadStreamAttempt(openStream, uploadUrl, fileSize, onProgress, attemptOffset, computeHash, hashOut)
             } catch (e: Exception) {
                 lastError = e
-                if (e.message?.contains("Upload rejected") == true && e.message?.contains("400") == true) throw e
+                if (isNonRetryable(e as? Exception ?: RuntimeException(e.toString()))) throw e
                 if (attempt < retryConfig.maxRetries) {
                     val delay = calculateBackoff(attempt, retryConfig)
                     Log.i("GooglePhotosApi", "Stream upload retry in ${delay}ms attempt ${attempt + 2} due to ${e.message}")
@@ -484,7 +502,8 @@ class GooglePhotosApi(
         val resp = postProtoRaw(
             "https://photosdata-pa.googleapis.com/6439526531001121323/16538846908252377752",
             msg.toByteArray(),
-            mapOf("x-goog-ext-173412678-bin" to "CgcIAhClARgC", "x-goog-ext-174067345-bin" to "CgIIAg==")
+            mapOf("x-goog-ext-173412678-bin" to "CgcIAhClARgC", "x-goog-ext-174067345-bin" to "CgIIAg=="),
+        endpoint = "commitUpload"
         )
         resp.use {
             val bytes = it.body?.bytes() ?: throw RuntimeException("Empty commit response")
@@ -510,7 +529,8 @@ class GooglePhotosApi(
             .build()
         val resp = postProtoRaw(
             "https://photosdata-pa.googleapis.com/6439526531001121323/5084965799730810217",
-            msg.toByteArray()
+            msg.toByteArray(),
+        endpoint = "hashCheck"
         )
         resp.use {
             val bytes = it.body?.bytes() ?: return ""
@@ -541,7 +561,8 @@ class GooglePhotosApi(
         val resp = postProtoRaw(
             "https://photosdata-pa.googleapis.com/6439526531001121323/8386163679468898444",
             msg.toByteArray(),
-            mapOf("x-goog-ext-173412678-bin" to "CgcIAhClARgC", "x-goog-ext-174067345-bin" to "CgIIAg==")
+            mapOf("x-goog-ext-173412678-bin" to "CgcIAhClARgC", "x-goog-ext-174067345-bin" to "CgIIAg=="),
+        endpoint = "createAlbum"
         )
         resp.use {
             val bytes = it.body?.bytes() ?: throw RuntimeException("Empty create album response")
@@ -564,7 +585,8 @@ class GooglePhotosApi(
         postProtoRaw(
             "https://photosdata-pa.googleapis.com/6439526531001121323/484917746253879292",
             msg.toByteArray(),
-            mapOf("x-goog-ext-173412678-bin" to "CgcIAhClARgC", "x-goog-ext-174067345-bin" to "CgIIAg==")
+            mapOf("x-goog-ext-173412678-bin" to "CgcIAhClARgC", "x-goog-ext-174067345-bin" to "CgIIAg=="),
+            endpoint = "addToAlbum"
         ).close()
     }
 
