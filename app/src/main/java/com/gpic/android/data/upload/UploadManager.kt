@@ -147,7 +147,9 @@ class UploadManager(
     private fun hint403(base: String?, phase: String): String {
         val b = base ?: "Failed"
         if (!b.contains("403")) return b
-        return b + " | 403 Forbidden at " + phase + " (service=" + authService() + "). Bearer OK but scope denied: re-copy FULL Photos line with photos.native service, reopen Photos, retry."
+        val svc = authService()
+        val extra = if (svc.contains("userinfo")) " You pasted the WRONG logcat line (Google login, not Photos). Filter logcat by photos.native." else if (!svc.contains("photos")) " Service does not look like Photos internal API." else ""
+        return b + " | 403 Forbidden at " + phase + " (service=" + svc + ")." + extra + " Bearer OK but scope denied: adb logcat | grep photos.native, reopen Photos, copy FULL androidId=...&service=... line, retry."
     }
 
     private fun openStreamFor(djiFile: DjiFile): () -> java.io.InputStream {
