@@ -8,6 +8,8 @@ import com.gpic.android.data.auth.CredentialStore
 import com.gpic.android.data.dji.DjiFile
 import com.gpic.android.data.dji.DjiScanner
 import com.gpic.android.data.progress.FileProgress
+import com.gpic.android.data.stats.LiveStats
+import com.gpic.android.data.stats.SystemStatsCollector
 import com.gpic.android.data.upload.UploadManager
 import com.gpic.android.data.upload.UploadResult
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +33,7 @@ data class HomeUiState(
     val skipped: Int = 0,
     val totalFiles: Int = 0,
     val totalBytes: Long = 0L,
+    val systemStats: LiveStats? = null,
 )
 
 class HomeViewModel(
@@ -43,6 +46,7 @@ class HomeViewModel(
     val state: StateFlow<HomeUiState> = _state.asStateFlow()
 
     private var uploadManager: UploadManager? = null
+    private var statsJob: kotlinx.coroutines.Job? = null
 
     init {
         refreshAuth()
@@ -116,10 +120,24 @@ class HomeViewModel(
                     )
                 }
             }
+            // Morphe-style live CPU/RAM/network while uploading
+            statsJob?.cancel()
+            statsJob = launch {
+                val collector = SystemStatsCollector(
+                    context,
+                    uploadedBytesProvider = {
+                        try { mgr.progress.files.values.sumOf { it.bytesUploaded } } catch (_: Exception) { 0L }
+                    }
+                )
+                collector.statsFlow().collect { s ->
+                    _state.value = _state.value.copy(systemStats = s)
+                }
+            }
             try {
                 mgr.start(files)
             } finally {
                 job.cancel()
+                statsJob?.cancel()
                 _state.value = _state.value.copy(uploadRunning = false)
             }
         }
@@ -127,6 +145,7 @@ class HomeViewModel(
 
     fun cancelUpload() {
         uploadManager?.cancel()
+        statsJob?.cancel()
         _state.value = _state.value.copy(uploadRunning = false)
     }
 }

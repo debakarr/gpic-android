@@ -10,6 +10,7 @@ Built as a direct port of the Python `gpic` desktop tool. Credit to [gotohp](htt
 - **Smart uploads**: concurrent uploads (auto-tuned), resumable via `Content-Range`, SHA-1 hash dedup (skips files already in your library), progress with speed/ETA, retry with exponential backoff.
 - **Auth via existing Google Photos**: uses the same `androidId=...&Email=...&Token=...` string you extract with `adb logcat` (see below). Stored in `EncryptedSharedPreferences`, never leaves the device except to Google's `android.googleapis.com/auth` and `photos.googleapis.com` endpoints.
 - **Human-friendly status**: every file shows Queued → Hashing → Checking (already backed up?) → Uploading/Resuming → Finalizing → Done / Already backed up / Failed. Overall stats and per-file progress bars make it obvious what's happening.
+- **Morphe-style live stats**: during upload shows CPU %, RAM used/total + app PSS, network ↑/↓ + app UID speeds, upload throughput, storage free, with sparklines (like Morphe Expert patching screen).
 
 ## Requirements
 
@@ -42,6 +43,7 @@ Alternative: copy `~/.config/gpic/config.json` from desktop and paste the `auth_
 5. **Upload** – FAB appears when files + auth are ready. Tap to start. Each file's card shows live percentage and status.
 6. If upload is interrupted, next run resumes from the last byte (persisted `upload_cache.json`, TTL 24h, plus server-side `Range` query).
 7. Skipped = `Already in library` (hash match). You can enable `Force re-upload` or `Delete after upload` in Settings.
+8. While uploading, a **Live** card shows CPU / RAM / network just like Morphe's patching screen: `Live • uploading 3/20` + `2.4 MB/s`, per-resource bars and tx/rx sparklines.
 
 ## Supported files
 
