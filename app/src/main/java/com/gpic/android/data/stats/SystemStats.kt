@@ -13,6 +13,8 @@ data class LiveStats(
     val appPssMb: Float = 0f,
     val storageAvailBytes: Long = 0L,
     val storageTotalBytes: Long = 0L,
+    val appCacheBytes: Long = 0L,
+    val appFilesBytes: Long = 0L,
     val lowMemory: Boolean = false,
     // device-wide network speeds
     val rxSpeedBps: Long = 0L,
@@ -31,8 +33,10 @@ data class LiveStats(
     val memHistory: List<Float> = emptyList(),
     val txHistory: List<Long> = emptyList(),
     val rxHistory: List<Long> = emptyList(),
+    val diskHistory: List<Float> = emptyList(),
 ) {
     val ramUsedBytes: Long get() = (ramTotalBytes - ramAvailBytes).coerceAtLeast(0)
     val ramPercent: Float get() = if (ramTotalBytes <= 0) 0f else ramUsedBytes.toFloat() / ramTotalBytes * 100f
     val storageUsedBytes: Long get() = (storageTotalBytes - storageAvailBytes).coerceAtLeast(0)
+    val storagePercent: Float get() = if (storageTotalBytes <= 0) 0f else storageUsedBytes.toFloat() / storageTotalBytes * 100f
 }

@@ -41,7 +41,64 @@ class DjiScanner(private val context: Context) {
         val doc = DocumentFile.fromTreeUri(context, treeUri) ?: return@withContext emptyList()
         val result = mutableListOf<DjiFile>()
         scanDocumentRecursive(doc, result)
-        result
+        // Smallest-first: quick wins first, avoids GB video head-of-line blocking.
+        result.sortedBy { it.sizeBytes }
+    }
+
+    /**
+     * Build DjiFile list from user-picked individual files (OpenMultipleDocuments).
+     * Queries display name + size via ContentResolver; filters by supported extensions.
+     * Returns smallest-first sorted list.
+     */
+    suspend fun filesFromUris(uris: List<Uri>): List<DjiFile> = withContext(Dispatchers.IO) {
+        val out = mutableListOf<DjiFile>()
+        for (uri in uris) {
+            try {
+                var name: String? = null
+                var size = 0L
+                var modified = 0L
+                // Try DocumentFile first (fast path for SAF Uris)
+                try {
+                    val doc = DocumentFile.fromSingleUri(context, uri)
+                    if (doc != null && doc.exists()) {
+                        name = doc.name
+                        size = doc.length()
+                        modified = doc.lastModified()
+                    }
+                } catch (_: Exception) {}
+                // Fallback to ContentResolver query (OpenableColumns + DocumentsContract)
+                if (name == null || size <= 0) {
+                    try {
+                        context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                            val nameIdx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                            val sizeIdx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                            val modIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                            if (c.moveToFirst()) {
+                                if (name == null && nameIdx >= 0) name = c.getString(nameIdx)
+                                if (size <= 0 && sizeIdx >= 0) size = c.getLong(sizeIdx)
+                                if (modified <= 0 && modIdx >= 0) {
+                                    try { modified = c.getLong(modIdx) } catch (_: Exception) {}
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+                val finalName = name ?: uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+                if (finalName.substringAfterLast('.', "").lowercase() !in DjiFile.supported) continue
+                if (size < 0) size = 0
+                out.add(DjiFile(displayName = finalName, sizeBytes = size, lastModified = modified, uri = uri))
+            } catch (_: Exception) {}
+        }
+        out.sortedBy { it.sizeBytes }
+    }
+
+    fun takePersistableFilePermission(uri: Uri) {
+        try {
+            val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            context.contentResolver.takePersistableUriPermission(uri, flags)
+        } catch (_: Exception) {
+            // Non-persistable Uris (e.g. from Downloads) still work for this session.
+        }
     }
 
     private fun scanDocumentRecursive(doc: DocumentFile, out: MutableList<DjiFile>) {
