@@ -200,7 +200,7 @@ private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progre
                     Icon(Icons.Default.Refresh, contentDescription = null)
                 }
             }
-            if (prog != null && (prog.status == UploadStatus.UPLOADING || prog.status == UploadStatus.RESUMING || prog.status == UploadStatus.HASHING || prog.status == UploadStatus.CHECKING)) {
+            if (prog != null && (prog.status == UploadStatus.UPLOADING || prog.status == UploadStatus.RESUMING || prog.status == UploadStatus.HASHING || prog.status == UploadStatus.CHECKING || prog.status == UploadStatus.PREPARING || prog.status == UploadStatus.COMMITTING)) {
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(progress = { prog.percentage / 100f }, modifier = Modifier.fillMaxWidth())
                 Text("${"%.1f".format(prog.percentage)}%", style = MaterialTheme.typography.labelSmall)
