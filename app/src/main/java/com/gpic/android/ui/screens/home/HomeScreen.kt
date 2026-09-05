@@ -17,6 +17,7 @@ import androidx.compose.ui.unit.dp
 import com.gpic.android.data.progress.UploadStatus
 import com.gpic.android.ui.components.StatusCard
 import com.gpic.android.ui.components.StatusCardState
+import com.gpic.android.ui.components.SystemStatsCard
 import com.gpic.android.util.formatSize
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -130,6 +131,18 @@ fun HomeScreen(
                             }
                         }
                     }
+                }
+            }
+
+            // 3b. Morphe-style live CPU / RAM / network during upload
+            if (state.uploadRunning || state.systemStats != null) {
+                item {
+                    SystemStatsCard(
+                        stats = state.systemStats,
+                        doneCount = state.completed + state.failed + state.skipped,
+                        totalFiles = state.totalFiles,
+                        isUploading = state.uploadRunning,
+                    )
                 }
             }
 
