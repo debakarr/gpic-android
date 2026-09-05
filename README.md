@@ -30,7 +30,7 @@ adb logcat | Select-String "auth"
 # Now open Google Photos on the phone – a line with androidId=...&Email=...&Token=... appears
 ```
 
-Copy the full line. In GPic Android: **Home → Link** (or Auth screen) → paste → Save. The app marks the account as `Active`. You can store multiple accounts and switch.
+Copy the FULL line *filtered by photos.native* (not userinfo). In GPic Android: **Home → Link** (or Auth screen) → paste → Save. The app marks the account as `Active`. You can store multiple accounts and switch.
 
 Alternative: copy `~/.config/gpic/config.json` from desktop and paste the `auth_string` value.
 
@@ -125,3 +125,20 @@ MIT – see desktop gpic.
 - Debug key SHA1 (this machine): `51:8D:06:60:D6:7A:D9:B0:1E:19:8C:8F:5E:DE:02:70:B7:83:2D:A4` (`~/.android/debug.keystore`, `androiddebugkey`).
 - Register BOTH debug + release SHA1 with package `com.gpic.android` in Google Cloud Console → APIs & Services → Credentials → OAuth client (Android). Mismatch → same UNREGISTERED error.
 - Release builds use `local.properties` `keystore.path/alias/password` if set, else unsigned; private releases ship debug APK (debug key above).
+
+## How to copy the RIGHT line (fixes 403 userinfo.profile)
+
+Your error `service=.../userinfo.profile` means you copied a Google-login line, not the Photos internal line. Do:
+
+```bash
+# Linux/Mac
+adb logcat -c
+adb logcat | grep -i "photos.native"
+# Windows (PowerShell)
+adb logcat -c
+adb logcat | Select-String "photos.native"
+```
+
+Then open Google Photos on the phone. Copy the line from `androidId=` to end — it must contain `service=oauth2:https://www.googleapis.com/auth/photos.native` (or similar `photos` scope). Paste in GPic → Auth → Save. The save screen now warns if `service=` doesn't contain `photos`.
+
+v1.3.4 also gunzips error bodies (was `bin:1f8b...` gzip magic) so 403 details are readable, and copy buttons remain for paste-back.

@@ -93,8 +93,13 @@ fun AuthScreen(
                 val cred = store.addCredential(raw)
                 if (cred != null) {
                     val svc = store.describeService(raw)
-                    message = "Saved for ${cred.email}. service=$svc Ready to upload."
-                    isError = false
+                    if (!svc.contains("photos")) {
+                        message = "Saved for ${cred.email} BUT service=$svc looks wrong (need photos.native). hashCheck will 403. Re-copy line filtered by photos.native." 
+                        isError = true
+                    } else {
+                        message = "Saved for ${cred.email}. service=$svc Ready to upload."
+                    }
+                    if (svc.contains("photos")) { isError = false }
                     authInput = ""
                 } else {
                     message = "Could not parse. Need androidId + Email + Token. Ensure you copied the FULL line including service=... (usually photos.native)."

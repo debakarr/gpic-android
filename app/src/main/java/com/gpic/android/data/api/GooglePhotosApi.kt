@@ -77,7 +77,6 @@ class GooglePhotosApi(
             "Content-Type" to "application/x-protobuf",
             "Authorization" to "Bearer ${bearer()}",
             "User-Agent" to userAgent,
-            "Accept-Encoding" to "gzip",
             "Accept-Language" to language,
         )
         headers.putAll(extraHeaders)
@@ -117,10 +116,17 @@ class GooglePhotosApi(
         }
         throw RuntimeException("[$endpoint] Request failed after ${retryConfig.maxRetries+1} attempts: $lastError")
     }
+    private fun gunzipMaybe(bytes: ByteArray): ByteArray {
+        if (bytes.size < 2 || bytes[0] != 0x1f.toByte() || bytes[1] != 0x8b.toByte()) return bytes
+        return try {
+            java.util.zip.GZIPInputStream(bytes.inputStream()).readBytes()
+        } catch (_: Exception) { bytes }
+    }
+
     private fun readPreview(resp: okhttp3.Response): String {
         return try {
-            val bytes = resp.body?.bytes()?.take(800)?.toByteArray() ?: return ""
-            previewBytes(bytes)
+            val raw = resp.body?.bytes()?.take(1200)?.toByteArray() ?: return ""
+            previewBytes(gunzipMaybe(raw))
         } catch (_: Exception) { "" } ?: ""
     }
 
@@ -339,7 +345,7 @@ class GooglePhotosApi(
 
         client.newCall(req).execute().use { resp ->
             if (resp.code >= 400) {
-                val preview = try { resp.body?.bytes()?.take(800)?.toByteArray()?.let { previewBytes(it) } } catch (_: Exception) { "" } ?: ""
+                val preview = try { resp.body?.bytes()?.take(1200)?.toByteArray()?.let { previewBytes(gunzipMaybe(it)) } } catch (_: Exception) { "" } ?: ""
                 Log.e("GooglePhotosApi", "Stream upload failed ${resp.code}: $preview")
                 throw RuntimeException("Upload rejected (${resp.code}): $preview")
             }
@@ -457,7 +463,7 @@ class GooglePhotosApi(
 
         client.newCall(req).execute().use { resp ->
             if (resp.code >= 400) {
-                val preview = try { resp.body?.bytes()?.take(800)?.toByteArray()?.let { previewBytes(it) } } catch (_: Exception) { "" } ?: ""
+                val preview = try { resp.body?.bytes()?.take(1200)?.toByteArray()?.let { previewBytes(gunzipMaybe(it)) } } catch (_: Exception) { "" } ?: ""
                 Log.e("GooglePhotosApi","Upload failed ${resp.code}: $preview")
                 throw RuntimeException("Upload rejected (${resp.code}): $preview")
             }
