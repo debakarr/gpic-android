@@ -3,8 +3,13 @@ package com.gpic.android.ui.screens.home
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -156,6 +161,23 @@ fun HomeScreen(
                                     Icon(Icons.Default.Stop, null); Spacer(Modifier.width(8.dp)); Text("Cancel")
                                 }
                             }
+                            if (state.failed > 0) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val sb = StringBuilder()
+                                        sb.append("GPic upload errors: ${state.completed} done, ${state.skipped} skipped, ${state.failed} failed of ${state.totalFiles}\n")
+                                        state.progressMap.values.filter { it.status == UploadStatus.ERROR }.forEach { fp ->
+                                            sb.append("FAIL ${fp.fileName} [${fp.status}] ${fp.message} (err=${fp.error})\n")
+                                        }
+                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        cm.setPrimaryClip(ClipData.newPlainText("gpic-errors", sb.toString()))
+                                        Toast.makeText(context, "Copied ${state.failed} errors — paste it here", Toast.LENGTH_LONG).show()
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, null); Spacer(Modifier.width(8.dp)); Text("Copy ${state.failed} errors")
+                                }
+                            }
                         }
                     }
                 }
@@ -211,6 +233,7 @@ private data class Quad(val a: String, val b: String, val c: androidx.compose.ui
 
 @Composable
 private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progress.FileProgress?) {
+    val ctx = LocalContext.current
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -234,10 +257,18 @@ private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progre
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
                     Text(name, style = MaterialTheme.typography.bodyMedium, maxLines = 1)
-                    Text("${formatSize(size)} • ${prog?.statusLabel ?: "Queued"} ${if (prog?.message?.isNotEmpty() == true && prog.status != UploadStatus.COMPLETED) "• ${prog.message}" else ""}", style = MaterialTheme.typography.bodySmall)
+                    SelectionContainer {
+                        Text("${formatSize(size)} • ${prog?.statusLabel ?: "Queued"} ${if (prog?.message?.isNotEmpty() == true && prog.status != UploadStatus.COMPLETED) "• ${prog.message}" else ""}", style = MaterialTheme.typography.bodySmall)
+                    }
                 }
                 if (prog != null && prog.status == UploadStatus.ERROR) {
-                    Icon(Icons.Default.Refresh, contentDescription = null)
+                    IconButton(onClick = {
+                        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("gpic-error", "FAIL $name [${prog.status}] ${prog.message} (err=${prog.error})"))
+                        Toast.makeText(ctx, "Error copied — paste it here", Toast.LENGTH_SHORT).show()
+                    }) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy error")
+                    }
                 }
             }
             if (prog != null && (prog.status == UploadStatus.UPLOADING || prog.status == UploadStatus.RESUMING || prog.status == UploadStatus.HASHING || prog.status == UploadStatus.CHECKING || prog.status == UploadStatus.PREPARING || prog.status == UploadStatus.COMMITTING)) {
