@@ -15,8 +15,10 @@ import java.io.RandomAccessFile
 /**
  * Collects live CPU / RAM / network stats every [intervalMs].
  *
- * - CPU: /proc/stat delta (device overall). First sample returns 0.
+ * - CPU: /proc/stat delta (device overall) with app-CPU fallback via getElapsedCpuTime.
+ *   /proc/stat is unreadable on some devices (SELinux) which previously stuck UI at 0%.
  * - RAM/storage: ActivityManager.MemoryInfo + StatFs(filesDir) — same as Morphe DeviceStats.
+ * - Disk: volume used/total + app cacheDir/filesDir du (temp upload copies).
  * - App RAM: ActivityManager.getProcessMemoryInfo(pid) PSS.
  * - Network: TrafficStats total + UID deltas → B/s.
  * - Upload throughput: supplied via [uploadedBytesProvider] (sum of FileProgress.bytesUploaded).
@@ -31,6 +33,8 @@ class SystemStatsCollector(
         var prevCpuTotal = 0L
         var prevCpuIdle = 0L
         var firstCpu = true
+        var prevAppCpuTime = android.os.Process.getElapsedCpuTime()
+        val numCores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
 
         var prevRx = TrafficStats.getTotalRxBytes()
         var prevTx = TrafficStats.getTotalTxBytes()
@@ -44,6 +48,7 @@ class SystemStatsCollector(
         val memHist = ArrayDeque<Float>()
         val txHist = ArrayDeque<Long>()
         val rxHist = ArrayDeque<Long>()
+        val diskHist = ArrayDeque<Float>()
 
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
@@ -51,13 +56,31 @@ class SystemStatsCollector(
             val now = System.currentTimeMillis()
             val dtSec = ((now - prevTime).coerceAtLeast(1) / 1000f)
 
-            // CPU
+            // CPU: device overall via /proc/stat, fallback to app CPU via elapsedCpuTime.
+            // /proc/stat can be unreadable on some OEMs/SELinux policies (returns null -> stuck 0%).
             val cpu = readCpuDelta(prevCpuTotal, prevCpuIdle, firstCpu)
+            var cpuPct = 0f
             if (cpu != null) {
                 prevCpuTotal = cpu.total
                 prevCpuIdle = cpu.idle
+                cpuPct = cpu.pct
             }
-            val cpuPct = cpu?.pct ?: 0f
+            // App-CPU fallback: meaningful even when device stat is blocked, and more
+            // relevant for hashing/upload work. Convert ms CPU time -> % of wall time.
+            var appCpuPct = 0f
+            try {
+                val curAppCpu = android.os.Process.getElapsedCpuTime()
+                val dCpuMs = (curAppCpu - prevAppCpuTime).coerceAtLeast(0)
+                // dtSec already computed; elapsedCpuTime is ms across all threads.
+                appCpuPct = (dCpuMs / (dtSec * 1000f) * 100f).coerceIn(0f, 100f * numCores)
+                prevAppCpuTime = curAppCpu
+            } catch (_: Exception) {}
+            // Prefer device stat when available; if it stays 0 while app is busy, show app-normalized.
+            // Normalize app CPU to single-core-equivalent device % for display consistency.
+            val appNormalized = (appCpuPct / numCores).coerceIn(0f, 100f)
+            if (cpu == null || (cpuPct < 0.5f && appNormalized > 1f)) {
+                cpuPct = appNormalized
+            }
             firstCpu = false
 
             // RAM / storage
@@ -75,6 +98,11 @@ class SystemStatsCollector(
                 storAvail = sf.availableBytes
                 storTotal = sf.totalBytes
             } catch (_: Exception) {}
+            // App-specific disk usage: temp SAF copies live in cacheDir during upload.
+            // Lightweight du; guarded so a huge cache can't stall the 1s sampler.
+            var cacheBytes = 0L; var filesBytes = 0L
+            try { cacheBytes = dirSize(context.cacheDir) } catch (_: Exception) {}
+            try { filesBytes = dirSize(context.filesDir) } catch (_: Exception) {}
 
             // Network
             val curRx = TrafficStats.getTotalRxBytes()
@@ -104,6 +132,8 @@ class SystemStatsCollector(
             push(memHist, ramPct)
             push(txHist, txSpeed)
             push(rxHist, rxSpeed)
+            val diskPct = if (storTotal > 0) (storTotal - storAvail).toFloat() / storTotal * 100f else 0f
+            push(diskHist, diskPct)
 
             emit(
                 LiveStats(
@@ -113,6 +143,8 @@ class SystemStatsCollector(
                     appPssMb = appPssMb,
                     storageAvailBytes = storAvail,
                     storageTotalBytes = storTotal,
+                    appCacheBytes = cacheBytes,
+                    appFilesBytes = filesBytes,
                     lowMemory = mem.lowMemory,
                     rxSpeedBps = rxSpeed,
                     txSpeedBps = txSpeed,
@@ -126,11 +158,29 @@ class SystemStatsCollector(
                     memHistory = memHist.toList(),
                     txHistory = txHist.toList(),
                     rxHistory = rxHist.toList(),
+                    diskHistory = diskHist.toList(),
                 )
             )
             delay(intervalMs)
         }
     }.flowOn(Dispatchers.Default)
+
+    private fun dirSize(dir: java.io.File?): Long {
+        if (dir == null || !dir.exists()) return 0L
+        var total = 0L
+        try {
+            // filesDir/cacheDir are small (config + temp copies); walk is cheap vs 1s interval.
+            // Guard against runawayideo: cap at 20k entries.
+            var count = 0
+            dir.walkTopDown().forEach { f ->
+                if (f.isFile) {
+                    total += f.length()
+                    if (++count > 20000) return total
+                }
+            }
+        } catch (_: Exception) {}
+        return total
+    }
 
     private data class CpuRead(val total: Long, val idle: Long, val pct: Float)
 

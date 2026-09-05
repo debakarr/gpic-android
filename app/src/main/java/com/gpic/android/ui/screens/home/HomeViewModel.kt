@@ -19,6 +19,7 @@ import kotlinx.coroutines.launch
 
 data class HomeUiState(
     val djiUri: Uri? = null,
+    val djiSource: String = "none", // none|folder|files
     val djiFiles: List<DjiFile> = emptyList(),
     val isScanning: Boolean = false,
     val scanError: String? = null,
@@ -51,10 +52,20 @@ class HomeViewModel(
     init {
         refreshAuth()
         refreshUsb()
-        // restore last DJI uri if saved
-        val saved = context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).getString("last_dji_uri", null)
-        saved?.let {
-            try { _state.value = _state.value.copy(djiUri = Uri.parse(it)) } catch (e: Exception) {}
+        // restore last DJI selection if saved
+        val prefs = context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE)
+        val saved = prefs.getString("last_dji_uri", null)
+        val savedFiles = prefs.getStringSet("last_dji_files", null)?.toList()
+        if (!savedFiles.isNullOrEmpty()) {
+            try {
+                val uris = savedFiles.map { Uri.parse(it) }
+                // Re-resolve without blocking init; user can reselect if permissions expired.
+                viewModelScope.launch { setDjiFileUris(uris, persist = false) }
+            } catch (_: Exception) {}
+        } else {
+            saved?.let {
+                try { _state.value = _state.value.copy(djiUri = Uri.parse(it)) } catch (e: Exception) {}
+            }
         }
     }
 
@@ -74,16 +85,52 @@ class HomeViewModel(
 
     fun setDjiUri(uri: Uri) {
         scanner.takePersistablePermission(uri)
-        context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit().putString("last_dji_uri", uri.toString()).apply()
-        _state.value = _state.value.copy(djiUri = uri)
+        context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
+            .putString("last_dji_uri", uri.toString())
+            .remove("last_dji_files")
+            .apply()
+        _state.value = _state.value.copy(djiUri = uri, djiSource = "folder")
         scanDji(uri)
+    }
+
+    fun setDjiFileUris(uris: List<Uri>, persist: Boolean = true) {
+        if (uris.isEmpty()) return
+        uris.forEach { scanner.takePersistableFilePermission(it) }
+        if (persist) {
+            context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
+                .putStringSet("last_dji_files", uris.map { it.toString() }.toSet())
+                .remove("last_dji_uri")
+                .apply()
+        }
+        viewModelScope.launch {
+            _state.value = _state.value.copy(isScanning = true, scanError = null, djiSource = "files", djiUri = null)
+            try {
+                // filesFromUris already returns smallest-first sorted
+                val files = scanner.filesFromUris(uris)
+                _state.value = _state.value.copy(
+                    djiFiles = files,
+                    totalFiles = files.size,
+                    totalBytes = files.sumOf { it.sizeBytes },
+                    isScanning = false,
+                    scanError = if (files.isEmpty()) "No supported photos/videos in selected files" else null
+                )
+            } catch (e: Exception) {
+                _state.value = _state.value.copy(isScanning = false, scanError = e.message)
+            }
+        }
+    }
+
+    fun clearSelection() {
+        context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
+            .remove("last_dji_uri").remove("last_dji_files").apply()
+        _state.value = _state.value.copy(djiUri = null, djiSource = "none", djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap())
     }
 
     fun scanDji(uri: Uri) {
         viewModelScope.launch {
             _state.value = _state.value.copy(isScanning = true, scanError = null)
             try {
-                val files = scanner.scanViaSaf(uri)
+                val files = scanner.scanViaSaf(uri).sortedBy { it.sizeBytes }
                 _state.value = _state.value.copy(
                     djiFiles = files,
                     totalFiles = files.size,
@@ -97,11 +144,11 @@ class HomeViewModel(
     }
 
     fun rescan() {
-        _state.value.djiUri?.let { scanDji(it) }
+        if (_state.value.djiSource == "folder") _state.value.djiUri?.let { scanDji(it) }
     }
 
     fun startUpload(threads: Int = 0, force: Boolean = false, deleteAfter: Boolean = false) {
-        val files = _state.value.djiFiles
+        val files = _state.value.djiFiles.sortedBy { it.sizeBytes }
         if (files.isEmpty()) return
         val cred = credentialStore.getActiveCredential() ?: return
         viewModelScope.launch {

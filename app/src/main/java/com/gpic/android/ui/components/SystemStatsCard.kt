@@ -19,7 +19,7 @@ import com.gpic.android.util.formatSpeed
 /**
  * Morphe-style live stats panel for uploads.
  * Morphe Expert patching shows: overall progress + patch counter + live memory vs heap + log.
- * Here: overall upload progress + file counter + live CPU / RAM / network + upload throughput.
+ * Here: overall upload progress + file counter + live CPU / RAM / disk / network + upload throughput.
  */
 @Composable
 fun SystemStatsCard(
@@ -59,7 +59,7 @@ fun SystemStatsCard(
             StatRow(
                 icon = Icons.Default.Memory,
                 label = "CPU",
-                value = "${"%.0f".format(stats.cpuPercent)}%",
+                value = "${"%.1f".format(stats.cpuPercent)}% (${java.lang.Runtime.getRuntime().availableProcessors()} cores)",
                 barFraction = (stats.cpuPercent / 100f).coerceIn(0f, 1f),
                 barColor = MaterialTheme.colorScheme.primary,
                 sparkFloat = stats.cpuHistory,
@@ -67,12 +67,22 @@ fun SystemStatsCard(
             )
             // RAM row (device + app PSS like Morphe "memory vs heap")
             StatRow(
-                icon = Icons.Default.Storage,
+                icon = Icons.Default.Memory,
                 label = "RAM",
                 value = "${formatSize(stats.ramUsedBytes)} / ${formatSize(stats.ramTotalBytes)} • app ${"%.0f".format(stats.appPssMb)} MB" + if (stats.lowMemory) " • LOW" else "",
                 barFraction = (stats.ramPercent / 100f).coerceIn(0f, 1f),
                 barColor = if (stats.lowMemory) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.secondary,
                 sparkFloat = stats.memHistory,
+                sparkMax = 100f,
+            )
+            // Disk row: volume usage + app cache (temp SAF copies) — critical for large DJI videos
+            StatRow(
+                icon = Icons.Default.SdStorage,
+                label = "Disk",
+                value = "${formatSize(stats.storageUsedBytes)} / ${formatSize(stats.storageTotalBytes)} • free ${formatSize(stats.storageAvailBytes)} • cache ${formatSize(stats.appCacheBytes)}",
+                barFraction = (stats.storagePercent / 100f).coerceIn(0f, 1f),
+                barColor = if (stats.storageAvailBytes < 1024L*1024L*500) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.tertiary,
+                sparkFloat = stats.diskHistory,
                 sparkMax = 100f,
             )
             // Network row: up/down + app UID + totals
@@ -92,8 +102,8 @@ fun SystemStatsCard(
                 // tx sparkline (upload matters most)
                 SparklineLong(values = stats.txHistory.map { it.toFloat() }, color = MaterialTheme.colorScheme.primary, modifier = Modifier.fillMaxWidth().height(28.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("↑ tx history", style = MaterialTheme.typography.labelSmall)
-                    Text("storage free ${formatSize(stats.storageAvailBytes)}", style = MaterialTheme.typography.labelSmall)
+                    Text("↑ tx history (upload)", style = MaterialTheme.typography.labelSmall)
+                    Text("↓ rx history affects dedup checks", style = MaterialTheme.typography.labelSmall)
                 }
             }
         }

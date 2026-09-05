@@ -30,8 +30,11 @@ fun HomeScreen(
     val state by vm.state.collectAsState()
     val context = LocalContext.current
 
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         if (uri != null) vm.setDjiUri(uri)
+    }
+    val filesPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
+        if (uris.isNotEmpty()) vm.setDjiFileUris(uris)
     }
 
     LaunchedEffect(Unit) { vm.refreshAuth(); vm.refreshUsb() }
@@ -71,18 +74,19 @@ fun HomeScreen(
                 val djiTitle = when {
                     state.isScanning -> "Scanning DJI storage…"
                     state.djiFiles.isNotEmpty() -> "DJI Action 4 • ${state.djiFiles.size} files • ${formatSize(state.totalBytes)}"
-                    state.djiUri != null -> "DJI folder selected • scanning…"
+                    state.djiUri != null || state.djiSource == "files" -> "DJI selection • scanning…"
                     else -> "Connect DJI Action 4"
                 }
                 val djiSubtitle = when {
-                    state.isScanning -> "Reading DCIM folder via USB-C…"
+                    state.isScanning -> if (state.djiSource == "files") "Reading selected files…" else "Reading DCIM folder via USB-C…"
                     state.djiFiles.isNotEmpty() -> {
                         val photos = state.djiFiles.count { it.isPhoto }
                         val videos = state.djiFiles.count { it.isVideo }
-                        "$photos photos • $videos videos • ${state.usbStatus}"
+                        val src = if (state.djiSource == "files") "selected files" else "DJI folder"
+                        "$photos photos • $videos videos • $src • ${state.usbStatus}"
                     }
-                    state.usbConnected -> "${state.usbStatus} • Now pick DJI folder"
-                    else -> "1. Plug camera via USB-C  2. Tap 'Choose DJI folder'  3. Select DCIM"
+                    state.usbConnected -> "${state.usbStatus} • Now pick folder or files"
+                    else -> "1. Plug camera via USB-C  2. Choose folder (DCIM) or individual files  3. Upload smallest-first"
                 }
                 val djiState = when {
                     state.djiFiles.isNotEmpty() -> StatusCardState.OK
@@ -91,19 +95,42 @@ fun HomeScreen(
                 }
                 StatusCard(
                     title = djiTitle,
-                    subtitle = djiSubtitle,
+                    subtitle = djiSubtitle + if (state.djiFiles.isNotEmpty()) " • smallest-first" else "",
                     icon = Icons.Default.Videocam,
                     status = djiState,
-                    actionLabel = when {
-                        state.djiFiles.isNotEmpty() -> "Rescan"
-                        state.djiUri != null -> "Rescan"
-                        else -> "Choose DJI folder"
-                    },
-                    onAction = {
-                        if (state.djiUri != null && state.djiFiles.isNotEmpty()) vm.rescan()
-                        else picker.launch(null)
-                    }
+                    actionLabel = null,
+                    onAction = null,
                 )
+                // Folder vs Files selection (DJI via USB-C exposes MTP; pick whole DCIM or just some files)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            if (state.djiSource == "folder" && state.djiFiles.isNotEmpty()) vm.rescan()
+                            else folderPicker.launch(null)
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.FolderOpen, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (state.djiSource == "folder" && state.djiFiles.isNotEmpty()) "Rescan folder" else "Choose folder")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            // MIME: pick any photo/video; filter to supported ext after pick
+                            filesPicker.launch(arrayOf("image/*", "video/*"))
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.FileOpen, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Choose files")
+                    }
+                }
+                if (state.djiFiles.isNotEmpty()) {
+                    TextButton(onClick = { vm.clearSelection() }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Clear selection")
+                    }
+                }
                 if (state.scanError != null) {
                     Text("Scan error: ${state.scanError}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                 }
