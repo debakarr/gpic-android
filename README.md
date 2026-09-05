@@ -115,6 +115,11 @@ MIT – see desktop gpic.
 - Cause was app sending `service=photoslibrary` (needs our package registration) instead of the pasted `service` (usually `photos.native`). Fixed in v1.3.1 to mirror desktop `gpic` exactly.
 - Fix: re-copy FULL logcat line with `service=...`, reopen Photos once, paste again. Save screen now shows detected `service=` and rejects strings missing `androidId`/`Email`/`Token`.
 
+**403 after auth (hashing OK, then Failed):**
+- v1.3.2 fails fast with tagged phase: `[getUploadToken]`, `[hashCheck]` (Checking), PUT `Upload rejected (403)`, `[commitUpload]` (Finalizing). Previously a 403 was retried 4x, hiding the phase.
+- 403 = bearer valid but scope/resource denied. Usual cause: pasted `service=` is `photoslibrary` (public) instead of internal `photos.native`. Re-copy the FULL logcat line filtered by `photos.native`, reopen Photos, paste again. The per-file error now shows `service=...` to confirm.
+- Also: force-close/reopen Photos refreshes the master Token; stale Tokens 403.
+
 **For Option A (official API, future) — yes, signing matters (your point):**
 - `applicationId` = `com.gpic.android`, `namespace` = `com.gpic.android`, no `applicationIdSuffix` (debug and release share ID on purpose).
 - Debug key SHA1 (this machine): `51:8D:06:60:D6:7A:D9:B0:1E:19:8C:8F:5E:DE:02:70:B7:83:2D:A4` (`~/.android/debug.keystore`, `androiddebugkey`).
