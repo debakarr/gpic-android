@@ -51,7 +51,7 @@ fun AuthScreen(
                 Text("1. On your PC with the phone connected via USB:", style = MaterialTheme.typography.bodySmall)
                 Text("  adb logcat -c; adb logcat | grep -i auth", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                 Text("2. Open Google Photos app on this phone", style = MaterialTheme.typography.bodySmall)
-                Text("3. Copy the line containing androidId=…&Email=…&Token=…", style = MaterialTheme.typography.bodySmall)
+                Text("3. Copy the FULL line containing androidId=…&Email=…&Token=…&service=… (must include service, usually photos.native)", style = MaterialTheme.typography.bodySmall)
                 Text("4. Paste below and tap Save. The app stores it securely (EncryptedSharedPreferences).", style = MaterialTheme.typography.bodySmall)
                 HorizontalDivider()
                 Text("Tip: you can also run 'gpic creds list' on desktop and share the config.json via QR or file.", style = MaterialTheme.typography.bodySmall)
@@ -83,19 +83,21 @@ fun AuthScreen(
                 value = authInput,
                 onValueChange = { authInput = it },
                 label = { Text("Paste auth string") },
-                placeholder = { Text("androidId=…&Email=you@gmail.com&Token=…") },
+                placeholder = { Text("androidId=…&Email=you@gmail.com&Token=…&service=…") },
                 modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp),
                 minLines = 3,
             )
 
             Button(onClick = {
-                val cred = store.addCredential(authInput.trim())
+                val raw = authInput.trim()
+                val cred = store.addCredential(raw)
                 if (cred != null) {
-                    message = "Saved for ${cred.email}. Ready to upload."
+                    val svc = store.describeService(raw)
+                    message = "Saved for ${cred.email}. service=$svc Ready to upload."
                     isError = false
                     authInput = ""
                 } else {
-                    message = "Could not parse. Need Email= field. Ensure you copied the full line."
+                    message = "Could not parse. Need androidId + Email + Token. Ensure you copied the FULL line including service=... (usually photos.native)."
                     isError = true
                 }
             }, modifier = Modifier.fillMaxWidth(), enabled = authInput.isNotBlank()) {
@@ -113,6 +115,8 @@ fun AuthScreen(
                     Text("Why two options?", style = MaterialTheme.typography.titleSmall)
                     Text("Option A = official OAuth via the same system account Photos uses (seamless, but Google now restricts to app-created media after Mar 2025; needs Cloud verification). Option B = internal mobile API with Pixel spoofing (unlimited) – needs that adb logcat master Token because Google Photos’ sandbox blocks silent reads. See docs/AUTH_LINKING_RESEARCH.md.", style = MaterialTheme.typography.bodySmall)
                     Text("Research: READ_LOGS is signature|privileged since Android 4.1, third-party apps can’t read Photos logs; in-app logcat won’t see them. ReVanced GmsCore log needs PC adb. CredentialManager+AuthorizationClient is the correct seamless path.", style = MaterialTheme.typography.bodySmall)
+                    HorizontalDivider()
+                    Text("Failed: UNREGISTERED_ON_API_CONSOLE? You do NOT need your own SHA-1/OAuth client for Option B — GPic reuses the Photos app registration (com.google.android.apps.photos). Fix: (1) re-copy FULL line with service=..., (2) reopen Photos once then re-copy (Token may be revoked), (3) ensure no extra spaces/line breaks. Only Option A (official API) needs your package com.gpic.android + debug SHA1 51:8D:06:60:...:2D:A4 registered in Google Cloud Console.", style = MaterialTheme.typography.bodySmall)
                 }
             }
         }

@@ -105,3 +105,18 @@ SDK: compileSdk 37, minSdk 26, targetSdk 37, AGP 9.1.1, Kotlin 2.3.0.
 ## License
 
 MIT – see desktop gpic.
+
+## Auth troubleshooting: UNREGISTERED_ON_API_CONSOLE
+
+`Failed: Auth failed HTTP 400: ... UNREGISTERED_ON_API_CONSOLE ... package name and SHA-1 ...` means Google rejected the master-token exchange.
+
+**For Option B (internal unlimited, current uploader) — no SHA-1 setup needed:**
+- GPic reuses the Photos app registration (`com.google.android.apps.photos`), not your own. Do NOT create an OAuth client.
+- Cause was app sending `service=photoslibrary` (needs our package registration) instead of the pasted `service` (usually `photos.native`). Fixed in v1.3.1 to mirror desktop `gpic` exactly.
+- Fix: re-copy FULL logcat line with `service=...`, reopen Photos once, paste again. Save screen now shows detected `service=` and rejects strings missing `androidId`/`Email`/`Token`.
+
+**For Option A (official API, future) — yes, signing matters (your point):**
+- `applicationId` = `com.gpic.android`, `namespace` = `com.gpic.android`, no `applicationIdSuffix` (debug and release share ID on purpose).
+- Debug key SHA1 (this machine): `51:8D:06:60:D6:7A:D9:B0:1E:19:8C:8F:5E:DE:02:70:B7:83:2D:A4` (`~/.android/debug.keystore`, `androiddebugkey`).
+- Register BOTH debug + release SHA1 with package `com.gpic.android` in Google Cloud Console → APIs & Services → Credentials → OAuth client (Android). Mismatch → same UNREGISTERED error.
+- Release builds use `local.properties` `keystore.path/alias/password` if set, else unsigned; private releases ship debug APK (debug key above).

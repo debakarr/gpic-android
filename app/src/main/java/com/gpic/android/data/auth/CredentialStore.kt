@@ -89,10 +89,16 @@ class CredentialStore(context: Context) {
     }
 
     fun addCredential(authString: String): Credential? {
-        // Parse Email from query string like "androidId=...&Email=...&Token=..."
+        // Parse Email from query string like "androidId=...&Email=...&Token=...&service=..."
+        // Require master Token + androidId too, otherwise auth will fail later at hashing->token
+        // exchange with cryptic UNREGISTERED_ON_API_CONSOLE.
         val params = parseQueryString(authString)
         val email = params["Email"] ?: params["email"] ?: return null
         if (email.isBlank()) return null
+        val token = params["Token"] ?: params["token"] ?: return null
+        if (token.isBlank()) return null
+        val androidId = params["androidId"] ?: params["android_id"] ?: return null
+        if (androidId.isBlank()) return null
         val lang = params["lang"] ?: "en"
         val current = loadConfig()
         val existingIdx = current.credentials.indexOfFirst { it.email.equals(email, ignoreCase = true) }
@@ -108,6 +114,11 @@ class CredentialStore(context: Context) {
         val finalConfig = if (newConfig.selectedEmail.isBlank()) newConfig.copy(selectedEmail = email) else newConfig
         saveConfig(finalConfig)
         return credential
+    }
+
+    fun describeService(authString: String): String {
+        val params = parseQueryString(authString)
+        return params["service"] ?: "(no service= field — re-copy full line if auth fails)"
     }
 
     fun removeCredential(email: String) {

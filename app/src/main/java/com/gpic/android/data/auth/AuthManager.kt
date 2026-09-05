@@ -66,21 +66,41 @@ class AuthManager(
     private fun fetchToken(authString: String): Pair<String, Long> {
         val params = parseAuthString(authString)
         val androidId = params["androidId"] ?: params["android_id"] ?: ""
+        val email = params["Email"] ?: params["email"] ?: ""
+        val masterToken = params["Token"] ?: params["token"] ?: ""
+        val service = params["service"] ?: ""
 
-        val formBuilder = FormBody.Builder()
-            .add("app", "com.google.android.apps.photos")
-            .add("callerPkg", "com.google.android.apps.photos")
-            .add("device", androidId)
-            .add("service", "oauth2:https://www.googleapis.com/auth/photoslibrary")
+        // Fail fast with actionable message instead of cryptic HTTP 400.
+        if (authString.isBlank() || androidId.isBlank() || email.isBlank() || masterToken.isBlank()) {
+            throw RuntimeException(
+                "Auth string incomplete: need androidId, Email and Token. " +
+                "Re-copy the FULL logcat line (androidId=...&Email=...&Token=...&service=...). " +
+                "No OAuth client / SHA-1 setup needed — GPic reuses the Photos app registration."
+            )
+        }
+        if (service.isBlank()) {
+            Log.w("AuthManager", "auth string has no service= field; server will use default. If UNREGISTERED, re-copy line including service=...")
+        } else {
+            Log.d("AuthManager", "requesting service=$service for $email")
+        }
 
-        // Forward relevant params excluding excluded keys (as in Python)
+        // Mirror Python gphotos/auth.py exactly: defaults, then overwrite with auth_string
+        // values (single value per key). Do NOT hardcode service=photoslibrary — that scope
+        // belongs to our package (unregistered) and causes UNREGISTERED_ON_API_CONSOLE.
+        // The service must come from the pasted Photos line (usually photos.native).
         val excluded = setOf("it_caveat_types", "assertion_jwt", "token_binding_alias")
+        val merged = mutableMapOf(
+            "app" to "com.google.android.apps.photos",
+            "callerPkg" to "com.google.android.apps.photos",
+            "device" to androidId
+        )
         for ((k, v) in params) {
-            if (k !in excluded) {
-                // Avoid duplicate keys already added
-                if (k == "app" || k == "callerPkg" || k == "device") continue
-                formBuilder.add(k, v)
-            }
+            if (k in excluded) continue
+            merged[k] = v
+        }
+        val formBuilder = FormBody.Builder()
+        for ((k, v) in merged) {
+            formBuilder.add(k, v)
         }
 
         val request = Request.Builder()
@@ -94,7 +114,15 @@ class AuthManager(
 
         client.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful) {
-                val body = resp.body?.string()?.take(500) ?: ""
+                val body = resp.body?.string()?.take(800) ?: ""
+                if ("UNREGISTERED_ON_API_CONSOLE" in body || "UNREFISTERED_ON_API_CONSOLE" in body) {
+                    throw RuntimeException(
+                        "Auth failed HTTP ${resp.code}: Google says this app is not registered for the requested service. " +
+                        "GPic reuses the Photos app registration, so you do NOT need your own SHA-1/OAuth client. " +
+                        "Fix: re-copy the FULL Photos logcat line including service=... (usually oauth2:https://www.googleapis.com/auth/photos.native), " +
+                        "reopen Google Photos once, then paste again. Detail: $body"
+                    )
+                }
                 throw RuntimeException("Auth failed HTTP ${resp.code}: $body")
             }
             val text = resp.body?.string() ?: throw RuntimeException("Empty auth response")
