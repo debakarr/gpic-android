@@ -221,18 +221,12 @@ class UploadManager(
             fp.message = "Uploading…"
             emitProgress()
             val sha1Out = mutableListOf<ByteArray>()
-            var lastEmit = 0L
             val commitToken = api.uploadStream(
                 openStream = openStream,
                 fileSize = fileSize,
                 uploadId = uploadId,
                 onProgress = { read, total ->
-                    fp.updateBytes(read, total)
-                    val now = System.currentTimeMillis()
-                    if (now - lastEmit > 200) {
-                        lastEmit = now
-                        emitProgress()
-                    }
+                    if (fp.trackUpload(read, total)) emitProgress()
                 },
                 resumeOffset = 0,
                 computeHash = true,
@@ -289,18 +283,12 @@ class UploadManager(
             fp.message = "Uploading…"
             emitProgress()
             val sha1Out = mutableListOf<ByteArray>()
-            var lastEmit = 0L
             val commitToken = api.uploadFile(
                 file = f,
                 uploadId = uploadId,
                 fileSize = fileSize,
                 onProgress = { read, total ->
-                    fp.updateBytes(read, total)
-                    val now = System.currentTimeMillis()
-                    if (now - lastEmit > 200) {
-                        lastEmit = now
-                        emitProgress()
-                    }
+                    if (fp.trackUpload(read, total)) emitProgress()
                 },
                 resumeOffset = 0,
                 computeHash = true,
@@ -442,21 +430,15 @@ class UploadManager(
                 if (fp.status != UploadStatus.RESUMING) fp.status = UploadStatus.UPLOADING
                 fp.message = "Uploading…"
                 emitProgress()
-                var lastEmit = 0L
                 commitToken = api.uploadStream(
                     openStream = openStream,
                     fileSize = fileSize,
                     uploadId = uploadId!!,
                     onProgress = { read, total ->
-                        fp.updateBytes(read, total)
                         if (fp.status == UploadStatus.RESUMING && read >= (fp.resumeOffset + 1024*1024)) {
                             fp.status = UploadStatus.UPLOADING
                         }
-                        val now = System.currentTimeMillis()
-                        if (now - lastEmit > 200) {
-                            lastEmit = now
-                            emitProgress()
-                        }
+                        if (fp.trackUpload(read, total)) emitProgress()
                     },
                     resumeOffset = resumeOffset ?: 0
                 )
@@ -563,18 +545,12 @@ class UploadManager(
                 if (fp.status != UploadStatus.RESUMING) fp.status = UploadStatus.UPLOADING
                 fp.message = "Uploading…"
                 emitProgress()
-                var lastEmit = 0L
                 commitToken = api.uploadFile(
                     file = f,
                     uploadId = uploadId!!,
                     fileSize = fileSize,
                     onProgress = { read, total ->
-                        fp.updateBytes(read, total)
-                        val now = System.currentTimeMillis()
-                        if (now - lastEmit > 200) {
-                            lastEmit = now
-                            emitProgress()
-                        }
+                        if (fp.trackUpload(read, total)) emitProgress()
                     },
                     resumeOffset = resumeOffset ?: 0
                 )
