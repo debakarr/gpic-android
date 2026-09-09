@@ -258,7 +258,7 @@ private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progre
                 Column(Modifier.weight(1f)) {
                     Text(name, style = MaterialTheme.typography.bodyMedium, maxLines = 1)
                     SelectionContainer {
-                        Text("${formatSize(size)} • ${prog?.statusLabel ?: "Queued"} ${if (prog?.message?.isNotEmpty() == true && prog.status != UploadStatus.COMPLETED) "• ${prog.message}" else ""}", style = MaterialTheme.typography.bodySmall)
+                        Text("${formatSize(size)} • ${prog?.detailLine ?: "Queued"}", style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 if (prog != null && prog.status == UploadStatus.ERROR) {

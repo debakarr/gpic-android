@@ -31,6 +31,68 @@ data class FileProgress(
         totalBytes = total
     }
 
+    // Last upload sample for speed/ETA; copied by snapshot() but only mutated on worker thread.
+    private var lastSampleMs: Long = 0L
+    private var lastSampleBytes: Long = 0L
+
+    /**
+     * Record an upload sample, updating speedBps/etaSeconds with light smoothing.
+     * @return true when enough time passed (or upload finished) that the caller should emit.
+     */
+    fun trackUpload(read: Long, total: Long, nowMs: Long = System.currentTimeMillis(), minIntervalMs: Long = 200): Boolean {
+        bytesUploaded = read
+        totalBytes = total
+        val dt = nowMs - lastSampleMs
+        if (read >= total) {
+            if (dt > 0 && read > lastSampleBytes) {
+                speedBps = ((read - lastSampleBytes) * 1000 / dt).coerceAtLeast(0)
+            }
+            etaSeconds = 0
+            lastSampleMs = nowMs
+            lastSampleBytes = read
+            return true
+        }
+        if (dt < minIntervalMs) return false
+        if (dt > 0 && read > lastSampleBytes) {
+            val instant = ((read - lastSampleBytes) * 1000 / dt).coerceAtLeast(0)
+            speedBps = if (speedBps == 0L) instant else (speedBps * 7 / 10 + instant * 3 / 10)
+            etaSeconds = if (speedBps > 0) (total - read) / speedBps else 0
+        }
+        lastSampleMs = nowMs
+        lastSampleBytes = read
+        return true
+    }
+
+    /** One-line transfer summary: speed + remaining time (no duplicated status text). */
+    val transferSummary: String
+        get() {
+            if (speedBps <= 0) return "starting…"
+            val eta = if (etaSeconds > 0) " • ${formatEtaCompat(etaSeconds)} left" else ""
+            return "${formatSpeedCompat(speedBps)}$eta"
+        }
+
+    private fun formatSpeedCompat(bps: Long): String {
+        if (bps < 1024) return "$bps B/s"
+        val kb = bps / 1024.0
+        if (kb < 1024) return String.format("%.1f KB/s", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024) return String.format("%.1f MB/s", mb)
+        return String.format("%.2f GB/s", mb / 1024.0)
+    }
+
+    private fun formatEtaCompat(seconds: Long): String {
+        if (seconds <= 0) return "--"
+        val m = seconds / 60
+        val s = seconds % 60
+        return if (m > 0) "${m}m ${s}s" else "${s}s"
+    }
+
+    val detailLine: String
+        get() = when (status) {
+            UploadStatus.UPLOADING, UploadStatus.RESUMING -> "$statusLabel • $transferSummary"
+            else -> if (message.isNotEmpty() && status != UploadStatus.COMPLETED) "$statusLabel • $message" else statusLabel
+        }
+
     val statusLabel: String
         get() = when (status) {
             UploadStatus.PENDING -> "Queued"

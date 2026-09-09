@@ -20,11 +20,20 @@ android {
         applicationId = "com.gpic.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 10
-        versionName = "1.3.5"
+        versionCode = 11
+        versionName = "1.3.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+            isUniversalApk = true
+        }
     }
 
     signingConfigs {
@@ -101,4 +110,22 @@ dependencies {
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+}
+
+// Version-numbered APK filenames for release uploads (streambox convention:
+// `make publish V=<versionName> CODE=<versionCode>` keeps these in sync).
+val releaseVersion = "1.3.6"
+val versionApks by tasks.registering(Copy::class) {
+    dependsOn("assembleRelease")
+    from(layout.buildDirectory.dir("outputs/apk/release"))
+    include("*.apk")
+    into(layout.buildDirectory.dir("outputs/apk/versioned"))
+    rename { name ->
+        name
+            .replace("app-arm64-v8a-release.apk", "GPic-$releaseVersion-arm64-v8a.apk")
+            .replace("app-armeabi-v7a-release.apk", "GPic-$releaseVersion-armeabi-v7a.apk")
+            .replace("app-x86_64-release.apk", "GPic-$releaseVersion-x86_64.apk")
+            .replace("app-x86-release.apk", "GPic-$releaseVersion-x86.apk")
+            .replace("app-universal-release.apk", "GPic-$releaseVersion-universal.apk")
+    }
 }
