@@ -527,8 +527,13 @@ class GooglePhotosApi(
         endpoint = "commitUpload"
         )
         resp.use {
-            val bytes = it.body?.bytes() ?: throw RuntimeException("Empty commit response")
-            val parsed = CommitUploadResponseOuterClass.CommitUploadResponse.parseFrom(bytes)
+            val raw = it.body?.bytes() ?: throw RuntimeException("[commitUpload] Empty commit response")
+            val bytes = gunzipMaybe(raw)
+            val parsed = try {
+                CommitUploadResponseOuterClass.CommitUploadResponse.parseFrom(bytes)
+            } catch (e: Exception) {
+                throw RuntimeException("[commitUpload] bad reply (" + bytes.size + "B): " + previewBytes(bytes))
+            }
             val mediaKey = parsed.field1.field3.mediaKey
             if (mediaKey.isNullOrEmpty()) throw RuntimeException("Upload rejected: no media key")
             return mediaKey
@@ -554,8 +559,16 @@ class GooglePhotosApi(
         endpoint = "hashCheck"
         )
         resp.use {
-            val bytes = it.body?.bytes() ?: return ""
-            val parsed = RemoteMatchesOuterClass.RemoteMatches.parseFrom(bytes)
+            val raw = it.body?.bytes() ?: return ""
+            val bytes = gunzipMaybe(raw)
+            val parsed = try {
+                RemoteMatchesOuterClass.RemoteMatches.parseFrom(bytes)
+            } catch (e: Exception) {
+                // Dedup is best-effort: a garbled check reply must not block the upload.
+                // Proceed as not-found; upload/commit steps will surface real errors with phase tags.
+                Log.w("GooglePhotosApi", "[hashCheck] unparseable reply (" + bytes.size + "B): " + previewBytes(bytes))
+                return ""
+            }
             return if (parsed.hasField1() && parsed.field1.hasField2() && parsed.field1.field2.hasField2()) {
                 parsed.field1.field2.field2.mediaKey ?: ""
             } else ""
