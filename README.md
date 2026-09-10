@@ -1,27 +1,33 @@
 # GPic
 
-An Android companion for [gpic](https://github.com/debakarr/gpic) — upload DJI Action 4 photos & videos to Google Photos over USB-C.
-
-Built as a direct port of the Python `gpic` desktop tool. Credit to [gotohp](https://github.com/xob0t/gotohp) for reverse-engineering the internal Google Photos mobile API.
+Android app that uploads DJI Action 4 photos and videos to Google Photos over USB-C. Companion to [gpic](https://github.com/debakarr/gpic) (the Python version). The upload protocol is a port of [gotohp](https://github.com/xob0t/gotohp) by [xob0t](https://github.com/xob0t), who did the reverse engineering work on the internal Google Photos mobile API.
 
 ## Features
 
-- **DJI Action 4 via USB-C** — plug the camera into your phone; pick the whole `DCIM` folder or individual files through the system file picker (persisted across restarts)
-- **Smart uploads** — concurrent uploads (auto-tuned thread count), resumable via `Content-Range`, SHA-1 hash dedup (skips files already in your library), retry with exponential backoff
-- **Smallest-first order** — quick wins first, so a single GB video can't head-of-line-block dozens of photos
-- **No temp copies** — uploads stream straight from the DJI document, with live hash progress and resume support
-- **Human-friendly status** — every file shows Queued → Preparing → Hashing → Checking → Uploading/Resuming → Finalizing → Done / Already backed up / Failed, with live percentage, speed and remaining time while uploading (e.g. `Uploading • 2.4 MB/s • 1m 20s left`)
-- **Morphe-style live stats** — CPU %, RAM used/total + app PSS, disk used/total + free + app cache, network ↑/↓ + app UID speeds and upload throughput, with sparklines
-- **Copyable errors** — each failed file has a copy button (plus long-press selectable text and a Copy-all-errors button) so failures can be pasted back for debugging
-- **Auth via existing Google Photos** — paste the same `androidId=...&Email=...&Token=...` string as desktop gpic (see below); stored in `EncryptedSharedPreferences`, with `service=` validation that warns before a guaranteed 403
+- Pick the whole `DCIM` folder or individual files from the DJI camera through the system file picker (access is kept across restarts)
+- Concurrent uploads with automatic thread count, resume from last byte via `Content-Range`, SHA-1 dedup against files already in the library, retry with backoff
+- Smallest files upload first
+- Streams straight from the camera, no temp copies
+- Per-file status with live percent, speed and time left while uploading (e.g. `Uploading • 2.4 MB/s • 1m 20s left`)
+- Live CPU / RAM / disk / network panel during uploads, with sparklines
+- Copy button on every failed file (plus long-press to select text, and copy-all) for debugging failures
+
+## Privacy & Data
+
+- **No analytics, no crash reporting, no ads, no third-party SDKs.** Dependencies are AndroidX, OkHttp, Gson, protobuf and Coil only.
+- **Your photos go from the camera to your phone to Google, nowhere else.** The app talks only to Google endpoints: `android.googleapis.com/auth` (token exchange), `photos.googleapis.com` (uploads) and `photosdata-pa.googleapis.com` (library calls).
+- **The Photos credential you paste** (`androidId`/`Email`/`Token`) is kept in `EncryptedSharedPreferences` on the device and sent only to Google. The short-lived bearer token lives in RAM and is refreshed as needed. Nothing is uploaded anywhere except Google Photos.
+- **Local state** is an upload-resume cache (`upload_cache.json`, 24h expiry) in the app cache dir, plus your picker selection and settings. Clearing app data wipes all of it.
+- **Permissions** used: `INTERNET`, `ACCESS_NETWORK_STATE`, foreground-service + notifications (to keep uploads alive in background), `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO`, and USB host (to detect the camera). `MANAGE_DOCUMENTS` is declared but is signature-level, so the system ignores it for this app.
+- The app cannot read your Photos login by itself (Android sandbox). That is why setup asks you to paste the auth string manually.
 
 ## Prerequisites
 
 - **JDK 21+**
 - **Android SDK** (compileSdk 37) — set `ANDROID_HOME` or let Android Studio manage it
-- **A DJI Action 4** + USB-C cable (phone needs USB OTG support, Android 8.0+ / API 26+)
+- **DJI Action 4** + USB-C cable (phone needs USB OTG, Android 8.0+ / API 26+)
 - **Google Photos** installed and signed in on the phone
-- **The auth string** from your Google Photos session (same as desktop gpic) — the app cannot read it from the Photos app itself (Android sandbox); see below
+- **The auth string** from your Google Photos session (same one desktop gpic uses)
 
 ## Build Instructions
 
@@ -31,7 +37,7 @@ Built as a direct port of the Python `gpic` desktop tool. Credit to [gotohp](htt
    cd gpic-android
    ```
 
-2. Make sure `local.properties` in the project root points at your SDK (`make setup` creates a template; it is git-ignored):
+2. Point `local.properties` at your SDK (`make setup` creates a template; the file is git-ignored):
    ```properties
    sdk.dir=/path/to/android-sdk
    # optional — only needed for signed release builds:
@@ -53,40 +59,24 @@ Built as a direct port of the Python `gpic` desktop tool. Credit to [gotohp](htt
 
 ### Per-architecture APKs
 
-ABI splits are enabled, so you can also build device-specific APKs:
+ABI splits are on, so one build also produces device-specific APKs in `app/build/outputs/apk/debug/`:
 
-```bash
-./gradlew assembleDebug
-```
-
-Outputs in `app/build/outputs/apk/debug/`:
-
-| APK | Architecture |
+| APK | For |
 |---|---|
 | `app-arm64-v8a-debug.apk` | Modern phones (most devices) |
 | `app-armeabi-v7a-debug.apk` | Older 32-bit ARM devices |
 | `app-x86_64-debug.apk` | x86_64 emulators / Chromebooks |
 | `app-x86-debug.apk` | x86 emulators |
-| `app-universal-debug.apk` | All architectures (largest) |
+| `app-universal-debug.apk` | Everything (largest) |
 
 ### Release build
 
 ```bash
-make keystore   # once: self-signed local key (git-ignored)
+make keystore   # once: local self-signed key (git-ignored)
 ./gradlew versionApks
 ```
 
-Versioned, signed APKs land in `app/build/outputs/apk/versioned/`:
-
-| APK | Architecture |
-|---|---|
-| `GPic-<version>-arm64-v8a.apk` | Modern phones (most devices) |
-| `GPic-<version>-armeabi-v7a.apk` | Older 32-bit ARM devices |
-| `GPic-<version>-x86_64.apk` | x86_64 emulators / Chromebooks |
-| `GPic-<version>-x86.apk` | x86 emulators |
-| `GPic-<version>-universal.apk` | All architectures (largest) |
-
-> The release build signs with `local.properties` `keystore.*` when set — configure it (or run `make keystore`) before distributing. Or use Android Studio's Generate Signed Bundle/APK wizard.
+Signed, versioned APKs land in `app/build/outputs/apk/versioned/` (`GPic-<version>-<abi>.apk`). Without `keystore.*` set the release build is unsigned — use Android Studio's Generate Signed Bundle/APK wizard instead.
 
 ## Install
 
@@ -96,7 +86,7 @@ adb install app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
 
 ## Getting the auth string
 
-Same credential as desktop gpic. On your PC with the phone connected via adb, capture the Photos internal line — it **must** contain `photos.native` (a `userinfo.profile` line 403s every call):
+On your PC with the phone on adb, capture the Photos line. It **must** contain `photos.native` — a `userinfo.profile` line fails every call with 403:
 
 ```bash
 # Linux / Mac
@@ -109,54 +99,53 @@ adb logcat | Select-String "photos.native"
 make auth-log
 ```
 
-Now open Google Photos on the phone and copy the FULL line from `androidId=` to the end (`androidId=...&Email=...&Token=...&service=...photos.native...`).
+Open Google Photos on the phone, copy the FULL line from `androidId=` to the end.
 
-In GPic: **Home → Link** (or the Auth screen) → paste → Save. The app shows the detected `service=` and warns if it doesn't look like Photos. You can store multiple accounts and switch the active one.
+In the app: **Home → Link** (or the Auth screen) → paste → Save. It shows the detected `service=` and warns if it is not a Photos scope. Multiple accounts can be stored; one is active at a time.
 
-Alternative: copy `~/.config/gpic/config.json` from desktop and paste the `auth_string` value.
+You can also copy `~/.config/gpic/config.json` off a desktop that already runs gpic and paste the `auth_string` value.
 
 ## Using the app
 
-1. **Plug DJI Action 4 via USB-C** — the home card shows the detected USB device.
-2. **Choose folder OR files** — `Choose folder` for the whole `DCIM` (recursive) or `Choose files` for individual photos/videos (multi-select). Access is persisted.
-3. Review the list: `X photos · Y videos · ZZ MB/GB`, always smallest-first.
-4. **Upload** — the FAB appears when files + auth are ready. Each file card shows live percentage plus speed and remaining time.
-5. Interrupted uploads resume from the last byte (persisted `upload_cache.json`, 24h TTL, plus server-side `Range` query).
-6. `Already in library` = SHA-1 hash matched, skipped without re-upload. `Force re-upload` and `Delete after upload` live in Settings.
+1. Plug the Action 4 in over USB-C. The home card shows the USB device if detected.
+2. `Choose folder` for all of `DCIM` (recursive) or `Choose files` for specific shots.
+3. Check the list (`X photos · Y videos · ZZ MB/GB`), then hit Upload.
+4. Each file card shows live percent, speed and time left. Interrupted uploads resume.
+5. `Already in library` means the SHA-1 matched and the file was skipped. `Force re-upload` and `Delete after upload` are in Settings.
 
 ## Status meanings
 
-| Status | What it means |
+| Status | Meaning |
 |---|---|
-| Queued | Waiting for an upload slot |
-| Preparing | Opening the DJI file (brief — streams directly, no copy) |
-| Hashing | Computing SHA-1 for duplicate detection (live %) |
-| Checking | Asking Google if this exact file is already in your library |
-| Uploading | Sending bytes (live % + speed + remaining time) |
+| Queued | Waiting for a free upload slot |
+| Preparing | Opening the file on the camera |
+| Hashing | Computing SHA-1 for the duplicate check |
+| Checking | Asking Google if the file is already in the library |
+| Uploading | Sending bytes (percent + speed + time left) |
 | Resuming | Continuing an interrupted upload from X% |
-| Finalizing | Server is committing the file into your library |
+| Finalizing | Server is committing the file to the library |
 | Done | Uploaded and committed |
-| Already backed up | Hash found in library — skipped, no duplicate |
-| Failed | Tap the copy icon on the row (or Copy-all-errors) and paste it back for debugging |
+| Already backed up | Hash matched, skipped |
+| Failed | Copy icon on the row copies the full error for debugging |
 
 ## How uploading works
 
-The app talks to the same internal Google Photos mobile endpoints as desktop `gpic`/`gotohp` (Pixel spoofing for unlimited storage): master-token → bearer via `android.googleapis.com/auth`, upload-ID via `photos.googleapis.com/data/upload/...`, dedup via `HashCheck`, commit via `photosdata-pa` protobufs. Retries use exponential backoff and fail fast on 4xx (except 429); errors carry `[endpoint]` tags (`getUploadToken`/`hashCheck`/`commitUpload`/PUT) so failures are diagnosable. Replies are gunzipped before proto parsing, and dedup-check parse failures fall back to uploading (dedup is best-effort).
+Same endpoints as desktop `gpic`/`gotohp` with Pixel spoofing: master token → bearer at `android.googleapis.com/auth`, upload ID from `photos.googleapis.com/data/upload/...`, duplicate check via `HashCheck`, commit via `photosdata-pa` protobufs. 4xx errors (except 429) fail fast with an `[endpoint]` tag (`getUploadToken` / `hashCheck` / `commitUpload` / PUT) so a failure says where it happened. Replies are gunzipped before proto parsing; if the duplicate check itself comes back garbled the file uploads anyway (dedup is best-effort).
 
-Supported files: `.avif .bmp .gif .heic .heif .ico .jpg .jpeg .png .tif .tiff .webp` · `.cr2 .cr3 .nef .arw .orf .raf .rw2 .pef .sr2 .dng` · `.3gp .3g2 .asf .avi .divx .m2t .m2ts .m4v .mkv .mmv .mod .mov .mp4 .mpg .mpeg .mts .tod .wmv .ts`
+Photos and videos supported: `.avif .bmp .gif .heic .heif .ico .jpg .jpeg .png .tif .tiff .webp` · `.cr2 .cr3 .nef .arw .orf .raf .rw2 .pef .sr2 .dng` · `.3gp .3g2 .asf .avi .divx .m2t .m2ts .m4v .mkv .mmv .mod .mov .mp4 .mpg .mpeg .mts .tod .wmv .ts`
 
 ## Troubleshooting
 
-- **`UNREGISTERED_ON_API_CONSOLE` (HTTP 400 at auth):** you do NOT need your own SHA-1/OAuth client — GPic reuses the Photos app registration. Re-copy the FULL logcat line *with* `service=...`, reopen Photos once, paste again. The save screen rejects strings missing `androidId`/`Email`/`Token`.
-- **403 right after hashing (Checking/Uploading/Finalizing):** bearer is valid but the scope is denied — the pasted `service=` is almost certainly `userinfo.profile` (a Google-login line) instead of `photos.native`. Re-capture with the `photos.native` filter above; the per-file error shows the detected `service=` to confirm.
-- **`Protocol message tag had invalid wire type` at Checking:** fixed in v1.3.5+ (gunzip before proto parse, dedup fallback). Update the app.
-- **Stuck at Preparing:** fixed in v1.3.0+ (direct Uri streaming, no temp copy). If it still sticks, the error now names the cause (e.g. permission lost → re-pick folder/files).
-- **CPU always 0%:** fixed in v1.3.0+ (`getElapsedCpuTime` fallback where `/proc/stat` is SELinux-blocked).
+- **`UNREGISTERED_ON_API_CONSOLE` (HTTP 400 at auth):** no OAuth client or SHA-1 setup needed on your side — the app reuses the Photos app registration. Re-copy the FULL logcat line *with* `service=...`, reopen Photos once, paste again. Strings missing `androidId`/`Email`/`Token` are rejected at save time.
+- **403 after hashing (Checking/Uploading/Finalizing):** the token works but the scope is wrong — the pasted `service=` is almost always `userinfo.profile` (a login line) instead of `photos.native`. Re-capture with the filter above; the error shows the detected `service=` so you can confirm.
+- **`Protocol message tag had invalid wire type` at Checking:** fixed in v1.3.5+. Update the app.
+- **Stuck at Preparing:** fixed in v1.3.0+ (direct streaming, no temp copy). A stuck file now fails with the reason instead (e.g. permission lost → re-pick the folder/files).
+- **CPU always 0%:** fixed in v1.3.0+ (fallback where `/proc/stat` is blocked).
 
 ## Disclaimer
 
-GPic uses the unofficial internal Google Photos mobile API (same as desktop `gpic`/`gotohp`), not the official Photos Library API. Use at your own risk: Google can change or block it at any time, and Pixel-spoofed unlimited uploads violate Google's ToS. Credentials stay on-device (encrypted prefs + in-RAM bearer) and are only sent to Google endpoints.
+This uses the unofficial internal Google Photos mobile API, not the official Library API. Google can change or block it at any time, and spoofed unlimited uploads are against Google's ToS. Use at your own risk.
 
 ## License
 
-MIT — see desktop [gpic](https://github.com/debakarr/gpic).
+MIT — same as desktop [gpic](https://github.com/debakarr/gpic).
