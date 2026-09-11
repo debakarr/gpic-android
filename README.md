@@ -1,13 +1,13 @@
 # GPic
 
-Android app that uploads DJI Action 4 photos and videos to Google Photos over USB-C. Companion to [gpic](https://github.com/debakarr/gpic) (the Python version). The upload protocol is a port of [gotohp](https://github.com/xob0t/gotohp) by [xob0t](https://github.com/xob0t), who did the reverse engineering work on the internal Google Photos mobile API.
+Android app that uploads photos and videos to Google Photos — from a DJI Action 4 over USB-C, any other USB storage, or the phone itself. Companion to [gpic](https://github.com/debakarr/gpic) (the Python version). The upload protocol is a port of [gotohp](https://github.com/xob0t/gotohp) by [xob0t](https://github.com/xob0t), who did the reverse engineering work on the internal Google Photos mobile API.
 
 ## Features
 
-- Pick the whole `DCIM` folder or individual files from the DJI camera through the system file picker (access is kept across restarts)
+- Pick any source through the system file picker: the whole `DCIM` folder off a DJI Action 4, any other USB drive or SD card, or individual photos and videos already on the phone (access is kept across restarts)
 - Concurrent uploads with automatic thread count, resume from last byte via `Content-Range`, SHA-1 dedup against files already in the library, retry with backoff
 - Smallest files upload first
-- Streams straight from the camera, no temp copies
+- Streams straight from the source, no temp copies
 - Per-file status with live percent, speed and time left while uploading (e.g. `Uploading • 2.4 MB/s • 1m 20s left`)
 - Live CPU / RAM / disk / network panel during uploads, with sparklines
 - Copy button on every failed file (plus long-press to select text, and copy-all) for debugging failures
@@ -15,7 +15,7 @@ Android app that uploads DJI Action 4 photos and videos to Google Photos over US
 ## Privacy & Data
 
 - **No analytics, no crash reporting, no ads, no third-party SDKs.** Dependencies are AndroidX, OkHttp, Gson, protobuf and Coil only.
-- **Your photos go from the camera to your phone to Google, nowhere else.** The app talks only to Google endpoints: `android.googleapis.com/auth` (token exchange), `photos.googleapis.com` (uploads) and `photosdata-pa.googleapis.com` (library calls).
+- **Your photos go from your storage to Google, nowhere else.** The app talks only to Google endpoints: `android.googleapis.com/auth` (token exchange), `photos.googleapis.com` (uploads) and `photosdata-pa.googleapis.com` (library calls).
 - **The Photos credential you paste** (`androidId`/`Email`/`Token`) is kept in `EncryptedSharedPreferences` on the device and sent only to Google. The short-lived bearer token lives in RAM and is refreshed as needed. Nothing is uploaded anywhere except Google Photos.
 - **Local state** is an upload-resume cache (`upload_cache.json`, 24h expiry) in the app cache dir, plus your picker selection and settings. Clearing app data wipes all of it.
 - **Permissions** used: `INTERNET`, `ACCESS_NETWORK_STATE`, foreground-service + notifications (to keep uploads alive in background), `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO`, and USB host (to detect the camera). `MANAGE_DOCUMENTS` is declared but is signature-level, so the system ignores it for this app.
@@ -25,7 +25,7 @@ Android app that uploads DJI Action 4 photos and videos to Google Photos over US
 
 - **JDK 21+**
 - **Android SDK** (compileSdk 37) — set `ANDROID_HOME` or let Android Studio manage it
-- **DJI Action 4** + USB-C cable (phone needs USB OTG, Android 8.0+ / API 26+)
+- **Something to upload from** — DJI Action 4 over USB-C, any USB storage or SD card, or photos already on the phone (USB OTG needed for external storage, Android 8.0+ / API 26+)
 - **Google Photos** installed and signed in on the phone
 - **The auth string** from your Google Photos session (same one desktop gpic uses)
 
@@ -107,8 +107,8 @@ You can also copy `~/.config/gpic/config.json` off a desktop that already runs g
 
 ## Using the app
 
-1. Plug the Action 4 in over USB-C. The home card shows the USB device if detected.
-2. `Choose folder` for all of `DCIM` (recursive) or `Choose files` for specific shots.
+1. Connect the source — plug the Action 4 or a USB drive in over USB-C, or skip this for photos already on the phone. The home card shows a detected USB device if there is one.
+2. `Choose folder` for a whole folder (recursive — `DCIM` or anything else) or `Choose files` for specific shots.
 3. Check the list (`X photos · Y videos · ZZ MB/GB`), then hit Upload.
 4. Each file card shows live percent, speed and time left. Interrupted uploads resume.
 5. `Already in library` means the SHA-1 matched and the file was skipped. `Force re-upload` and `Delete after upload` are in Settings.
