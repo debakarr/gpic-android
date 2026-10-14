@@ -2,6 +2,7 @@ package com.gpic.android.data.auth
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import org.json.JSONArray
@@ -12,25 +13,51 @@ import kotlinx.coroutines.flow.StateFlow
 /**
  * Port of gphotos/config.py ConfigManager
  * On Android we use EncryptedSharedPreferences for credential storage.
- * Plain fallback if device doesn't support encryption.
+ * Plain fallback (own file, no backup) only if the device Keystore is broken.
  */
 class CredentialStore(context: Context) {
 
     private val prefs: SharedPreferences by lazy {
-        try {
-            val masterKey = MasterKey.Builder(context)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                context,
-                "gpic_encrypted_prefs",
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        } catch (e: Exception) {
-            context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE)
+        openEncrypted(context) ?: run {
+            // A crypto failure means the Keystore key no longer matches the file (reinstall, OS
+            // keystore reset): the stored token is unreadable for good, so start a fresh encrypted
+            // file and the user re-pastes once. Anything else may be transient — never wipe for it.
+            if (lastOpenError.isCryptoFailure()) {
+                Log.w("CredentialStore", "encrypted prefs undecryptable — resetting", lastOpenError)
+                context.deleteSharedPreferences(ENCRYPTED_FILE)
+                openEncrypted(context)
+            } else null
+        } ?: run {
+            // Last resort on devices whose Keystore is broken outright. Its own file — never the
+            // UI-state "gpic_prefs" — and excluded from backup (allowBackup=false).
+            Log.e("CredentialStore", "Keystore unavailable — storing credentials unencrypted")
+            context.getSharedPreferences("gpic_credentials_plain", Context.MODE_PRIVATE)
         }
+    }
+
+    private fun openEncrypted(context: Context): SharedPreferences? = try {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        EncryptedSharedPreferences.create(
+            context,
+            ENCRYPTED_FILE,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    } catch (e: Exception) {
+        lastOpenError = e
+        null
+    }
+
+    private var lastOpenError: Throwable? = null
+
+    private fun Throwable?.isCryptoFailure(): Boolean =
+        generateSequence(this) { it.cause }.any { it is java.security.GeneralSecurityException }
+
+    companion object {
+        private const val ENCRYPTED_FILE = "gpic_encrypted_prefs"
     }
 
     private val _configFlow = MutableStateFlow(loadConfig())
@@ -59,7 +86,8 @@ class CredentialStore(context: Context) {
                 forceUpload = obj.optBoolean("force_upload", false),
                 deleteAfterUpload = obj.optBoolean("delete_after_upload", false),
                 saverMode = obj.optBoolean("saver_mode", false),
-                useQuota = obj.optBoolean("use_quota", false)
+                useQuota = obj.optBoolean("use_quota", false),
+                cameraStream = obj.optBoolean("camera_stream", false),
             )
         } catch (e: Exception) {
             AppConfig()
@@ -74,6 +102,7 @@ class CredentialStore(context: Context) {
             put("delete_after_upload", config.deleteAfterUpload)
             put("saver_mode", config.saverMode)
             put("use_quota", config.useQuota)
+            put("camera_stream", config.cameraStream)
             val arr = JSONArray()
             config.credentials.forEach { c ->
                 arr.put(JSONObject().apply {
@@ -114,6 +143,19 @@ class CredentialStore(context: Context) {
         val finalConfig = if (newConfig.selectedEmail.isBlank()) newConfig.copy(selectedEmail = email) else newConfig
         saveConfig(finalConfig)
         return credential
+    }
+
+    /**
+     * Why this auth line can't upload, or null if it looks right. The Photos API only accepts a
+     * token minted for the photos.native service; the userinfo.profile line (Google sign-in) that
+     * sits next to it in logcat yields a token every Photos call rejects with 403.
+     */
+    fun serviceProblem(authString: String): String? {
+        val svc = parseQueryString(authString)["service"]
+            ?: return "This line has no service= field. Copy the whole line that ends in service=…photos.native."
+        if (svc.contains("photos")) return null
+        if (svc.contains("userinfo")) return "This is the Google sign-in line (userinfo.profile), not the Photos one. Every upload would fail with 403. Copy the line containing photos.native instead."
+        return "service=$svc isn't the Photos service. Copy the line containing photos.native."
     }
 
     fun describeService(authString: String): String {

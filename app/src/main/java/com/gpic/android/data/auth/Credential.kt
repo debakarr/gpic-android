@@ -4,7 +4,7 @@ package com.gpic.android.data.auth
  * Port of gphotos/config.py Credential
  * authString format: "androidId=...&Email=...&Token=..." extracted via adb logcat from Google Photos
  * Example extraction:
- *   adb logcat -c; adb logcat | grep -i "auth"
+ *   adb logcat -c; adb logcat | grep -i "photos.native"   (make auth-log)
  *   then open Google Photos app on phone, copy the line containing androidId & Token
  */
 data class Credential(
@@ -21,4 +21,6 @@ data class AppConfig(
     val deleteAfterUpload: Boolean = false,
     val saverMode: Boolean = false,
     val useQuota: Boolean = false,
+    /** Camera over WiFi: true = upload straight from the camera, false = download to the phone first. */
+    val cameraStream: Boolean = false,
 )

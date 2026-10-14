@@ -134,7 +134,8 @@ class AuthManager(
                     parsed[t.substring(0, idx)] = t.substring(idx + 1)
                 }
             }
-            val authToken = parsed["Auth"] ?: throw RuntimeException("Auth response missing Auth token: $text")
+            // Keys only: the body can carry other credentials.
+            val authToken = parsed["Auth"] ?: throw RuntimeException("Auth response missing Auth token (fields: ${parsed.keys.joinToString()})")
             val expiryStr = parsed["Expiry"] ?: "0"
             val expiryLong = expiryStr.toLongOrNull() ?: 0L
             // If expiry is 0, default to 1 hour

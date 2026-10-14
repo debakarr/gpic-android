@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.*
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -23,8 +24,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             GpicTheme {
                 val nav = rememberNavController()
-                // ViewModel manual – no Hilt for v1
-                val homeVm = remember { HomeViewModel(this, app.credentialStore, app.djiScanner) }
+                // Manual factory – no Hilt for v1. Scoped to the Activity's ViewModelStore so it
+                // survives recreation (theme/locale change) instead of spawning a second uploader.
+                val homeVm = viewModel { HomeViewModel(app, app.credentialStore, app.djiScanner) }
 
                 // Refresh auth when returning from Auth screen
                 LaunchedEffect(nav.currentBackStackEntry) {

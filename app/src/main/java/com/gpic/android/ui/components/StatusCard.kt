@@ -46,7 +46,8 @@ fun StatusCard(
                 Text(subtitle, style = MaterialTheme.typography.bodySmall)
             }
             if (actionLabel != null && onAction != null) {
-                FilledTonalButton(onClick = onAction) { Text(actionLabel) }
+                Spacer(Modifier.width(8.dp))
+                FilledTonalButton(onClick = onAction, contentPadding = PaddingValues(horizontal = 16.dp)) { Text(actionLabel) }
             }
         }
     }

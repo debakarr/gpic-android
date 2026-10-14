@@ -1,11 +1,11 @@
 package com.gpic.android.data.upload
 
 import android.content.Context
-import android.provider.DocumentsContract
 import android.util.Log
 import com.gpic.android.data.api.GooglePhotosApi
 import com.gpic.android.data.auth.Credential
 import com.gpic.android.data.cache.UploadCache
+import com.gpic.android.data.cache.UploadHistory
 import com.gpic.android.data.dji.DjiFile
 import com.gpic.android.data.progress.FileProgress
 import com.gpic.android.data.progress.ProgressTracker
@@ -20,8 +20,7 @@ import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * Port of gphotos/upload.py UploadManager
- * Uses coroutines + semaphore for concurrency.
- * Streams directly from SAF Uri (no temp copy) to avoid "stuck at Preparing".
+ * Uses coroutines + semaphore for concurrency, over any [MediaSource] (no temp copies).
  */
 class UploadManager(
     private val context: Context,
@@ -31,9 +30,12 @@ class UploadManager(
     private val saver: Boolean = false,
     private val useQuota: Boolean = false,
     private val deleteAfter: Boolean = false,
+    /** Maps a list item to its byte source; camera files need the live camera link. */
+    private val sourceFor: (DjiFile) -> MediaSource = { it.defaultSource(context) },
 ) {
     private var api: GooglePhotosApi? = null
     private val cache by lazy { UploadCache(context) }
+    private val history by lazy { UploadHistory(context) }
 
     val progress = ProgressTracker()
     private val _results = mutableListOf<UploadResult>()
@@ -59,9 +61,8 @@ class UploadManager(
     }
 
     companion object {
-        fun autoThreads(files: List<DjiFile>): Int {
-            if (files.isEmpty()) return 3
-            val sizes = files.map { it.sizeBytes }
+        fun autoThreads(sizes: List<Long>): Int {
+            if (sizes.isEmpty()) return 3
             val count = sizes.size
             val total = sizes.sum()
             val avg = if (count > 0) total / count else 0L
@@ -94,8 +95,8 @@ class UploadManager(
         _results.clear()
         progress.reset()
         // Smallest-first: quick wins, avoids head-of-line blocking on GB videos.
-        val ordered = files.sortedBy { it.sizeBytes }
-        ordered.forEach { f -> progress.addFile(f.uri?.toString() ?: f.file?.absolutePath ?: f.displayName, f.sizeBytes) }
+        val sources = files.sortedBy { it.sizeBytes }.map(sourceFor)
+        sources.forEach { progress.addFile(it.key, it.sizeBytes, it.displayName) }
         emitProgress()
         _events.value = UploadEvent.BatchStart(progress.totalFiles, progress.totalBytes)
 
@@ -106,17 +107,25 @@ class UploadManager(
             useQuota = useQuota,
         )
 
-        val effectiveThreads = if (threads <= 0) autoThreads(ordered) else threads
-        Log.i("UploadManager","Starting ${ordered.size} files smallest-first with $effectiveThreads threads force=$force")
+        val requested = if (threads <= 0) autoThreads(sources.map { it.sizeBytes }) else threads
+        // A source's cap wins over both "auto" and an explicit count: extra streams on an MTP camera
+        // or the camera's WiFi only queue behind each other.
+        val cap = sources.mapNotNull { it.maxParallel }.minOrNull()
+        val effectiveThreads = if (cap != null) minOf(requested, cap) else requested
+        Log.i("UploadManager","Starting ${sources.size} files smallest-first with $effectiveThreads threads force=$force")
 
         val semaphore = Semaphore(effectiveThreads)
         coroutineScope {
-            val deferreds = ordered.map { djiFile ->
+            sources.map { source ->
                 async {
-                    if (cancelled) return@async
                     semaphore.withPermit {
+                        // Queued workers wake here after cancel; don't open (and fail) their files.
+                        if (cancelled) {
+                            progress.get(source.key).status = UploadStatus.CANCELLED
+                            return@withPermit
+                        }
                         try {
-                            val result = if (force) uploadForce(djiFile) else uploadWithHash(djiFile)
+                            val result = uploadOne(source)
                             synchronized(_results) { _results.add(result) }
                             _events.value = UploadEvent.FileResult(result)
                         } catch (e: CancellationException) {
@@ -128,8 +137,7 @@ class UploadManager(
                         }
                     }
                 }
-            }
-            deferreds.forEach { d ->
+            }.forEach { d ->
                 try { d.await() } catch (e: CancellationException) {} catch (e: Exception) { Log.e("UploadManager","job failed ${e.message}") }
             }
         }
@@ -152,439 +160,157 @@ class UploadManager(
         return b + " | 403 Forbidden at " + phase + " (service=" + svc + ")." + extra + " Bearer OK but scope denied: adb logcat | grep photos.native, reopen Photos, copy FULL androidId=...&service=... line, retry."
     }
 
-    private fun openStreamFor(djiFile: DjiFile): () -> java.io.InputStream {
-        val uri = djiFile.uri ?: throw RuntimeException("No Uri for ${djiFile.displayName}")
-        return {
-            context.contentResolver.openInputStream(uri)
-                ?: throw RuntimeException("Cannot open DJI file (null stream). Re-pick folder/files.")
-        }
-    }
-
-    private fun checkOpenable(djiFile: DjiFile, fp: FileProgress, key: String): String? {
-        // Returns error message or null if openable.
-        val uri = djiFile.uri
-        if (djiFile.file != null) {
-            if (!djiFile.file.exists()) return "Local file missing: ${djiFile.displayName}"
-            return null
-        }
-        if (uri == null) return "Cannot open file"
-        if (djiFile.sizeBytes <= 0) return "Empty or unreadable file (0 bytes)"
-        return try {
-            context.contentResolver.openInputStream(uri)?.close()
-            null
-        } catch (e: SecurityException) {
-            "Permission lost for ${djiFile.displayName}. Re-pick folder/files, then retry. (${e.message})"
-        } catch (e: java.io.FileNotFoundException) {
-            "DJI file not found (disconnected?): ${djiFile.displayName}"
-        } catch (e: Exception) {
-            "Cannot open DJI file: ${e.message}. Re-pick folder/files."
-        }
-    }
-
-    private suspend fun uploadForce(djiFile: DjiFile): UploadResult {
-        val key = djiFile.uri?.toString() ?: djiFile.file?.absolutePath ?: djiFile.displayName
-        val fp = progress.get(key)
-        val api = api!!
-
-        fp.status = UploadStatus.PREPARING
-        fp.message = "Opening file…"
-        fp.totalBytes = djiFile.sizeBytes
+    private fun skipped(source: MediaSource, fp: FileProgress, mediaKey: String, why: String): UploadResult {
+        fp.status = UploadStatus.SKIPPED
+        fp.message = why
+        progress.incSkipped()
+        // A hash match is an exact byte-for-byte copy already in the library, so the original is as
+        // safe to remove as one we just uploaded. A local-history match is name+size only — keep it.
+        if (deleteAfter && why == ALREADY_IN_LIBRARY) deleteOriginal(source, fp)
         emitProgress()
-
-        djiFile.file?.let { f ->
-            return uploadForceFile(djiFile, key, fp, api, f)
-        }
-
-        val openErr = checkOpenable(djiFile, fp, key)
-        if (openErr != null) {
-            fp.status = UploadStatus.ERROR
-            fp.message = openErr
-            fp.error = openErr
-            progress.incFailed()
-            emitProgress()
-            return UploadResult(key, djiFile.displayName, false, error = openErr)
-        }
-
-        val fileSize = djiFile.sizeBytes
-        val openStream = openStreamFor(djiFile)
-        val timestampSec = if (djiFile.lastModified > 0) djiFile.lastModified / 1000 else System.currentTimeMillis() / 1000
-
-        try {
-            fp.status = UploadStatus.UPLOADING
-            fp.message = "Requesting upload token…"
-            emitProgress()
-            val uploadId = try {
-                api.getUploadTokenSkipHash(fileSize)
-            } catch (e: Exception) {
-                throw RuntimeException("Token request failed: ${e.message}")
-            }
-            fp.message = "Uploading…"
-            emitProgress()
-            val sha1Out = mutableListOf<ByteArray>()
-            val commitToken = api.uploadStream(
-                openStream = openStream,
-                fileSize = fileSize,
-                uploadId = uploadId,
-                onProgress = { read, total ->
-                    if (fp.trackUpload(read, total)) emitProgress()
-                },
-                resumeOffset = 0,
-                computeHash = true,
-                hashOut = sha1Out
-            )
-            val sha1 = try {
-                sha1Out.firstOrNull() ?: api.calculateSha1WithProgress(openStream, fileSize, null)
-            } catch (e: Exception) {
-                throw RuntimeException("Hash failed: ${e.message}")
-            }
-            fp.bytesUploaded = fileSize
-            emitProgress()
-            fp.status = UploadStatus.COMMITTING
-            fp.message = "Finalizing…"
-            emitProgress()
-            val mediaKey = try {
-                api.commitUpload(commitToken, djiFile.displayName, sha1, timestampSec)
-            } catch (e: Exception) {
-                throw RuntimeException("Finalize failed: ${e.message}")
-            }
-            fp.status = UploadStatus.COMPLETED
-            fp.message = "Uploaded"
-            fp.bytesUploaded = fileSize
-            progress.incCompleted()
-            emitProgress()
-            if (deleteAfter) tryDeleteOriginal(djiFile)
-            return UploadResult(key, djiFile.displayName, true, mediaKey)
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            fp.status = UploadStatus.ERROR
-            fp.message = hint403(e.message, fp.status.name)
-            fp.error = e.message
-            progress.incFailed()
-            emitProgress()
-            Log.e("UploadManager", "Force upload failed ${djiFile.displayName}: ${e.message}", e)
-            return UploadResult(key, djiFile.displayName, false, error = e.message ?: "Failed")
-        }
+        return UploadResult(source.key, source.displayName, true, mediaKey, skipped = true)
     }
 
-    private suspend fun uploadForceFile(
-        djiFile: DjiFile,
-        key: String,
-        fp: FileProgress,
-        api: GooglePhotosApi,
-        f: java.io.File,
-    ): UploadResult {
-        val fileSize = f.length()
-        fp.totalBytes = fileSize
-        try {
-            fp.status = UploadStatus.UPLOADING
-            fp.message = "Requesting upload token…"
-            emitProgress()
-            val uploadId = api.getUploadTokenSkipHash(fileSize)
-            fp.message = "Uploading…"
-            emitProgress()
-            val sha1Out = mutableListOf<ByteArray>()
-            val commitToken = api.uploadFile(
-                file = f,
-                uploadId = uploadId,
-                fileSize = fileSize,
-                onProgress = { read, total ->
-                    if (fp.trackUpload(read, total)) emitProgress()
-                },
-                resumeOffset = 0,
-                computeHash = true,
-                hashOut = sha1Out
-            )
-            val sha1 = sha1Out.firstOrNull() ?: api.calculateSha1(f)
-            fp.bytesUploaded = fileSize
-            emitProgress()
-            fp.status = UploadStatus.COMMITTING
-            fp.message = "Finalizing…"
-            emitProgress()
-            val mediaKey = api.commitUpload(commitToken, djiFile.displayName, sha1, f.lastModified() / 1000)
-            fp.status = UploadStatus.COMPLETED
-            fp.message = "Uploaded"
-            fp.bytesUploaded = fileSize
-            progress.incCompleted()
-            emitProgress()
-            if (deleteAfter) tryDeleteOriginal(djiFile)
-            return UploadResult(key, djiFile.displayName, true, mediaKey)
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            fp.status = UploadStatus.ERROR
-            fp.message = hint403(e.message, fp.status.name)
-            fp.error = e.message
-            progress.incFailed()
-            emitProgress()
-            return UploadResult(key, djiFile.displayName, false, error = e.message ?: "Failed")
-        }
+    private fun deleteOriginal(source: MediaSource, fp: FileProgress) {
+        val err = source.delete() ?: return
+        Log.w("UploadManager", "delete-after failed: $err")
+        fp.message = "${fp.message.ifEmpty { "Uploaded" }} • original kept: $err"
     }
 
-    private suspend fun uploadWithHash(djiFile: DjiFile): UploadResult {
-        val key = djiFile.uri?.toString() ?: djiFile.file?.absolutePath ?: djiFile.displayName
-        val fp = progress.get(key)
+    /**
+     * One file, start to finish: hash → dedup → (resume or new token) → stream → commit.
+     * [phase] tracks the step for error messages; it's captured before status flips to ERROR.
+     */
+    private fun uploadOne(source: MediaSource): UploadResult {
+        val fp = progress.get(source.key)
         val api = api!!
-
-        fp.status = UploadStatus.PREPARING
-        fp.message = "Opening file…"
-        fp.totalBytes = djiFile.sizeBytes
-        emitProgress()
-
-        djiFile.file?.let { f ->
-            return uploadWithHashFile(djiFile, key, fp, api, f)
+        val size = source.sizeBytes
+        var phase = UploadStatus.PREPARING
+        fun enter(status: UploadStatus, msg: String) {
+            phase = status
+            fp.status = status
+            fp.message = msg
+            emitProgress()
         }
 
-        val openErr = checkOpenable(djiFile, fp, key)
-        if (openErr != null) {
+        enter(UploadStatus.PREPARING, "Opening file…")
+        fp.totalBytes = size
+        source.checkReadable()?.let { err ->
             fp.status = UploadStatus.ERROR
-            fp.message = openErr
-            fp.error = openErr
+            fp.message = err
+            fp.error = err
             progress.incFailed()
             emitProgress()
-            return UploadResult(key, djiFile.displayName, false, error = openErr)
+            return UploadResult(source.key, source.displayName, false, error = err)
         }
 
-        val fileSize = djiFile.sizeBytes
-        val openStream = openStreamFor(djiFile)
-        val timestampSec = if (djiFile.lastModified > 0) djiFile.lastModified / 1000 else System.currentTimeMillis() / 1000
-
         try {
-            fp.status = UploadStatus.HASHING
-            fp.message = "Calculating hash…"
-            fp.bytesUploaded = 0
-            emitProgress()
-            var lastHashEmit = 0L
-            val sha1 = try {
-                api.calculateSha1WithProgress(openStream, fileSize) { read, total ->
+            // Hash first when a second read is cheap: it lets Google tell us the file is already
+            // backed up before we send a byte. Single-pass sources (camera WiFi) hash while uploading.
+            var sha1: ByteArray? = null
+            if (!force && !source.singlePass) {
+                enter(UploadStatus.HASHING, "Calculating hash…")
+                var lastHashEmit = 0L
+                sha1 = api.calculateSha1WithProgress(source::open, size) { read, total ->
                     fp.updateBytes((read * 0.1).toLong().coerceAtMost(total), total)
                     val now = System.currentTimeMillis()
                     if (now - lastHashEmit > 300) {
                         lastHashEmit = now
-                        fp.message = "Hashing ${((read.toFloat()/total*100).toInt())}%…"
+                        fp.message = "Hashing ${(read.toFloat() / total * 100).toInt()}%…"
                         emitProgress()
                     }
                 }
-            } catch (e: Exception) {
-                throw RuntimeException("Hash failed: ${e.message}")
-            }
-            // Reset progress for upload phase (hash was 0-10% preview)
-            fp.bytesUploaded = 0
-            val sha1B64 = Base64.getEncoder().encodeToString(sha1)
-            if (cancelled) return UploadResult(key, djiFile.displayName, false, error="Cancelled")
+                fp.bytesUploaded = 0
+                if (cancelled) return cancelledResult(source, fp)
 
-            if (!force) {
-                fp.status = UploadStatus.CHECKING
-                fp.message = "Checking if already backed up…"
-                emitProgress()
-                val existingKey = try {
-                    api.findMediaByHash(sha1)
-                } catch (e: Exception) {
-                    throw RuntimeException("Check failed: ${e.message}")
-                }
-                if (existingKey.isNotEmpty()) {
-                    fp.status = UploadStatus.SKIPPED
-                    fp.message = "Already in library"
-                    progress.incSkipped()
-                    emitProgress()
-                    if (deleteAfter) tryDeleteOriginal(djiFile)
-                    return UploadResult(key, djiFile.displayName, true, existingKey, skipped = true)
-                }
+                enter(UploadStatus.CHECKING, "Checking if already backed up…")
+                val existingKey = api.findMediaByHash(sha1)
+                if (existingKey.isNotEmpty()) return skipped(source, fp, existingKey, ALREADY_IN_LIBRARY)
+            } else if (!force) {
+                history.find(source.displayName, size)?.let { return skipped(source, fp, it, "Uploaded before from this phone") }
             }
-            if (cancelled) return UploadResult(key, djiFile.displayName, false, error="Cancelled")
+            if (cancelled) return cancelledResult(source, fp)
 
+            // Resume an interrupted session for this file if the server still has it.
             var uploadId: String? = null
-            var resumeOffset: Long? = null
+            var resumeOffset = 0L
             var commitToken: gphotos.CommitTokenOuterClass.CommitToken? = null
-
-            val cached = cache.get(key)
-            if (cached != null) {
-                val cachedId = cached.optString("upload_id","")
-                if (cachedId.isNotEmpty()) {
-                    val (offset, token) = api.tryResumeSession(cachedId, fileSize)
-                    if (token != null) commitToken = token
-                    else if (offset != null) {
-                        uploadId = cachedId
-                        resumeOffset = offset
-                        fp.status = UploadStatus.RESUMING
-                        fp.resumeOffset = offset
-                        fp.updateBytes(offset, fileSize)
-                        val pct = if (fileSize>0) offset.toFloat()/fileSize.toFloat()*100f else 0f
-                        fp.message = "Resuming from ${"%.1f".format(pct)}%"
-                        emitProgress()
-                    }
+            cache.get(source.key)?.optString("upload_id", "")?.takeIf { it.isNotEmpty() }?.let { cachedId ->
+                val (nextByte, token) = api.tryResumeSession(cachedId, size)
+                if (token != null) commitToken = token
+                else if (nextByte != null) {
+                    uploadId = cachedId
+                    resumeOffset = nextByte
+                    fp.resumeOffset = nextByte
+                    fp.updateBytes(nextByte, size)
+                    enter(UploadStatus.RESUMING, "Resuming from ${"%.1f".format(if (size > 0) nextByte * 100f / size else 0f)}%")
                 }
             }
 
             if (uploadId == null && commitToken == null) {
-                fp.status = UploadStatus.UPLOADING
-                fp.message = "Requesting upload token…"
-                emitProgress()
-                uploadId = try {
-                    api.getUploadToken(sha1B64, fileSize)
-                } catch (e: Exception) {
-                    throw RuntimeException("Token request failed: ${e.message}")
-                }
-                cache.set(key, uploadId, fileSize)
+                enter(UploadStatus.UPLOADING, "Requesting upload token…")
+                uploadId = if (sha1 != null) api.getUploadToken(Base64.getEncoder().encodeToString(sha1), size)
+                else api.getUploadTokenSkipHash(size)
+                cache.set(source.key, uploadId!!, size)
             }
 
             if (commitToken == null) {
-                if (fp.status != UploadStatus.RESUMING) fp.status = UploadStatus.UPLOADING
-                fp.message = "Uploading…"
-                emitProgress()
+                if (fp.status != UploadStatus.RESUMING) enter(UploadStatus.UPLOADING, "Uploading…") else phase = UploadStatus.RESUMING
+                val hashOut = if (sha1 == null) mutableListOf<ByteArray>() else null
                 commitToken = api.uploadStream(
-                    openStream = openStream,
-                    fileSize = fileSize,
+                    openStream = source::open,
+                    fileSize = size,
                     uploadId = uploadId!!,
                     onProgress = { read, total ->
-                        if (fp.status == UploadStatus.RESUMING && read >= (fp.resumeOffset + 1024*1024)) {
+                        if (fp.status == UploadStatus.RESUMING && read >= fp.resumeOffset + 1024 * 1024) {
                             fp.status = UploadStatus.UPLOADING
                         }
                         if (fp.trackUpload(read, total)) emitProgress()
                     },
-                    resumeOffset = resumeOffset ?: 0
+                    resumeOffset = resumeOffset,
+                    hashOut = hashOut,
                 )
-                fp.bytesUploaded = fileSize
-                emitProgress()
+                if (sha1 == null) sha1 = hashOut?.firstOrNull()
+                fp.bytesUploaded = size
+            }
+            // No whole-file hash yet (the upload resumed mid-file): one extra read to get it right.
+            if (sha1 == null) {
+                enter(UploadStatus.HASHING, "Hashing for commit…")
+                sha1 = api.calculateSha1WithProgress(source::open, size)
             }
 
-            cache.remove(key)
-
-            fp.status = UploadStatus.COMMITTING
-            fp.message = "Finalizing…"
-            emitProgress()
-            val mediaKey = try {
-                api.commitUpload(commitToken!!, djiFile.displayName, sha1, timestampSec)
-            } catch (e: Exception) {
-                throw RuntimeException("Finalize failed: ${e.message}")
-            }
+            enter(UploadStatus.COMMITTING, "Finalizing…")
+            val mediaKey = api.commitUpload(commitToken!!, source.displayName, sha1!!, source.lastModifiedMs.takeIf { it > 0 }?.div(1000) ?: (System.currentTimeMillis() / 1000))
+            cache.remove(source.key)
+            history.record(source.displayName, size, mediaKey)
 
             fp.status = UploadStatus.COMPLETED
             fp.message = "Uploaded"
+            fp.bytesUploaded = size
             progress.incCompleted()
+            if (deleteAfter) deleteOriginal(source, fp)
             emitProgress()
-            if (deleteAfter) tryDeleteOriginal(djiFile)
-            return UploadResult(key, djiFile.displayName, true, mediaKey)
+            return UploadResult(source.key, source.displayName, true, mediaKey)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            if (cancelled) return cancelledResult(source, fp)
             fp.status = UploadStatus.ERROR
-            fp.message = hint403(e.message, fp.status.name)
+            fp.message = hint403(e.message, phase.name)
+            fp.error = e.message
             progress.incFailed()
             emitProgress()
-            Log.e("UploadManager","Upload failed ${djiFile.displayName}: ${e.message}", e)
-            return UploadResult(key, djiFile.displayName, false, error = e.message ?: "Failed")
+            Log.e("UploadManager", "Upload failed ${source.displayName} at $phase: ${e.message}", e)
+            return UploadResult(source.key, source.displayName, false, error = e.message ?: "Failed")
         }
     }
 
-    private suspend fun uploadWithHashFile(
-        djiFile: DjiFile,
-        key: String,
-        fp: FileProgress,
-        api: GooglePhotosApi,
-        f: java.io.File,
-    ): UploadResult {
-        val fileSize = f.length()
-        fp.totalBytes = fileSize
-        try {
-            fp.status = UploadStatus.HASHING
-            fp.message = "Calculating hash…"
-            emitProgress()
-            var lastHashEmit = 0L
-            val sha1 = api.calculateSha1(f) { read, total ->
-                fp.updateBytes((read * 0.1).toLong().coerceAtMost(total), total)
-                val now = System.currentTimeMillis()
-                if (now - lastHashEmit > 300) {
-                    lastHashEmit = now
-                    emitProgress()
-                }
-            }
-            fp.bytesUploaded = 0
-            val sha1B64 = Base64.getEncoder().encodeToString(sha1)
-            if (cancelled) return UploadResult(key, djiFile.displayName, false, error="Cancelled")
-            if (!force) {
-                fp.status = UploadStatus.CHECKING
-                fp.message = "Checking if already backed up…"
-                emitProgress()
-                val existingKey = api.findMediaByHash(sha1)
-                if (existingKey.isNotEmpty()) {
-                    fp.status = UploadStatus.SKIPPED
-                    fp.message = "Already in library"
-                    progress.incSkipped()
-                    emitProgress()
-                    if (deleteAfter) tryDeleteOriginal(djiFile)
-                    return UploadResult(key, djiFile.displayName, true, existingKey, skipped = true)
-                }
-            }
-            if (cancelled) return UploadResult(key, djiFile.displayName, false, error="Cancelled")
-            var uploadId: String? = null
-            var resumeOffset: Long? = null
-            var commitToken: gphotos.CommitTokenOuterClass.CommitToken? = null
-            val cached = cache.get(key)
-            if (cached != null) {
-                val cachedId = cached.optString("upload_id","")
-                if (cachedId.isNotEmpty()) {
-                    val (offset, token) = api.tryResumeSession(cachedId, fileSize)
-                    if (token != null) commitToken = token
-                    else if (offset != null) {
-                        uploadId = cachedId
-                        resumeOffset = offset
-                        fp.status = UploadStatus.RESUMING
-                        fp.resumeOffset = offset
-                        fp.updateBytes(offset, fileSize)
-                        emitProgress()
-                    }
-                }
-            }
-            if (uploadId == null && commitToken == null) {
-                fp.status = UploadStatus.UPLOADING
-                fp.message = "Requesting upload token…"
-                emitProgress()
-                uploadId = api.getUploadToken(sha1B64, fileSize)
-                cache.set(key, uploadId, fileSize)
-            }
-            if (commitToken == null) {
-                if (fp.status != UploadStatus.RESUMING) fp.status = UploadStatus.UPLOADING
-                fp.message = "Uploading…"
-                emitProgress()
-                commitToken = api.uploadFile(
-                    file = f,
-                    uploadId = uploadId!!,
-                    fileSize = fileSize,
-                    onProgress = { read, total ->
-                        if (fp.trackUpload(read, total)) emitProgress()
-                    },
-                    resumeOffset = resumeOffset ?: 0
-                )
-                fp.bytesUploaded = fileSize
-                emitProgress()
-            }
-            cache.remove(key)
-            fp.status = UploadStatus.COMMITTING
-            fp.message = "Finalizing…"
-            emitProgress()
-            val mediaKey = api.commitUpload(commitToken!!, djiFile.displayName, sha1, f.lastModified()/1000)
-            fp.status = UploadStatus.COMPLETED
-            fp.message = "Uploaded"
-            progress.incCompleted()
-            emitProgress()
-            if (deleteAfter) tryDeleteOriginal(djiFile)
-            return UploadResult(key, djiFile.displayName, true, mediaKey)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            fp.status = UploadStatus.ERROR
-            fp.message = hint403(e.message, fp.status.name)
-            progress.incFailed()
-            emitProgress()
-            return UploadResult(key, djiFile.displayName, false, error = e.message ?: "Failed")
-        }
-    }
-
-    private fun tryDeleteOriginal(djiFile: DjiFile) {
-        try {
-            djiFile.file?.delete()
-            djiFile.uri?.let { uri ->
-                try { DocumentsContract.deleteDocument(context.contentResolver, uri) } catch (e: Exception) {}
-            }
-        } catch (e: Exception) {}
+    private fun cancelledResult(source: MediaSource, fp: FileProgress): UploadResult {
+        fp.status = UploadStatus.CANCELLED
+        fp.message = "Cancelled"
+        emitProgress()
+        return UploadResult(source.key, source.displayName, false, error = "Cancelled")
     }
 }
+
+private const val ALREADY_IN_LIBRARY = "Already in library"

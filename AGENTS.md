@@ -60,7 +60,11 @@ make publish V=1.4 CODE=11 NOTES="..."   # bump → release build → commit →
 make auth-log   # adb logcat filtered by photos.native for the master-token line
 ```
 
-No unit tests exist yet. Lint is not enforced.
+Unit tests: `./gradlew testDebugUnitTest` (JVM; includes vendored osmosis Action 4 manifest fixtures).
+`GooglePhotosLiveTest` uploads one random image to the real account, so it is skipped unless both
+`GPIC_LIVE_TEST=1` and `G_TOKEN` (photos.native line; `.envrc` is git-ignored, quote the value) are set.
+Run it with `--rerun` — env vars aren't Test-task inputs, so Gradle otherwise reuses a cached skip.
+Lint is not enforced.
 
 ## Project Structure
 
@@ -72,11 +76,13 @@ app/src/main/
     data/
       api/      GooglePhotosApi.kt (internal Photos API port), Retry.kt
       auth/     AuthManager.kt (master-token exchange), CredentialStore.kt, GoogleAccountLinker.kt (stub)
-      cache/    UploadCache.kt (24h TTL resume tokens, mirrors desktop)
       dji/      DjiScanner.kt (SAF tree + multi-file pick), DjiFile.kt, UsbReceiver.kt
       progress/ FileProgress.kt (UploadStatus + ProgressTracker.snapshot())
       stats/    SystemStatsCollector.kt (/proc/stat + TrafficStats), SystemStats.kt
-      upload/   UploadManager.kt (coroutine semaphore, smallest-first, SAF streaming)
+      upload/   UploadManager.kt (one pipeline over MediaSource: hash→dedup→resume→stream→commit), MediaSource.kt
+      cache/    UploadCache.kt (resume ids) + UploadHistory.kt (name+size → media key, for single-pass sources)
+    camera/     CameraLink.kt (BLE pair → camera WiFi → DUML list), CameraTransfer.kt (self-resuming HTTP stream, stager)
+      osmosis/  vendored KonradIT/osmosis protocol code (MIT, see NOTICE.md); only change: CameraNet socket binding
     ui/
       theme/      Theme.kt
       components/ StatusCard.kt, SystemStatsCard.kt (Morphe-style CPU/RAM/disk/net sparklines)
@@ -104,6 +110,13 @@ docs/AUTH_LINKING_RESEARCH.md    # why silent Photos linking is impossible; Cred
 ### Auth (two options, see AuthScreen)
 - **Option B (current uploader):** paste the FULL `adb logcat | grep photos.native` line (`androidId`+`Email`+`Token`+`service=...photos.native`). `AuthManager` mirrors `auth.py` exactly — never hardcode `service`. A `userinfo.profile` line 403s every call. Stored in EncryptedSharedPreferences.
 - **Option A (stub):** official OAuth via CredentialManager + AuthorizationClient (`GoogleAccountLinker.kt`, needs `WEB_CLIENT_ID` + Play verification). Post-Mar-2025 scopes are app-created-data only.
+
+### DJI camera over WiFi (Android 10+)
+`CameraLink` follows osmosis's verified sequence; only camera sockets are bound to the camera network
+(`CameraNet`), never the whole process, so Google uploads keep the default network. Two modes
+(Settings): download-to-phone first (default; works without mobile data) or stream (single-pass hash,
+needs internet alongside the camera AP; falls back to download). `adb logcat -s GPicCamera` traces it.
+On a 2.4 GHz-only phone (Redmi 3S) the Action 4's AP never appeared in scans after a successful BLE pair — likely 5 GHz.
 
 ### DJI over USB-C
 Action 4 exposes MTP, which Android can't auto-mount: `OpenDocumentTree` (whole DCIM, persisted) or `OpenMultipleDocuments` (multi-file). `DjiScanner` resolves display name/size via DocumentFile + OpenableColumns, sorted smallest-first. Uploads stream straight from the Uri (no temp copy) with resume `skip()`.

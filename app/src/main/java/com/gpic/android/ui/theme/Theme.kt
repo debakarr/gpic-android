@@ -1,9 +1,11 @@
 package com.gpic.android.ui.theme
 
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 
 private val DarkColorScheme = darkColorScheme(
     primary = Color(0xFF4285F4),
@@ -28,8 +30,17 @@ private val LightColorScheme = lightColorScheme(
 @Composable
 fun GpicTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
+    // Material You wallpaper colors on Android 12+; the Google palette above elsewhere.
+    dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
-    val scheme = if (darkTheme) DarkColorScheme else LightColorScheme
+    val scheme = when {
+        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val ctx = LocalContext.current
+            if (darkTheme) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
+        }
+        darkTheme -> DarkColorScheme
+        else -> LightColorScheme
+    }
     MaterialTheme(colorScheme = scheme, content = content)
 }

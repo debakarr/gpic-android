@@ -71,6 +71,10 @@ android {
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
+    testOptions {
+        // android.util.Log etc. return defaults in JVM tests instead of throwing.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 kotlin {

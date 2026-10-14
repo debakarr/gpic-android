@@ -15,8 +15,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.File
-import java.io.FileInputStream
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.concurrent.TimeUnit
@@ -49,8 +47,10 @@ class GooglePhotosApi(
     companion object {
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS) // streaming
-            .writeTimeout(0, TimeUnit.SECONDS)
+            // Per-I/O-operation, not whole-call: a long upload is fine, a stalled one now fails
+            // (and is retried/resumed) instead of hanging forever.
+            .readTimeout(2, TimeUnit.MINUTES)
+            .writeTimeout(2, TimeUnit.MINUTES)
             .retryOnConnectionFailure(false) // we handle retry manually
             .build()
 
@@ -105,7 +105,7 @@ class GooglePhotosApi(
                 }
             } catch (e: Exception) {
                 lastError = e
-                if (isNonRetryable(e as? Exception ?: RuntimeException(e.toString()))) throw e
+                if (isNonRetryable(e)) throw e
                 // Network errors / 5xx / 429 retry; 4xx already rethrown above
                 if (attempt < retryConfig.maxRetries) {
                     val delay = calculateBackoff(attempt, retryConfig)
@@ -199,77 +199,35 @@ class GooglePhotosApi(
     }
 
     /**
-     * Streaming upload with progress callback and optional on-the-fly SHA1.
-     * Port of _do_upload_attempt
-     */
-    fun uploadFile(
-        file: File,
-        uploadId: String,
-        fileSize: Long = file.length(),
-        onProgress: ((bytesRead: Long, total: Long) -> Unit)? = null,
-        resumeOffset: Long = 0,
-        computeHash: Boolean = false,
-        hashOut: MutableList<ByteArray>? = null,
-    ): CommitTokenOuterClass.CommitToken {
-        val uploadUrl = "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=$uploadId"
-
-        var attemptOffset = resumeOffset
-        var lastError: Exception? = null
-        for (attempt in 0..retryConfig.maxRetries) {
-            if (cancelled) throw RuntimeException("Upload cancelled")
-            // On retries, check server resume point
-            if (attempt > 0) {
-                val (resumeByte, existingToken) = tryResume(uploadUrl, fileSize)
-                if (existingToken != null) return existingToken
-                if (resumeByte != null) attemptOffset = resumeByte + 1
-            }
-            try {
-                return doUploadAttempt(file, uploadUrl, fileSize, onProgress, attemptOffset, computeHash, hashOut)
-            } catch (e: Exception) {
-                lastError = e
-                if (isNonRetryable(e as? Exception ?: RuntimeException(e.toString()))) throw e
-                if (attempt < retryConfig.maxRetries) {
-                    val delay = calculateBackoff(attempt, retryConfig)
-                    Log.i("GooglePhotosApi","Upload retry in ${delay}ms attempt ${attempt+2} due to ${e.message}")
-                    Thread.sleep(delay)
-                }
-            }
-        }
-        throw RuntimeException("Upload failed after ${retryConfig.maxRetries+1}: $lastError")
-    }
-
-    /**
-     * Streaming upload directly from a ContentResolver Uri (no temp-file copy).
-     * Fixes "stuck at Preparing" for GB-scale DJI videos: previously we copied the
-     * entire SAF file to cacheDir before uploading, which looked hung with 0% feedback
-     * and could fill disk. Now we hash + upload straight from the Uri stream.
+     * Streaming upload with resume. Port of _do_upload_attempt.
      *
-     * @param openStream fresh stream per attempt (required for retry/resume).
+     * @param openStream fresh stream positioned at the given offset, one per attempt.
+     * @param hashOut receives the SHA-1 of the whole file, but only from an attempt that streamed
+     *   it from byte 0 — a resumed attempt sees only the tail, and its digest would be wrong.
      */
     fun uploadStream(
-        openStream: () -> java.io.InputStream,
+        openStream: (offset: Long) -> java.io.InputStream,
         fileSize: Long,
         uploadId: String,
         onProgress: ((bytesRead: Long, total: Long) -> Unit)? = null,
         resumeOffset: Long = 0,
-        computeHash: Boolean = false,
         hashOut: MutableList<ByteArray>? = null,
     ): CommitTokenOuterClass.CommitToken {
-        val uploadUrl = "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=$uploadId"
+        val uploadUrl = uploadUrl(uploadId)
         var attemptOffset = resumeOffset
         var lastError: Exception? = null
         for (attempt in 0..retryConfig.maxRetries) {
             if (cancelled) throw RuntimeException("Upload cancelled")
             if (attempt > 0) {
-                val (resumeByte, existingToken) = tryResume(uploadUrl, fileSize)
+                val (nextByte, existingToken) = tryResume(uploadUrl, fileSize)
                 if (existingToken != null) return existingToken
-                if (resumeByte != null) attemptOffset = resumeByte + 1
+                if (nextByte != null) attemptOffset = nextByte
             }
             try {
-                return doUploadStreamAttempt(openStream, uploadUrl, fileSize, onProgress, attemptOffset, computeHash, hashOut)
+                return doUploadStreamAttempt(openStream, uploadUrl, fileSize, onProgress, attemptOffset, hashOut)
             } catch (e: Exception) {
                 lastError = e
-                if (isNonRetryable(e as? Exception ?: RuntimeException(e.toString()))) throw e
+                if (cancelled || isNonRetryable(e)) throw e
                 if (attempt < retryConfig.maxRetries) {
                     val delay = calculateBackoff(attempt, retryConfig)
                     Log.i("GooglePhotosApi", "Stream upload retry in ${delay}ms attempt ${attempt + 2} due to ${e.message}")
@@ -281,42 +239,28 @@ class GooglePhotosApi(
     }
 
     private fun doUploadStreamAttempt(
-        openStream: () -> java.io.InputStream,
+        openStream: (Long) -> java.io.InputStream,
         uploadUrl: String,
         fileSize: Long,
         onProgress: ((Long, Long) -> Unit)?,
         startByte: Long,
-        computeHash: Boolean,
         hashOut: MutableList<ByteArray>?,
     ): CommitTokenOuterClass.CommitToken {
         if (cancelled) throw RuntimeException("Upload cancelled")
         if (startByte < 0 || startByte > fileSize) throw RuntimeException("Invalid resume offset $startByte/$fileSize")
-        val sha1 = if (computeHash) MessageDigest.getInstance("SHA-1") else null
+        val sha1 = if (hashOut != null && startByte == 0L) MessageDigest.getInstance("SHA-1") else null
         val contentLength = fileSize - startByte
 
         val body = object : okhttp3.RequestBody() {
             override fun contentType() = "application/octet-stream".toMediaType()
             override fun contentLength() = contentLength
             override fun writeTo(sink: okio.BufferedSink) {
-                openStream().use { raw ->
-                    // Skip to resume point; ContentResolver streams support skip but may be partial.
-                    var toSkip = startByte
-                    while (toSkip > 0) {
-                        if (cancelled) throw RuntimeException("Upload cancelled")
-                        val skipped = raw.skip(toSkip)
-                        if (skipped <= 0) {
-                            // Fallback: read+discard if skip unsupported
-                            val discard = ByteArray(256 * 1024)
-                            val r = raw.read(discard, 0, minOf(discard.size.toLong(), toSkip).toInt())
-                            if (r == -1) throw RuntimeException("Stream ended before resume offset $startByte/$fileSize")
-                            toSkip -= r
-                        } else toSkip -= skipped
-                    }
+                openStream(startByte).use { raw ->
                     val buffer = ByteArray(256 * 1024)
                     var totalRead = startByte
-                    while (true) {
+                    while (totalRead < fileSize) {
                         if (cancelled) throw RuntimeException("Upload cancelled")
-                        val read = raw.read(buffer)
+                        val read = raw.read(buffer, 0, minOf(buffer.size.toLong(), fileSize - totalRead).toInt())
                         if (read == -1) break
                         totalRead += read
                         sha1?.update(buffer, 0, read)
@@ -327,9 +271,7 @@ class GooglePhotosApi(
                         throw RuntimeException("Stream ended early: $totalRead/$fileSize bytes")
                     }
                 }
-                if (computeHash && hashOut != null && sha1 != null) {
-                    hashOut.add(sha1.digest())
-                }
+                if (sha1 != null && hashOut != null && hashOut.isEmpty()) hashOut.add(sha1.digest())
             }
         }
 
@@ -355,15 +297,15 @@ class GooglePhotosApi(
     }
 
     /**
-     * Hash a ContentResolver stream with progress (for GB files hashing also looks stuck).
+     * Hash a stream with progress (for GB files hashing also looks stuck).
      */
     fun calculateSha1WithProgress(
-        openStream: () -> java.io.InputStream,
+        openStream: (offset: Long) -> java.io.InputStream,
         fileSize: Long,
         onProgress: ((bytesRead: Long, total: Long) -> Unit)? = null,
     ): ByteArray {
         val md = MessageDigest.getInstance("SHA-1")
-        openStream().use { s ->
+        openStream(0).use { s ->
             val buf = ByteArray(1024 * 1024)
             var total = 0L
             while (true) {
@@ -378,6 +320,11 @@ class GooglePhotosApi(
         return md.digest()
     }
 
+    /**
+     * Ask the server how much of [uploadUrl] it already has.
+     * @return (next byte to send, null) for a 308; (null, token) when the upload already finished;
+     *   (null, null) when the session is unknown/expired.
+     */
     private fun tryResume(uploadUrl: String, fileSize: Long): Pair<Long?, CommitTokenOuterClass.CommitToken?> {
         return try {
             val req = Request.Builder()
@@ -390,19 +337,8 @@ class GooglePhotosApi(
                 .build()
             client.newCall(req).execute().use { resp ->
                 when (resp.code) {
-                    200, 201 -> {
-                        val token = CommitTokenOuterClass.CommitToken.parseFrom(resp.body?.bytes())
-                        null to token
-                    }
-                    308 -> {
-                        val range = resp.header("Range") ?: ""
-                        if ("=" in range) {
-                            val parts = range.substringAfter("=").split("-")
-                            val last = parts.getOrNull(1)?.toLongOrNull()
-                            if (last != null) return last to null
-                        }
-                        0L to null
-                    }
+                    200, 201 -> null to CommitTokenOuterClass.CommitToken.parseFrom(resp.body?.bytes())
+                    308 -> nextByteFromRange(resp.header("Range")) to null
                     else -> null to null
                 }
             }
@@ -411,77 +347,11 @@ class GooglePhotosApi(
         }
     }
 
-    private fun doUploadAttempt(
-        file: File,
-        uploadUrl: String,
-        fileSize: Long,
-        onProgress: ((Long, Long) -> Unit)?,
-        startByte: Long,
-        computeHash: Boolean,
-        hashOut: MutableList<ByteArray>?,
-    ): CommitTokenOuterClass.CommitToken {
-        if (cancelled) throw RuntimeException("Upload cancelled")
-        val sha1 = if (computeHash) MessageDigest.getInstance("SHA-1") else null
+    fun tryResumeSession(uploadId: String, fileSize: Long): Pair<Long?, CommitTokenOuterClass.CommitToken?> =
+        tryResume(uploadUrl(uploadId), fileSize)
 
-        // For streaming we need to count bytes and report progress
-        // OkHttp RequestBody that streams file chunk and calls onProgress
-        val contentLength = fileSize - startByte
-        val fileInput = FileInputStream(file).apply { if (startByte > 0) skip(startByte) }
-
-        val body = object : okhttp3.RequestBody() {
-            override fun contentType() = "application/octet-stream".toMediaType()
-            override fun contentLength() = contentLength
-            override fun writeTo(sink: okio.BufferedSink) {
-                val buffer = ByteArray(256 * 1024)
-                var totalRead = startByte
-                var lastEmit = System.currentTimeMillis()
-                while (true) {
-                    if (cancelled) throw RuntimeException("Upload cancelled")
-                    val read = fileInput.read(buffer)
-                    if (read == -1) break
-                    totalRead += read
-                    sha1?.update(buffer, 0, read)
-                    sink.write(buffer, 0, read)
-                    onProgress?.invoke(totalRead, fileSize)
-                }
-                fileInput.close()
-                if (computeHash && hashOut != null && sha1 != null) {
-                    hashOut.add(sha1.digest())
-                }
-            }
-        }
-
-        val req = Request.Builder()
-            .url(uploadUrl)
-            .header("Authorization", "Bearer ${bearer()}")
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", contentLength.toString())
-            .header("Content-Range", "bytes $startByte-${fileSize-1}/$fileSize")
-            .header("User-Agent", userAgent)
-            .put(body)
-            .build()
-
-        client.newCall(req).execute().use { resp ->
-            if (resp.code >= 400) {
-                val preview = try { resp.body?.bytes()?.take(1200)?.toByteArray()?.let { previewBytes(gunzipMaybe(it)) } } catch (_: Exception) { "" } ?: ""
-                Log.e("GooglePhotosApi","Upload failed ${resp.code}: $preview")
-                throw RuntimeException("Upload rejected (${resp.code}): $preview")
-            }
-            val bytes = resp.body?.bytes() ?: throw RuntimeException("Empty upload response")
-            // hashOut if computeHash already handled in writeTo, but if we didn't compute there, fallback?
-            // Ensure hashOut filled if needed
-            if (computeHash && (hashOut == null || hashOut.isEmpty()) && sha1 != null) {
-                // Should have been filled; if not, compute separately (fallback)
-                // but we already digested via streaming, so we have it
-            }
-            return CommitTokenOuterClass.CommitToken.parseFrom(bytes)
-        }
-    }
-
-    fun tryResumeSession(uploadId: String, fileSize: Long): Pair<Long?, CommitTokenOuterClass.CommitToken?> {
-        val url = "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=$uploadId"
-        return tryResume(url, fileSize)
-    }
+    private fun uploadUrl(uploadId: String) =
+        "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=$uploadId"
 
     fun commitUpload(
         commitToken: CommitTokenOuterClass.CommitToken,
@@ -623,36 +493,13 @@ class GooglePhotosApi(
             endpoint = "addToAlbum"
         ).close()
     }
+}
 
-    fun calculateSha1(file: File, onProgress: ((Long, Long) -> Unit)? = null): ByteArray {
-        val md = MessageDigest.getInstance("SHA-1")
-        val total = file.length()
-        var read = 0L
-        FileInputStream(file).use { fis ->
-            val buf = ByteArray(1024 * 1024)
-            while (true) {
-                if (cancelled) throw RuntimeException("Upload cancelled")
-                val r = fis.read(buf)
-                if (r == -1) break
-                md.update(buf, 0, r)
-                read += r
-                onProgress?.invoke(read, total)
-            }
-        }
-        return md.digest()
-    }
-
-    // Convenience for InputStream-based files (e.g., DocumentFile from SAF)
-    fun calculateSha1(stream: java.io.InputStream): ByteArray {
-        val md = MessageDigest.getInstance("SHA-1")
-        stream.use { s ->
-            val buf = ByteArray(1024 * 1024)
-            while (true) {
-                val r = s.read(buf)
-                if (r == -1) break
-                md.update(buf, 0, r)
-            }
-        }
-        return md.digest()
-    }
+/**
+ * Next byte to send, from a resumable-upload 308 `Range` header. The header names the last byte
+ * the server holds, inclusive (`bytes=0-999` → resume at 1000); no header means nothing arrived.
+ */
+internal fun nextByteFromRange(range: String?): Long {
+    val last = range?.substringAfter('=', "")?.substringAfter('-', "")?.trim()?.toLongOrNull()
+    return if (last == null) 0L else last + 1
 }

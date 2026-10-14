@@ -4,7 +4,7 @@ package com.gpic.android.data.progress
  * Port of gphotos/progress.py FileProgress
  */
 enum class UploadStatus {
-    PENDING, PREPARING, HASHING, CHECKING, UPLOADING, RESUMING, COMMITTING, COMPLETED, ERROR, SKIPPED, QUEUED
+    PENDING, PREPARING, HASHING, CHECKING, UPLOADING, RESUMING, COMMITTING, COMPLETED, ERROR, SKIPPED, QUEUED, CANCELLED, DOWNLOADING
 }
 
 data class FileProgress(
@@ -25,6 +25,13 @@ data class FileProgress(
 
     val resumedPercentage: Float
         get() = if (totalBytes == 0L) 0f else (resumeOffset.toFloat() / totalBytes.toFloat()) * 100f
+
+    /** Bytes to count toward batch progress: finished files (incl. skipped/failed) count in full. */
+    val settledBytes: Long
+        get() = when (status) {
+            UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.ERROR, UploadStatus.CANCELLED -> totalBytes
+            else -> bytesUploaded.coerceAtMost(totalBytes)
+        }
 
     fun updateBytes(read: Long, total: Long) {
         bytesUploaded = read
@@ -106,6 +113,8 @@ data class FileProgress(
             UploadStatus.COMPLETED -> "Done"
             UploadStatus.SKIPPED -> "Already backed up"
             UploadStatus.ERROR -> "Failed"
+            UploadStatus.CANCELLED -> "Cancelled"
+            UploadStatus.DOWNLOADING -> "Downloading from camera"
         }
 }
 
@@ -130,8 +139,7 @@ class ProgressTracker {
         get() = if (totalFiles == 0) 0f else (doneCount.toFloat() / totalFiles.toFloat()) * 100f
 
     @Synchronized
-    fun addFile(filePath: String, fileSize: Long) {
-        val name = filePath.substringAfterLast("/").substringAfterLast("\\")
+    fun addFile(filePath: String, fileSize: Long, name: String) {
         _files[filePath] = FileProgress(filePath = filePath, fileName = name, totalBytes = fileSize)
         totalFiles++
         totalBytes += fileSize

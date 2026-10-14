@@ -22,6 +22,9 @@ import java.io.File
  * and tries common mount points like /storage/xxxx/DCIM if device is rooted/OTG mounted.
  */
 class DjiScanner(private val context: Context) {
+    companion object {
+        const val DJI_VENDOR_ID = 0x2ca3
+    }
 
     fun checkUsbConnected(): Boolean {
         val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
@@ -33,7 +36,8 @@ class DjiScanner(private val context: Context) {
         val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
         val devices = usbManager.deviceList.values
         if (devices.isEmpty()) return "No USB device detected. Plug DJI Action 4 via USB-C."
-        val d = devices.first()
+        // Report the camera, not whatever hub/keyboard enumerated first.
+        val d = devices.firstOrNull { it.vendorId == DJI_VENDOR_ID } ?: devices.first()
         return "USB device: ${d.manufacturerName ?: "Unknown"} ${d.productName ?: ""} (VID ${d.vendorId} PID ${d.productId})"
     }
 
@@ -93,11 +97,17 @@ class DjiScanner(private val context: Context) {
     }
 
     fun takePersistableFilePermission(uri: Uri) {
+        val read = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+        val write = android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        // Write too, when the picker granted it, so "Delete after upload" still works after a restart.
         try {
-            val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-            context.contentResolver.takePersistableUriPermission(uri, flags)
+            context.contentResolver.takePersistableUriPermission(uri, read or write)
         } catch (_: Exception) {
-            // Non-persistable Uris (e.g. from Downloads) still work for this session.
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, read)
+            } catch (_: Exception) {
+                // Non-persistable Uris (e.g. from Downloads) still work for this session.
+            }
         }
     }
 
