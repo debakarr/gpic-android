@@ -2,6 +2,8 @@ package com.gpic.android.data.upload
 
 import android.content.Context
 import android.util.Log
+import com.gpic.android.data.albums.IndexedMedia
+import com.gpic.android.data.albums.MediaIndex
 import com.gpic.android.data.api.GooglePhotosApi
 import com.gpic.android.data.auth.Credential
 import com.gpic.android.data.cache.UploadCache
@@ -142,6 +144,7 @@ class UploadManager(
             }
         }
 
+        MediaIndex.get(context).flush()
         emitProgress()
         _events.value = UploadEvent.UploadDone
     }
@@ -160,7 +163,17 @@ class UploadManager(
         return b + " | 403 Forbidden at " + phase + " (service=" + svc + ")." + extra + " Bearer OK but scope denied: adb logcat | grep photos.native, reopen Photos, copy FULL androidId=...&service=... line, retry."
     }
 
+    /** Remember what's in the library for album suggestions. Before any delete: it reads the file. */
+    private fun index(source: MediaSource, mediaKey: String) {
+        if (mediaKey.isEmpty()) return
+        runCatching {
+            val c = source.captureInfo()
+            MediaIndex.get(context).record(IndexedMedia(mediaKey, source.displayName, c.takenMs, c.lat, c.lon, source.thumbUri))
+        }.onFailure { Log.w("UploadManager", "index failed for ${source.displayName}: ${it.message}") }
+    }
+
     private fun skipped(source: MediaSource, fp: FileProgress, mediaKey: String, why: String): UploadResult {
+        index(source, mediaKey)
         fp.status = UploadStatus.SKIPPED
         fp.message = why
         progress.incSkipped()
@@ -172,9 +185,23 @@ class UploadManager(
     }
 
     private fun deleteOriginal(source: MediaSource, fp: FileProgress) {
-        val err = source.delete() ?: return
+        val done = fp.message.ifEmpty { "Uploaded" }
+        // What Google has may be missing the GPS Android hid from us; the original is the only copy with it.
+        if (source.mayHaveLostLocation) {
+            fp.message = "$done • original kept: " + if (OriginalMedia.hasLocationPermission(context))
+                "Android didn't hand GPic the original, so its location may not have uploaded"
+            else "allow GPic photo and video access so it can read the location"
+            return
+        }
+        val err = source.delete()
+        if (err == null) {
+            fp.deleted = true
+            progress.incDeleted()
+            fp.message = "$done • deleted from phone"
+            return
+        }
         Log.w("UploadManager", "delete-after failed: $err")
-        fp.message = "${fp.message.ifEmpty { "Uploaded" }} • original kept: $err"
+        fp.message = "$done • original kept: $err"
     }
 
     /**
@@ -195,7 +222,12 @@ class UploadManager(
 
         enter(UploadStatus.PREPARING, "Opening file…")
         fp.totalBytes = size
-        source.checkReadable()?.let { err ->
+        // With the permission granted, a missing original is Android not handing it over (seen once right after
+        // 40 files were copied in). Uploading the stripped read would leave a GPS-less duplicate; fail so Retry can
+        // fetch the original. Without the permission the user chose stripped uploads (they're just never deleted).
+        val withheld = if (source.knownStrippedGps && OriginalMedia.hasLocationPermission(context))
+            "Android didn't hand over the original file, so its location would be lost. Retry in a moment." else null
+        (withheld ?: source.checkReadable())?.let { err ->
             fp.status = UploadStatus.ERROR
             fp.message = err
             fp.error = err
@@ -208,6 +240,7 @@ class UploadManager(
             // Hash first when a second read is cheap: it lets Google tell us the file is already
             // backed up before we send a byte. Single-pass sources (camera WiFi) hash while uploading.
             var sha1: ByteArray? = null
+            var staleKey: String? = null
             if (!force && !source.singlePass) {
                 enter(UploadStatus.HASHING, "Calculating hash…")
                 var lastHashEmit = 0L
@@ -223,9 +256,19 @@ class UploadManager(
                 fp.bytesUploaded = 0
                 if (cancelled) return cancelledResult(source, fp)
 
+                Log.i("GPicMedia", "${source.displayName} sha1=${sha1.joinToString("") { "%02x".format(it) }} lostLocation=${source.mayHaveLostLocation}")
                 enter(UploadStatus.CHECKING, "Checking if already backed up…")
                 val existingKey = api.findMediaByHash(sha1)
                 if (existingKey.isNotEmpty()) return skipped(source, fp, existingKey, ALREADY_IN_LIBRARY)
+                // Not there as-is. An older GPic read this photo with its GPS stripped; if that copy is
+                // what's in the library, this upload is the one that brings the location.
+                source.openRedacted?.let { openPlain ->
+                    enter(UploadStatus.CHECKING, "Checking for a copy without location…")
+                    val plain = api.calculateSha1WithProgress(openPlain, size)
+                    if (!plain.contentEquals(sha1)) staleKey = api.findMediaByHash(plain).ifEmpty { null }
+                    Log.i("GPicMedia", "${source.displayName} plain sha1=${plain.joinToString("") { "%02x".format(it) }} staleCopy=${staleKey != null}")
+                    if (cancelled) return cancelledResult(source, fp)
+                }
             } else if (!force) {
                 history.find(source.displayName, size)?.let { return skipped(source, fp, it, "Uploaded before from this phone") }
             }
@@ -288,6 +331,12 @@ class UploadManager(
             fp.message = "Uploaded"
             fp.bytesUploaded = size
             progress.incCompleted()
+            index(source, mediaKey)
+            if (staleKey != null) {
+                fp.staleKey = staleKey
+                fp.message = "Uploaded with location • the older copy without it is still in Google Photos (delete it there)"
+                progress.incRelocated()
+            }
             if (deleteAfter) deleteOriginal(source, fp)
             emitProgress()
             return UploadResult(source.key, source.displayName, true, mediaKey)

@@ -19,6 +19,10 @@ data class FileProgress(
     var speedBps: Long = 0,
     var etaSeconds: Long = 0,
     var error: String? = null,
+    /** The local original was deleted after a successful upload / exact match. */
+    var deleted: Boolean = false,
+    /** Media key of an older GPS-less copy of this photo still in the library (see OriginalMedia). */
+    var staleKey: String? = null,
 ) {
     val percentage: Float
         get() = if (totalBytes == 0L) 0f else (bytesUploaded.toFloat() / totalBytes.toFloat()) * 100f
@@ -97,7 +101,11 @@ data class FileProgress(
     val detailLine: String
         get() = when (status) {
             UploadStatus.UPLOADING, UploadStatus.RESUMING -> "$statusLabel • $transferSummary"
-            else -> if (message.isNotEmpty() && status != UploadStatus.COMPLETED) "$statusLabel • $message" else statusLabel
+            // A finished upload's message only matters when it adds something (deleted, kept, stale copy).
+            UploadStatus.COMPLETED -> if (message.isEmpty() || message == "Uploaded") statusLabel else message
+            // "Already in library", "Uploaded before from this phone", … already say it; don't prefix "Already backed up".
+            UploadStatus.SKIPPED -> message.ifEmpty { statusLabel }
+            else -> if (message.isNotEmpty()) "$statusLabel • $message" else statusLabel
         }
 
     val statusLabel: String
@@ -132,6 +140,11 @@ class ProgressTracker {
         private set
     @Volatile var skipped: Int = 0
         private set
+    /** Uploaded again with location because the library only had a GPS-stripped copy. */
+    @Volatile var relocated: Int = 0
+        private set
+    @Volatile var deleted: Int = 0
+        private set
 
     val doneCount: Int get() = completed + failed + skipped
 
@@ -158,10 +171,12 @@ class ProgressTracker {
     @Synchronized fun incCompleted() { completed++ }
     @Synchronized fun incFailed() { failed++ }
     @Synchronized fun incSkipped() { skipped++ }
+    @Synchronized fun incRelocated() { relocated++ }
+    @Synchronized fun incDeleted() { deleted++ }
 
     @Synchronized
     fun reset() {
         _files.clear()
-        totalFiles = 0; totalBytes = 0; completed = 0; failed = 0; skipped = 0
+        totalFiles = 0; totalBytes = 0; completed = 0; failed = 0; skipped = 0; relocated = 0; deleted = 0
     }
 }

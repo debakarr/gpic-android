@@ -36,6 +36,47 @@ interface MediaSource {
 
     /** Delete the original. Returns an error message, or null on success. */
     fun delete(): String?
+
+    /**
+     * A photo/video whose location Android may have stripped from what [open] returns (no media-location
+     * permission). Its upload can lack GPS, so the original must not be deleted on its strength.
+     */
+    val mayHaveLostLocation: Boolean get() = false
+
+    /**
+     * Set when [open] reads the unredacted original: the plain read Android gives apps without the
+     * permission. Hashing it finds a GPS-less copy uploaded by an earlier GPic version.
+     */
+    val openRedacted: ((offset: Long) -> InputStream)? get() = null
+
+    /** A photo that has a location, but what [open] returns has it blanked. */
+    val knownStrippedGps: Boolean get() = false
+
+    /** Capture time + GPS for the album index (photos: EXIF header only). */
+    fun captureInfo(): CaptureInfo = CaptureInfo(lastModifiedMs)
+
+    /** Where a thumbnail can be loaded from while the original still exists. */
+    val thumbUri: String? get() = null
+}
+
+data class CaptureInfo(val takenMs: Long, val lat: Double? = null, val lon: Double? = null)
+
+/** EXIF capture time (else [fallbackMs]) and GPS. A stripped read's 0,0 counts as no location. */
+internal fun readCapture(isPhoto: Boolean, fallbackMs: Long, open: () -> InputStream): CaptureInfo {
+    if (!isPhoto) return CaptureInfo(fallbackMs)
+    return runCatching {
+        open().use { s ->
+            val exif = android.media.ExifInterface(s)
+            val taken = com.gpic.android.data.cleanup.parseExifDate(
+                exif.getAttribute(android.media.ExifInterface.TAG_DATETIME_ORIGINAL),
+                exif.getAttribute(android.media.ExifInterface.TAG_OFFSET_TIME_ORIGINAL),
+            )
+            val ll = FloatArray(2)
+            @Suppress("DEPRECATION")
+            val hasGps = exif.getLatLong(ll) && !(ll[0] == 0f && ll[1] == 0f)
+            CaptureInfo(taken ?: fallbackMs, ll[0].toDouble().takeIf { hasGps }, ll[1].toDouble().takeIf { hasGps })
+        }
+    }.getOrElse { CaptureInfo(fallbackMs) }
 }
 
 /** File on the phone's filesystem (e.g. a staged camera download). */
@@ -55,6 +96,8 @@ class LocalFileSource(
     override fun open(offset: Long): InputStream =
         FileInputStream(file).apply { if (offset > 0) channel.position(offset) }
 
+    override fun captureInfo() = readCapture(f.isPhoto, lastModifiedMs) { open(0) }
+
     override fun delete(): String? =
         if (!deleteFile || file.delete()) null else "Couldn't delete ${file.name}"
 }
@@ -69,10 +112,52 @@ class UriSource(private val context: Context, private val f: DjiFile, private va
     // MTP serialises object reads; more parallel streams just queue on the camera.
     override val maxParallel: Int? get() = if (uri.authority == MTP_AUTHORITY) 2 else null
 
+    private val mimeHint = when { f.isVideo -> "video/*"; f.isPhoto -> "image/*"; else -> null }
+    // Resolved once, off the main thread (first checkReadable/open); null = read the Uri as given.
+    private val original: Uri? by lazy { OriginalMedia.originalUri(context, uri, mimeHint) }
+    private val readUri: Uri get() = original ?: uri
+
+    /**
+     * GPS tags in the plain read. Stripping zeroes the values but keeps the tags (measured on Android 13:
+     * GPSLatitude read back as 0/1,0/1,0/1), so tags present = the photo had a location; none = it never did.
+     */
+    private enum class Gps { PRESENT, ABSENT, UNKNOWN }
+
+    /**
+     * Only JPEG is trusted to answer "no GPS": the framework ExifInterface may read nothing from other
+     * formats through a stream (PNG/WebP/HEIC/real RAW), and nothing read must not mean "safe to delete".
+     */
+    private val plainGps: Gps by lazy {
+        if (!f.isPhoto) return@lazy Gps.UNKNOWN
+        runCatching {
+            val isJpeg = context.contentResolver.openInputStream(uri)?.use { s ->
+                val head = ByteArray(3)
+                s.read(head) == 3 && head[0] == 0xFF.toByte() && head[1] == 0xD8.toByte() && head[2] == 0xFF.toByte()
+            } ?: false
+            if (!isJpeg) return@runCatching Gps.UNKNOWN
+            context.contentResolver.openInputStream(uri)?.use { s ->
+                val exif = android.media.ExifInterface(s)
+                if (exif.hasAttribute(android.media.ExifInterface.TAG_GPS_LATITUDE) || exif.hasAttribute(android.media.ExifInterface.TAG_GPS_LONGITUDE)) Gps.PRESENT
+                else Gps.ABSENT
+            } ?: Gps.UNKNOWN
+        }.getOrDefault(Gps.UNKNOWN)
+    }
+
+    private val readStripped: Boolean get() = OriginalMedia.mayRedactLocation(uri) && original == null
+
+    override val knownStrippedGps: Boolean get() = readStripped && plainGps == Gps.PRESENT
+
+    override val mayHaveLostLocation: Boolean
+        // Videos and non-JPEG photos can't be checked, so assume the worst: upload, never delete.
+        get() = readStripped && (f.isVideo || plainGps != Gps.ABSENT)
+
+    override val openRedacted: ((Long) -> InputStream)?
+        get() = if (original != null && f.isPhoto) { offset -> openUri(uri, offset) } else null
+
     override fun checkReadable(): String? {
         if (f.sizeBytes <= 0) return "Empty or unreadable file (0 bytes)"
         return try {
-            context.contentResolver.openInputStream(uri)?.close()
+            context.contentResolver.openInputStream(readUri)?.close()
             null
         } catch (e: SecurityException) {
             "Permission lost for ${f.displayName}. Re-pick folder/files, then retry. (${e.message})"
@@ -83,7 +168,13 @@ class UriSource(private val context: Context, private val f: DjiFile, private va
         }
     }
 
-    override fun open(offset: Long): InputStream {
+    override fun open(offset: Long): InputStream = openUri(readUri, offset)
+
+    override fun captureInfo() = readCapture(f.isPhoto, lastModifiedMs) { open(0) }
+
+    override val thumbUri: String get() = uri.toString()
+
+    private fun openUri(uri: Uri, offset: Long): InputStream {
         val raw = context.contentResolver.openInputStream(uri)
             ?: throw RuntimeException("Cannot open ${f.displayName} (null stream). Re-pick folder/files.")
         skipFully(raw, offset, f.sizeBytes)

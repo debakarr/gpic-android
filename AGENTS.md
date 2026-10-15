@@ -8,7 +8,7 @@
 
 - **Package:** `com.gpic.android`
 - **App entry:** `MainActivity` → Compose NavHost (home/auth/settings)
-- **Current version:** `1.3.5 (10)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
+- **Current version:** `1.4.1 (13)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
 - **Repo:** `github.com/debakarr/gpic-android` (private), branch `main`
 
 ## Tech Stack
@@ -79,8 +79,9 @@ app/src/main/
       dji/      DjiScanner.kt (SAF tree + multi-file pick), DjiFile.kt, UsbReceiver.kt
       progress/ FileProgress.kt (UploadStatus + ProgressTracker.snapshot())
       stats/    SystemStatsCollector.kt (/proc/stat + TrafficStats), SystemStats.kt
-      upload/   UploadManager.kt (one pipeline over MediaSource: hash→dedup→resume→stream→commit), MediaSource.kt
+      upload/   UploadManager.kt (one pipeline over MediaSource: hash→dedup→resume→stream→commit), MediaSource.kt, OriginalMedia.kt (unredacted GPS)
       cache/    UploadCache.kt (resume ids) + UploadHistory.kt (name+size → media key, for single-pass sources)
+      cleanup/  AgeRule.kt (free-up-space age cutoff, EXIF date parsing; pure, unit-tested)
     camera/     CameraLink.kt (BLE pair → camera WiFi → DUML list), CameraTransfer.kt (self-resuming HTTP stream, stager)
       osmosis/  vendored KonradIT/osmosis protocol code (MIT, see NOTICE.md); only change: CameraNet socket binding
     ui/
@@ -117,6 +118,48 @@ docs/AUTH_LINKING_RESEARCH.md    # why silent Photos linking is impossible; Cred
 (Settings): download-to-phone first (default; works without mobile data) or stream (single-pass hash,
 needs internet alongside the camera AP; falls back to download). `adb logcat -s GPicCamera` traces it.
 On a 2.4 GHz-only phone (Redmi 3S) the Action 4's AP never appeared in scans after a successful BLE pair — likely 5 GHz.
+
+### Photo location (GPS) — read originals
+Android 10+ zero-fills GPS in photos it hands to apps without `ACCESS_MEDIA_LOCATION`, so a plain
+SAF/MediaStore read uploads a location-less copy (and its hash then dedups against that copy).
+`OriginalMedia` maps the Uri to MediaStore (`getMediaUri`, else RELATIVE_PATH lookup for
+`com.android.externalstorage.documents`) and opens it with `setRequireOriginal`. Home asks for photo
+access + media location before any picker. When the original's hash is new, `UploadManager` also
+hashes the plain read: if *that* is in the library, an older GPic uploaded it stripped → upload the
+original and flag `staleKey` (the old copy stays; there's no known edit/trash call). Delete-after
+refuses photos read without the original (`MediaSource.mayHaveLostLocation`). `adb logcat -s GPicMedia`.
+Measured on the Redmi 3S (Android 13): folder (tree) reads without the permission were stripped (hash
+changed, same size); single picks from the picker's Recent (media documents) were not. Stripping zeroes the
+GPS values but keeps the tags (GPSLatitude reads 0/1,0/1,0/1), so `UriSource.knownStrippedGps` = plain read
+has GPS tags and no original was available. JPEGs without GPS tags lose nothing and delete normally; with
+the permission granted a known-stripped photo fails ("Retry") instead of uploading a GPS-less duplicate.
+Videos and non-JPEG photos (stream EXIF may read nothing) can't be checked: never deleted without the original. Google Photos does show EXIF GPS for GPic
+uploads (checked on a cloud-only test item).
+
+### Free up space (Home tab)
+SAF tree folder (`DjiScanner.listTree`, one query per folder, hidden entries skipped) → files whose
+taken time (earlier of EXIF DateTimeOriginal and mtime; `data/cleanup/AgeRule.kt`, EXIF read only when
+mtime alone isn't old enough) is before `AgeRule` (days/weeks/months/years, calendar maths, min 1) →
+confirm dialog → upload with delete-after forced on (exact-hash skips delete too). Folder/age/subfolder
+choices live in `gpic_prefs` (`cleanup_*`), not AppConfig.
+
+### Home screen
+Type filter (Photos / RAW / Videos chips, `MediaKind`, persisted as `type_filter`) applies to every
+source: `HomeUiState.files` is `djiFiles` after the filter and is what the list shows and Upload sends.
+After a run the FAB becomes "Retry N" (failed/cancelled only) or disappears; a new pick/rescan resets it.
+Progress card sits right under the account card; the top bar shows "Uploading n of N" (tap → top); a
+small go-to-top FAB appears once scrolled; device stats collapse; list chips All / Not done / Failed.
+A saved phone-storage folder is rescanned on launch (MTP camera folders wait for Rescan).
+
+### Album suggestions (Albums screen, top-bar icon)
+`MediaIndex` (filesDir JSON, singleton) records media key + EXIF capture time/GPS + local Uri for every
+file `UploadManager` uploads or matches (before any delete). `AlbumSuggester` (pure, unit-tested) groups
+by time on the phone: new group after an 18 h gap; groups spanning > 7 days are re-split at 3 h; min size
+3/5/10/20 (`album_min_size`). Default names are dates only (no geocoder: it would send coordinates).
+"Create album" is the only network step: `createAlbum` (first 250 keys) + `addMediaToAlbum` batches;
+items are then marked with the album and never suggested again; dismissals are stored by group id.
+Verified live: a 3-photo album appeared in Google Photos. Older backups join the pool when a folder is
+re-run (already-uploaded files hit "Already in library", which also indexes them).
 
 ### DJI over USB-C
 Action 4 exposes MTP, which Android can't auto-mount: `OpenDocumentTree` (whole DCIM, persisted) or `OpenMultipleDocuments` (multi-file). `DjiScanner` resolves display name/size via DocumentFile + OpenableColumns, sorted smallest-first. Uploads stream straight from the Uri (no temp copy) with resume `skip()`.

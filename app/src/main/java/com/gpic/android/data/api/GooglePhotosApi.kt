@@ -470,8 +470,9 @@ class GooglePhotosApi(
         )
         resp.use {
             val bytes = it.body?.bytes() ?: throw RuntimeException("Empty create album response")
-            val parsed = CreateAlbumResponseOuterClass.CreateAlbumResponse.parseFrom(bytes)
-            return parsed.field1.albumMediaKey
+            // Replies can be gzipped like the other photosdata calls.
+            val parsed = CreateAlbumResponseOuterClass.CreateAlbumResponse.parseFrom(gunzipMaybe(bytes))
+            return parsed.field1.albumMediaKey.ifEmpty { throw RuntimeException("[createAlbum] no album key in reply") }
         }
     }
 

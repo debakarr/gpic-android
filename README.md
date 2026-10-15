@@ -11,14 +11,19 @@ Android app that uploads photos and videos to Google Photos — from a DJI Actio
 - Per-file status with live percent, speed and time left while uploading (e.g. `Uploading • 2.4 MB/s • 1m 20s left`)
 - Live CPU / RAM / disk / network panel during uploads, with sparklines
 - Copy button on every failed file (plus long-press to select text, and copy-all) for debugging failures
+- Keeps photo locations: reads the original file (Android strips GPS from photos for apps without media-location access), and re-uploads photos an earlier version sent without their location
+- **Free up space**: back up a folder's photos and videos older than N days / weeks / months / years, then delete them from the phone (only once Google Photos has them)
+- File-type filter (Photos / RAW / Videos) for every source
+- **Album suggestions**: groups the photos GPic backed up by when they were taken, on the phone, and creates the album in Google Photos when you tap Create
 
 ## Privacy & Data
 
 - **No analytics, no crash reporting, no ads, no third-party SDKs.** Dependencies are AndroidX, OkHttp, Gson, protobuf and Coil only.
 - **Your photos go from your storage to Google, nowhere else.** The app talks only to Google endpoints: `android.googleapis.com/auth` (token exchange), `photos.googleapis.com` (uploads) and `photosdata-pa.googleapis.com` (library calls).
 - **The Photos credential you paste** (`androidId`/`Email`/`Token`) is kept in `EncryptedSharedPreferences` on the device and sent only to Google. The short-lived bearer token lives in RAM and is refreshed as needed. Nothing is uploaded anywhere except Google Photos.
-- **Local state** is an upload-resume cache (`upload_cache.json`, 24h expiry) in the app cache dir, plus your picker selection and settings. Clearing app data wipes all of it.
-- **Permissions** used: `INTERNET`, `ACCESS_NETWORK_STATE`, foreground-service + notifications (to keep uploads alive in background), `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO`, and USB host (to detect the camera). `MANAGE_DOCUMENTS` is declared but is signature-level, so the system ignores it for this app.
+- **Local state** is an upload-resume cache (`upload_cache.json`, 24h expiry) in the app cache dir, an upload history and a media index (media key, capture time, GPS and local file link of what GPic backed up; used only for album suggestions, never sent anywhere), plus your picker selection and settings. App backups are off. Clearing app data wipes all of it.
+- **Album suggestions** are computed on the phone. Creating an album sends Google the album name and which of your photos go in it — nothing else. Album names are dates; GPic doesn't look up place names, which would send coordinates to a server.
+- **Permissions** used: `INTERNET`, `ACCESS_NETWORK_STATE`, foreground-service + notifications (to keep uploads alive in background), `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO` + `ACCESS_MEDIA_LOCATION` (`READ_EXTERNAL_STORAGE` on Android 12 and older) so photos keep their location, USB host (to detect the camera), and Bluetooth + nearby WiFi for camera over WiFi.
 - The app cannot read your Photos login by itself (Android sandbox). That is why setup asks you to paste the auth string manually.
 
 ## Prerequisites

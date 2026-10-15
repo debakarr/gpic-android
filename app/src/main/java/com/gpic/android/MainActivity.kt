@@ -1,5 +1,10 @@
 package com.gpic.android
 
+import com.gpic.android.ui.screens.albums.AlbumsScreen
+import com.gpic.android.ui.screens.albums.AlbumsViewModel
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
+
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,6 +32,8 @@ class MainActivity : ComponentActivity() {
                 // Manual factory – no Hilt for v1. Scoped to the Activity's ViewModelStore so it
                 // survives recreation (theme/locale change) instead of spawning a second uploader.
                 val homeVm = viewModel { HomeViewModel(app, app.credentialStore, app.djiScanner) }
+                val albumsVm = viewModel { AlbumsViewModel(app, app.credentialStore) }
+                val albumState by albumsVm.state.collectAsState()
 
                 // Refresh auth when returning from Auth screen
                 LaunchedEffect(nav.currentBackStackEntry) {
@@ -38,11 +45,16 @@ class MainActivity : ComponentActivity() {
                         HomeScreen(
                             vm = homeVm,
                             onNavigateAuth = { nav.navigate("auth") },
-                            onNavigateSettings = { nav.navigate("settings") }
+                            onNavigateSettings = { nav.navigate("settings") },
+                            onNavigateAlbums = { nav.navigate("albums") },
+                            albumSuggestions = albumState.suggestions.size,
                         )
                     }
                     composable("auth") {
                         AuthScreen(store = app.credentialStore, onDone = { nav.popBackStack() })
+                    }
+                    composable("albums") {
+                        AlbumsScreen(vm = albumsVm, onBack = { nav.popBackStack() })
                     }
                     composable("settings") {
                         SettingsScreen(store = app.credentialStore, onBack = { nav.popBackStack() })

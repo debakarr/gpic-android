@@ -14,14 +14,24 @@ data class DjiFile(
     val file: java.io.File? = null, // for direct file path (if DJI mounts as storage)
     val cameraPath: String? = null, // over WiFi: DCIM/... served by the camera's /v2?storage=&path=
     val cameraStorage: Int = 0,
+    /** Capture time when known (EXIF or modified time, whichever is earlier); 0 = not computed. */
+    val takenMs: Long = 0,
     val extension: String = displayName.substringAfterLast('.', "").lowercase(),
     val isVideo: Boolean = extension in videoExtensions,
     val isPhoto: Boolean = extension in photoExtensions,
 ) {
+    val kind: MediaKind get() = when {
+        isVideo -> MediaKind.VIDEO
+        extension in rawExtensions -> MediaKind.RAW
+        else -> MediaKind.PHOTO
+    }
+
     companion object {
         val photoExtensions = setOf("jpg","jpeg","png","heic","heif","dng","webp","tif","tiff","bmp","arw","nef","cr2","cr3","raf","orf","rw2","pef","sr2","avif","ico")
         val videoExtensions = setOf("mp4","mov","avi","mkv","mts","m2ts","m2t","m4v","mod","tod","wmv","asf","divx","3gp","3g2","mpg","mpeg","mmv","ts")
         val supported = photoExtensions + videoExtensions
+        /** Camera RAW (DJI shoots DNG); a subset of [photoExtensions]. */
+        val rawExtensions = setOf("dng","arw","nef","cr2","cr3","raf","orf","rw2","pef","sr2")
     }
 
     /** Stable identity: progress map, resume cache and list keys all use this. */
@@ -34,3 +44,6 @@ data class DjiFile(
         else -> "File"
     }
 }
+
+/** What the type filter selects on. */
+enum class MediaKind(val label: String) { PHOTO("Photos"), RAW("RAW"), VIDEO("Videos") }

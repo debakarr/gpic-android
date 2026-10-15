@@ -12,7 +12,22 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.rememberLazyListState
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.compose.ui.text.input.KeyboardType
+import com.gpic.android.data.cleanup.AgeRule
+import com.gpic.android.data.cleanup.AgeUnit
+import com.gpic.android.data.dji.MediaKind
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.lazy.items
@@ -35,12 +50,14 @@ import com.gpic.android.ui.components.StatusCardState
 import com.gpic.android.ui.components.SystemStatsCard
 import com.gpic.android.util.formatSize
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun HomeScreen(
     vm: HomeViewModel,
     onNavigateAuth: () -> Unit,
     onNavigateSettings: () -> Unit,
+    onNavigateAlbums: () -> Unit = {},
+    albumSuggestions: Int = 0,
 ) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
@@ -52,6 +69,48 @@ fun HomeScreen(
     val filesPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
         if (uris.isNotEmpty()) vm.setDjiFileUris(uris)
     }
+    val cleanupFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        if (uri != null) vm.setCleanupFolder(uri)
+    }
+
+    // Without media access Android strips GPS from photos it hands GPic, so uploads lose their location.
+    val mediaPerms = remember { mediaPermissions() }
+    fun mediaGranted() = mediaPerms.all { ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
+    var mediaAccess by remember { mutableStateOf(mediaGranted()) }
+    // Back from app settings (or a grant elsewhere): re-check so the banner and delete rules update.
+    LifecycleResumeEffect(Unit) {
+        mediaAccess = mediaGranted()
+        onPauseOrDispose {}
+    }
+
+    // Which picker to open once the permission prompt closes (saveable: the dialog can outlive a rotation).
+    var pendingPick by rememberSaveable { mutableStateOf<String?>(null) }
+    val mediaPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        mediaAccess = mediaGranted()
+        when (pendingPick) {
+            "folder" -> folderPicker.launch(null)
+            "files" -> filesPicker.launch(arrayOf("image/*", "video/*"))
+            "cleanup" -> cleanupFolderPicker.launch(null)
+        }
+        pendingPick = null
+    }
+    val prefs = remember { context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE) }
+    // After repeated "Don't allow" Android stops showing the prompt and the request returns denied at once.
+    fun promptBlocked(): Boolean {
+        val activity = context as? Activity ?: return false
+        return prefs.getBoolean("media_perm_asked", false) &&
+            mediaPerms.none { activity.shouldShowRequestPermissionRationale(it) }
+    }
+    fun requestMedia() {
+        prefs.edit().putBoolean("media_perm_asked", true).apply()
+        mediaPermLauncher.launch(mediaPerms)
+    }
+    /** Ask for media access once, then run the picker either way (uploads still work without it). */
+    fun pick(what: String, launch: () -> Unit) {
+        // A blocked prompt can't be answered; don't make every pick go through a no-op request.
+        if (mediaAccess || promptBlocked()) launch() else { pendingPick = what; requestMedia() }
+    }
+    var confirmCleanup by remember { mutableStateOf(false) }
     // Upload proceeds either way; the permission only controls whether progress shows in the shade.
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.startUpload() }
     val startUpload = {
@@ -84,34 +143,74 @@ fun HomeScreen(
 
     LaunchedEffect(Unit) { vm.refreshAuth(); vm.refreshUsb() }
 
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val scrolledDown by remember { derivedStateOf { listState.firstVisibleItemIndex > 2 } }
+    val toTop: () -> Unit = { scope.launch { listState.animateScrollToItem(0) } }
+    var statsExpanded by rememberSaveable { mutableStateOf(false) }
+    // After a run: narrow a long list to what needs attention.
+    var listFilter by rememberSaveable { mutableStateOf(ListFilter.ALL) }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
+                    // While uploading the subtitle is a live status line; tapping it jumps back to the progress card.
+                    Column(if (busy) Modifier.clickable(onClick = toTop) else Modifier) {
                         Text("GPic")
-                        Text("Camera → Google Photos", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        val done = state.completed + state.failed + state.skipped
+                        Text(
+                            if (busy) "${if (state.cancelling) "Cancelling" else "Uploading"} $done of ${state.totalFiles}" +
+                                (if (state.failed > 0) " • ${state.failed} failed" else "")
+                            else "Camera → Google Photos",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (busy) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 },
                 actions = {
+                    IconButton(onClick = onNavigateAlbums) {
+                        BadgedBox(badge = { if (albumSuggestions > 0) Badge { Text("$albumSuggestions") } }) {
+                            Icon(Icons.Default.PhotoAlbum, "Album suggestions")
+                        }
+                    }
                     IconButton(onClick = onNavigateSettings) { Icon(Icons.Default.Settings, "Settings") }
                 }
             )
         },
         floatingActionButton = {
-            if (state.djiFiles.isNotEmpty() && !busy && state.hasAuth && state.authProblem == null) {
+          Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            AnimatedVisibility(visible = scrolledDown, enter = fadeIn() + scaleIn(), exit = fadeOut() + scaleOut()) {
+                SmallFloatingActionButton(onClick = toTop) { Icon(Icons.Default.KeyboardArrowUp, "Go to top") }
+            }
+            val ready = state.files.isNotEmpty() && !busy && state.hasAuth && state.authProblem == null &&
+                state.cleanup.progress.let { it == null || state.source != Source.CLEANUP }
+            // After a run, offer only what's left to do: a fresh "Upload all" would just re-check every file.
+            val ran = state.progressMap.isNotEmpty()
+            val retryable = if (ran) state.files.count { ListFilter.FAILED.matches(state.progressMap[it.key]?.status) } else 0
+            if (ready && ran && retryable > 0) {
                 ExtendedFloatingActionButton(
-                    onClick = startUpload,
-                    icon = { Icon(Icons.Default.CloudUpload, null) },
-                    text = { Text("Upload ${state.djiFiles.size} · ${formatSize(state.totalBytes)}") }
+                    onClick = { vm.retryFailed() },
+                    icon = { Icon(Icons.Default.Refresh, null) },
+                    text = { Text("Retry ${plural(retryable, "file")}") },
                 )
             }
+            if (ready && !ran) {
+                val cleanup = state.source == Source.CLEANUP
+                ExtendedFloatingActionButton(
+                    onClick = { if (cleanup) confirmCleanup = true else startUpload() },
+                    icon = { Icon(if (cleanup) Icons.Default.CleaningServices else Icons.Default.CloudUpload, null) },
+                    text = { Text("${if (cleanup) "Back up & delete" else "Upload"} ${state.files.size} · ${formatSize(state.filesBytes)}") }
+                )
+            }
+          }
         }
     ) { padding ->
         LazyColumn(
+            state = listState,
             modifier = Modifier.padding(padding),
             contentPadding = PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             // 1. Photos auth status – most important to user
             item(key = "auth") {
@@ -139,51 +238,7 @@ fun HomeScreen(
                 }
             }
 
-            // 2. Source: phone/USB or camera over WiFi
-            if (state.cameraSupported) {
-                item(key = "source-switch") {
-                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                        Source.entries.forEachIndexed { i, src ->
-                            SegmentedButton(
-                                selected = state.source == src,
-                                onClick = { vm.selectSource(src) },
-                                enabled = !busy,
-                                shape = SegmentedButtonDefaults.itemShape(i, Source.entries.size),
-                                icon = { Icon(if (src == Source.DEVICE) Icons.Default.Usb else Icons.Default.Wifi, null, Modifier.size(18.dp)) },
-                            ) { Text(if (src == Source.DEVICE) "Phone / USB" else "Camera WiFi") }
-                        }
-                    }
-                }
-            }
-            if (state.source == Source.CAMERA) item(key = "camera") {
-                CameraSection(
-                    state = state,
-                    permDenied = permDenied,
-                    onScan = startCameraScan,
-                    onConnect = { vm.cameraLink?.connect(it) },
-                    onDisconnect = { vm.cameraLink?.disconnect() },
-                )
-            } else item(key = "source") {
-                SourceSection(
-                    state = state,
-                    enabled = !busy,
-                    onPickFolder = {
-                        if (state.djiSource == "folder" && state.djiFiles.isNotEmpty()) vm.rescan()
-                        else folderPicker.launch(null)
-                    },
-                    onPickFiles = { filesPicker.launch(arrayOf("image/*", "video/*")) },
-                    onClear = { vm.clearSelection() },
-                )
-            }
-
-            // 3. Settings that will apply to the next upload
-            if (state.djiFiles.isNotEmpty()) {
-                item(key = "settings-summary") {
-                    SettingsSummary(state.config, enabled = !busy, onEdit = onNavigateSettings)
-                }
-            }
-
-            // 4. Batch progress
+            // 1b. Batch progress, near the top so it stays one tap (or the go-to-top button) away
             if (busy || state.completed > 0 || state.failed > 0 || state.skipped > 0) {
                 item(key = "progress") {
                     ProgressSection(
@@ -203,6 +258,73 @@ fun HomeScreen(
                 }
             }
 
+            // 2. Source: phone/USB, free up space, or camera over WiFi
+            item(key = "source-switch") {
+                val sources = Source.entries.filter { it != Source.CAMERA || state.cameraSupported }
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    sources.forEachIndexed { i, src ->
+                        SegmentedButton(
+                            selected = state.source == src,
+                            onClick = { vm.selectSource(src) },
+                            enabled = !busy,
+                            shape = SegmentedButtonDefaults.itemShape(i, sources.size),
+                            // Three labels don't fit beside icons on a 360 dp screen.
+                            icon = {},
+                        ) { Text(src.label, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    }
+                }
+            }
+            if (state.source == Source.CLEANUP) item(key = "cleanup") {
+                CleanupSection(
+                    state = state,
+                    mediaAccess = mediaAccess,
+                    enabled = !busy,
+                    onPickFolder = { pick("cleanup") { cleanupFolderPicker.launch(null) } },
+                    onRule = vm::setCleanupRule,
+                    onRecursive = vm::setCleanupRecursive,
+                    onRescan = vm::scanCleanup,
+                    onAllowMedia = {
+                        if (promptBlocked()) runCatching {
+                            context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)))
+                            Toast.makeText(context, "Permissions → Photos and videos → Allow", Toast.LENGTH_LONG).show()
+                        } else requestMedia()
+                    },
+                )
+            } else if (state.source == Source.CAMERA) item(key = "camera") {
+                CameraSection(
+                    state = state,
+                    permDenied = permDenied,
+                    onScan = startCameraScan,
+                    onConnect = { vm.cameraLink?.connect(it) },
+                    onDisconnect = { vm.cameraLink?.disconnect() },
+                )
+            } else item(key = "source") {
+                SourceSection(
+                    state = state,
+                    enabled = !busy,
+                    onPickFolder = {
+                        if (state.djiSource == "folder" && state.djiFiles.isNotEmpty()) vm.rescan()
+                        else pick("folder") { folderPicker.launch(null) }
+                    },
+                    onPickFiles = { pick("files") { filesPicker.launch(arrayOf("image/*", "video/*")) } },
+                    onClear = { vm.clearSelection() },
+                )
+            }
+
+            // 2b. File types to include (any source)
+            if (state.djiFiles.isNotEmpty()) {
+                item(key = "type-filter") {
+                    TypeFilterRow(state, enabled = !busy, onToggle = vm::toggleType)
+                }
+            }
+
+            // 3. Settings that will apply to the next upload
+            if (state.files.isNotEmpty()) {
+                item(key = "settings-summary") {
+                    SettingsSummary(state.config, deletes = state.config.deleteAfterUpload || state.source == Source.CLEANUP, enabled = !busy, onEdit = onNavigateSettings)
+                }
+            }
+
             // 4b. Morphe-style live CPU / RAM / network during upload
             if (busy || state.systemStats != null) {
                 item(key = "stats") {
@@ -211,6 +333,8 @@ fun HomeScreen(
                         doneCount = state.completed + state.failed + state.skipped,
                         totalFiles = state.totalFiles,
                         isUploading = busy,
+                        expanded = statsExpanded,
+                        onToggle = { statsExpanded = !statsExpanded },
                     )
                 }
             }
@@ -230,22 +354,163 @@ fun HomeScreen(
             }
 
             // 6. Per-file list (first 30 until an upload starts, then all with live status)
-            if (state.djiFiles.isNotEmpty()) {
+            if (state.files.isNotEmpty()) {
+                val ran = state.progressMap.isNotEmpty()
+                val counts = ListFilter.entries.associateWith { f -> state.files.count { f.matches(state.progressMap[it.key]?.status) } }
+                val filter = if (ran) listFilter else ListFilter.ALL
                 item(key = "files-header") {
-                    Text("Files (${state.djiFiles.size})", style = MaterialTheme.typography.titleSmall)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        val of = if (state.files.size != state.djiFiles.size) " of ${state.djiFiles.size}" else ""
+                        Text("Files (${state.files.size}$of)", style = MaterialTheme.typography.titleSmall)
+                        if (ran) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            ListFilter.entries.forEach { f ->
+                                FilterChip(
+                                    selected = filter == f,
+                                    onClick = { listFilter = f },
+                                    label = { Text("${f.label} ${counts[f]}") },
+                                )
+                            }
+                        }
+                    }
                 }
-                val toShow = if (state.progressMap.isEmpty()) state.djiFiles.take(30) else state.djiFiles
+                val toShow = if (!ran) state.files.take(30) else state.files.filter { filter.matches(state.progressMap[it.key]?.status) }
                 items(toShow, key = { it.key }) { f ->
-                    FileRow(f.displayName, f.sizeBytes, state.progressMap[f.key])
+                    FileRow(f.displayName, f.sizeBytes, state.progressMap[f.key], takenMs = f.takenMs)
                 }
-                if (state.djiFiles.size > 30 && state.progressMap.isEmpty()) {
+                if (state.files.size > 30 && state.progressMap.isEmpty()) {
                     item(key = "files-more") {
-                        Text("…and ${state.djiFiles.size - 30} more. Upload will show each file's live status.", style = MaterialTheme.typography.bodySmall)
+                        Text("…and ${state.files.size - 30} more. Upload will show each file's live status.", style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
 
             item(key = "fab-spacer") { Spacer(Modifier.height(80.dp)) }
+        }
+    }
+
+    if (confirmCleanup) {
+        AlertDialog(
+            onDismissRequest = { confirmCleanup = false },
+            icon = { Icon(Icons.Default.DeleteSweep, null) },
+            title = { Text("Back up, then delete from phone?") },
+            text = {
+                Text(
+                    "GPic uploads ${plural(state.files.size, "file")} (${formatSize(state.filesBytes)}) taken before " +
+                        "${formatDate(state.cleanup.cutoffMs)} to ${state.authEmail ?: "Google Photos"}, then deletes each one " +
+                        "from this phone once Google Photos has it. Anything that fails to upload is kept. " +
+                        "Copies in Google Photos are never touched."
+                )
+            },
+            confirmButton = {
+                Button(onClick = { confirmCleanup = false; startUpload() }) { Text("Back up & delete") }
+            },
+            dismissButton = { TextButton(onClick = { confirmCleanup = false }) { Text("Cancel") } },
+        )
+    }
+}
+
+private fun mediaPermissions(): Array<String> = when {
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> arrayOf(
+        Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO, Manifest.permission.ACCESS_MEDIA_LOCATION,
+    )
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> arrayOf(
+        Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.ACCESS_MEDIA_LOCATION,
+    )
+    else -> emptyArray() // nothing is redacted before Android 10
+}
+
+private fun formatDate(ms: Long): String =
+    if (ms <= 0) "—" else java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM).format(java.util.Date(ms))
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CleanupSection(
+    state: HomeUiState,
+    mediaAccess: Boolean,
+    enabled: Boolean,
+    onPickFolder: () -> Unit,
+    onRule: (AgeRule) -> Unit,
+    onRecursive: (Boolean) -> Unit,
+    onRescan: () -> Unit,
+    onAllowMedia: () -> Unit,
+) {
+    val c = state.cleanup
+    val title = when {
+        c.folderUri == null -> "Free up space"
+        c.progress != null -> "Scanning…"
+        c.error != null -> "Can't read the folder"
+        state.files.isEmpty() && state.djiFiles.isNotEmpty() -> "Nothing older than ${c.rule.description} of the chosen types"
+        state.files.isEmpty() -> "Nothing older than ${c.rule.description}"
+        else -> "${plural(state.files.size, "file")} • ${formatSize(state.filesBytes)} to free"
+    }
+    val subtitle = when {
+        c.folderUri == null -> "Back up photos and videos older than a set age from one folder, then delete them from this phone. Google Photos keeps its copies."
+        c.progress != null -> c.progress
+        c.error != null -> c.error
+        c.inFolder == 0 -> "No photos or videos in ${c.folderName} — it's empty, or was moved or deleted."
+        else -> "Taken before ${formatDate(c.cutoffMs)}, out of ${plural(c.inFolder, "file")} in ${c.folderName}. " +
+            "Photo dates come from EXIF when the file has it, otherwise the file date."
+    }
+    val cardState = when {
+        c.error != null -> StatusCardState.ERROR
+        state.files.isNotEmpty() && c.progress == null -> StatusCardState.OK
+        else -> StatusCardState.NEUTRAL
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        StatusCard(title = title, subtitle = subtitle, icon = Icons.Default.CleaningServices, status = cardState)
+        if (c.progress != null) LinearProgressIndicator(Modifier.fillMaxWidth())
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(onClick = onPickFolder, enabled = enabled, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Default.FolderOpen, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(c.folderName ?: "Choose folder", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (c.folderUri != null) {
+                IconButton(onClick = onRescan, enabled = enabled && c.progress == null) { Icon(Icons.Default.Refresh, "Rescan folder") }
+            }
+        }
+        // Local text so the field can be briefly empty while typing; the rule only takes valid numbers.
+        var amountText by rememberSaveable(c.rule.amount) { mutableStateOf(c.rule.amount.toString()) }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Older than", style = MaterialTheme.typography.bodyLarge)
+            OutlinedTextField(
+                value = amountText,
+                onValueChange = { v ->
+                    val digits = v.filter(Char::isDigit).take(AgeRule.MAX_AMOUNT.toString().length)
+                    amountText = digits
+                    digits.toIntOrNull()?.let { onRule(c.rule.copy(amount = it)) }
+                },
+                enabled = enabled,
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.width(96.dp),
+            )
+        }
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+            AgeUnit.entries.forEachIndexed { i, u ->
+                SegmentedButton(
+                    selected = c.rule.unit == u,
+                    onClick = { onRule(c.rule.copy(unit = u)) },
+                    enabled = enabled,
+                    shape = SegmentedButtonDefaults.itemShape(i, AgeUnit.entries.size),
+                    icon = {},
+                ) { Text(u.label, maxLines = 1) }
+            }
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Include subfolders", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+            Switch(checked = c.recursive, onCheckedChange = onRecursive, enabled = enabled)
+        }
+        if (!mediaAccess) {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                Row(Modifier.padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Allow photo and video access so GPic can read locations. Without it Android hides them, so anything that may have a location is uploaded but kept on the phone (JPEGs without one are still deleted).",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer, modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = onAllowMedia) { Text("Allow") }
+                }
+            }
         }
     }
 }
@@ -260,23 +525,32 @@ private fun SourceSection(
 ) {
     val title = when {
         state.isScanning -> "Scanning…"
-        state.djiFiles.isNotEmpty() -> "${plural(state.djiFiles.size, "file")} • ${formatSize(state.totalBytes)}"
+        state.files.isNotEmpty() -> "${plural(state.files.size, "file")} • ${formatSize(state.filesBytes)}"
+        state.djiFiles.isNotEmpty() -> "All ${plural(state.djiFiles.size, "file")} hidden by the type filter"
         state.djiUri != null || state.djiSource == "files" -> "Selection ready"
         else -> "Choose what to back up"
     }
     val subtitle = when {
         state.isScanning -> if (state.djiSource == "files") "Reading selected files…" else "Reading DCIM folder over USB-C…"
+        state.files.isNotEmpty() -> {
+            val photos = state.files.count { it.isPhoto }
+            val videos = state.files.count { it.isVideo }
+            val src = when {
+                state.djiSource == "files" -> "selected files"
+                state.djiUri?.authority == com.gpic.android.data.upload.UriSource.MTP_AUTHORITY -> "the camera"
+                else -> "the chosen folder"
+            }
+            "${plural(photos, "photo")} • ${plural(videos, "video")} • from $src"
+        }
         state.djiFiles.isNotEmpty() -> {
-            val photos = state.djiFiles.count { it.isPhoto }
-            val videos = state.djiFiles.count { it.isVideo }
-            val src = if (state.djiSource == "files") "selected files" else "camera folder"
-            "$photos photos • $videos videos • from $src"
+            val kinds = state.typeFilter.joinToString(" / ") { it.label.lowercase() }
+            "None of them are $kinds. Turn on more types below."
         }
         state.usbConnected -> "${state.usbStatus}\nNow pick the DCIM folder or individual files"
         else -> "Plug the camera in over USB-C, or pick files already on this phone"
     }
     val cardState = when {
-        state.djiFiles.isNotEmpty() -> StatusCardState.OK
+        state.files.isNotEmpty() -> StatusCardState.OK
         state.usbConnected -> StatusCardState.WARN
         else -> StatusCardState.NEUTRAL
     }
@@ -305,8 +579,43 @@ private fun SourceSection(
     }
 }
 
+/** File-list view after an upload starts. */
+private enum class ListFilter(val label: String) {
+    ALL("All"), ACTIVE("Not done"), FAILED("Failed");
+
+    fun matches(status: UploadStatus?): Boolean = when (this) {
+        ALL -> true
+        ACTIVE -> status !in setOf(UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.ERROR, UploadStatus.CANCELLED)
+        FAILED -> status == UploadStatus.ERROR || status == UploadStatus.CANCELLED
+    }
+}
+
 @Composable
-private fun SettingsSummary(config: AppConfig, enabled: Boolean, onEdit: () -> Unit) {
+private fun TypeFilterRow(state: HomeUiState, enabled: Boolean, onToggle: (MediaKind) -> Unit) {
+    val counts = state.djiFiles.groupingBy { it.kind }.eachCount()
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        MediaKind.entries.forEach { kind ->
+            val on = kind in state.typeFilter
+            FilterChip(
+                selected = on,
+                onClick = { onToggle(kind) },
+                // The VM ignores switching off the last type (it would select nothing); keep it looking on.
+                enabled = enabled,
+                label = { Text("${kind.label} ${counts[kind] ?: 0}") },
+                leadingIcon = {
+                    Icon(
+                        if (on) Icons.Default.Check
+                        else when (kind) { MediaKind.PHOTO -> Icons.Default.Image; MediaKind.RAW -> Icons.Default.RawOn; MediaKind.VIDEO -> Icons.Default.Videocam },
+                        null, Modifier.size(18.dp),
+                    )
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsSummary(config: AppConfig, deletes: Boolean, enabled: Boolean, onEdit: () -> Unit) {
     val quality = when {
         config.useQuota -> "Original • counts against storage"
         config.saverMode -> "Storage saver"
@@ -321,7 +630,7 @@ private fun SettingsSummary(config: AppConfig, enabled: Boolean, onEdit: () -> U
             Column(Modifier.weight(1f)) {
                 Text(quality, style = MaterialTheme.typography.bodyMedium)
                 Text("$threads • $dedup", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (config.deleteAfterUpload) {
+                if (deletes) {
                     Text("Deletes originals after upload", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 }
             }
@@ -330,12 +639,13 @@ private fun SettingsSummary(config: AppConfig, enabled: Boolean, onEdit: () -> U
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ProgressSection(state: HomeUiState, onCancel: () -> Unit, onCopyErrors: () -> Unit) {
     val done = state.completed + state.failed + state.skipped
     // Byte-weighted: with smallest-first ordering a file count races ahead of the real transfer.
     val sentBytes = state.progressMap.values.sumOf { it.settledBytes }
-    val totalBytes = state.progressMap.values.sumOf { it.totalBytes }.takeIf { it > 0 } ?: state.totalBytes
+    val totalBytes = state.progressMap.values.sumOf { it.totalBytes }.takeIf { it > 0 } ?: state.filesBytes
     val fraction = if (totalBytes > 0) (sentBytes.toFloat() / totalBytes).coerceIn(0f, 1f) else 0f
     val heading = when {
         state.cancelling -> "Cancelling…"
@@ -354,10 +664,12 @@ private fun ProgressSection(state: HomeUiState, onCancel: () -> Unit, onCopyErro
             if (state.uploadRunning) {
                 Text("${formatSize(sentBytes)} of ${formatSize(totalBytes)}", style = MaterialTheme.typography.bodySmall)
             }
-            state.cameraNotice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                CountChip(Icons.Default.CheckCircle, "${state.completed} uploaded", MaterialTheme.colorScheme.primary)
+            state.notice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (state.completed > 0 || done == 0) CountChip(Icons.Default.CheckCircle, "${state.completed} uploaded", MaterialTheme.colorScheme.primary)
                 if (state.skipped > 0) CountChip(Icons.Default.Verified, "${state.skipped} already there", MaterialTheme.colorScheme.secondary)
+                if (state.relocated > 0) CountChip(Icons.Default.LocationOn, "${state.relocated} re-uploaded with location", MaterialTheme.colorScheme.tertiary)
+                if (state.deleted > 0) CountChip(Icons.Default.DeleteSweep, "${state.deleted} deleted from phone", MaterialTheme.colorScheme.secondary)
                 if (state.failed > 0) CountChip(Icons.Default.Error, "${state.failed} failed", MaterialTheme.colorScheme.error)
             }
             if (state.uploadRunning) {
@@ -385,14 +697,15 @@ private fun CountChip(icon: androidx.compose.ui.graphics.vector.ImageVector, lab
 }
 
 @Composable
-private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progress.FileProgress?) {
+private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progress.FileProgress?, takenMs: Long = 0) {
     val ctx = LocalContext.current
     val active = prog != null && prog.status in setOf(
         UploadStatus.PREPARING, UploadStatus.HASHING, UploadStatus.CHECKING,
         UploadStatus.UPLOADING, UploadStatus.RESUMING, UploadStatus.COMMITTING,
     )
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp)) {
+        // Compact rows: a long batch should fit ~12 per screen, not 8.
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     when {
@@ -417,7 +730,11 @@ private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progre
                     Text(name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     SelectionContainer {
                         Text(
-                            "${formatSize(size)} • ${prog?.detailLine ?: "Queued"}",
+                            listOfNotNull(
+                                formatSize(size),
+                                takenMs.takeIf { it > 0 }?.let { "taken ${formatDate(it)}" },
+                                prog?.detailLine ?: "Queued",
+                            ).joinToString(" • "),
                             style = MaterialTheme.typography.bodySmall,
                             color = if (prog?.status == UploadStatus.ERROR) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -505,8 +822,8 @@ private fun CameraSection(
             is CameraState.Ready -> {
                 val mode = if (state.config.cameraStream) "Streams straight to Google Photos" else "Downloads to the phone, then uploads"
                 StatusCard(
-                    title = "${cs.camera.name} • ${plural(state.djiFiles.size, "file")}",
-                    subtitle = "${formatSize(state.totalBytes)} • $mode",
+                    title = "${cs.camera.name} • ${plural(state.files.size, "file")}",
+                    subtitle = "${formatSize(state.filesBytes)} • $mode",
                     icon = Icons.Default.Videocam, status = StatusCardState.OK,
                     actionLabel = if (busy) null else "Disconnect", onAction = onDisconnect,
                 )
@@ -528,12 +845,12 @@ private fun CameraSection(
             }
         }
         // Staged files left from an interrupted run, with the camera already disconnected.
-        if (state.camera !is CameraState.Ready && state.djiFiles.isNotEmpty()) {
-            Text("${plural(state.djiFiles.size, "file")} downloaded from the camera and waiting to upload.", style = MaterialTheme.typography.bodySmall)
+        if (state.camera !is CameraState.Ready && state.files.isNotEmpty()) {
+            Text("${plural(state.files.size, "file")} downloaded from the camera and waiting to upload.", style = MaterialTheme.typography.bodySmall)
         }
         if (permDenied) {
             Text("GPic needs Nearby devices permission to find and pair with the camera.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
-        if (!busy) state.cameraNotice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+        if (!busy) state.notice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
     }
 }

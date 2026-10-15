@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.StatFs
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.lifecycle.ViewModel
@@ -17,9 +18,15 @@ import com.gpic.android.camera.CameraState
 import com.gpic.android.camera.osmosis.core.CameraFile
 import com.gpic.android.data.auth.AppConfig
 import com.gpic.android.data.auth.Credential
+import com.gpic.android.data.cleanup.AgeRule
+import com.gpic.android.data.cleanup.AgeUnit
+import com.gpic.android.data.cleanup.isOlderThan
+import com.gpic.android.data.cleanup.needsExif
+import com.gpic.android.data.cleanup.takenMs
 import com.gpic.android.data.auth.CredentialStore
 import com.gpic.android.data.dji.DjiFile
 import com.gpic.android.data.dji.DjiScanner
+import com.gpic.android.data.dji.MediaKind
 import com.gpic.android.data.progress.FileProgress
 import com.gpic.android.data.progress.ProgressTracker
 import com.gpic.android.data.progress.UploadStatus
@@ -71,11 +78,37 @@ data class HomeUiState(
     val camera: CameraState = CameraState.Idle,
     /** Wireless transfers need Android 10+ (WifiNetworkSpecifier). */
     val cameraSupported: Boolean = false,
-    /** One-line status from the camera transfer (downloading, waiting for internet, …). */
-    val cameraNotice: String? = null,
+    /** One-line status for the batch (camera download, waiting for internet, space freed, …). */
+    val notice: String? = null,
+    /** Photos re-uploaded because the library only had a copy without location. */
+    val relocated: Int = 0,
+    /** Originals deleted from the phone/camera after upload. */
+    val deleted: Int = 0,
+    val cleanup: CleanupState = CleanupState(),
+    /** File types to back up; applies to every source. Never empty. */
+    val typeFilter: Set<MediaKind> = MediaKind.entries.toSet(),
+) {
+    /** [djiFiles] after the type filter: what the list shows and what Upload sends. */
+    val files: List<DjiFile> get() =
+        if (typeFilter.size == MediaKind.entries.size) djiFiles else djiFiles.filter { it.kind in typeFilter }
+    val filesBytes: Long get() = files.sumOf { it.sizeBytes }
+}
+
+/** "Free up space": back up a folder's media older than [rule], then delete it from the phone. */
+data class CleanupState(
+    val folderUri: Uri? = null,
+    val folderName: String? = null,
+    val rule: AgeRule = AgeRule(),
+    val recursive: Boolean = true,
+    /** Supported files in the folder, before the age filter. */
+    val inFolder: Int = 0,
+    val cutoffMs: Long = 0,
+    /** Non-null while listing the folder or reading photo dates. */
+    val progress: String? = null,
+    val error: String? = null,
 )
 
-enum class Source { DEVICE, CAMERA }
+enum class Source(val label: String) { DEVICE("Phone / USB"), CLEANUP("Free up space"), CAMERA("Camera WiFi") }
 
 /** [context] must be the Application context: this ViewModel outlives Activity recreation. */
 class HomeViewModel(
@@ -88,6 +121,11 @@ class HomeViewModel(
     val state: StateFlow<HomeUiState> = _state.asStateFlow()
 
     private var uploadManager: UploadManager? = null
+    private val prefs = context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE)
+    /** Free-up-space folder contents (unfiltered) and photo EXIF dates read so far (-1 = none). */
+    private var cleanupAll: List<DjiFile> = emptyList()
+    private val exifCache = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private var cleanupJob: kotlinx.coroutines.Job? = null
     private var statsJob: kotlinx.coroutines.Job? = null
     @Volatile private var batchCancelled = false
 
@@ -115,8 +153,12 @@ class HomeViewModel(
             credentialStore.configFlow.collect { c -> _state.update { it.copy(config = c) } }
         }
         refreshUsb()
-        // restore last DJI selection if saved
-        val prefs = context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE)
+        _state.update { it.copy(cleanup = loadCleanupPrefs(), typeFilter = loadTypeFilter()) }
+        restoreDeviceSelection()
+    }
+
+    /** Last folder / files picked on the Phone / USB tab (re-resolved; permissions may have lapsed). */
+    private fun restoreDeviceSelection() {
         val saved = prefs.getString("last_dji_uri", null)
         val savedFiles = prefs.getStringSet("last_dji_files", null)?.toList()
         if (!savedFiles.isNullOrEmpty()) {
@@ -127,7 +169,10 @@ class HomeViewModel(
             } catch (_: Exception) {}
         } else {
             saved?.let {
-                try { _state.value = _state.value.copy(djiUri = Uri.parse(it)) } catch (e: Exception) {}
+                val uri = runCatching { Uri.parse(it) }.getOrNull() ?: return@let
+                _state.update { st -> st.copy(djiUri = uri, djiSource = "folder") }
+                // Phone storage is always there; a USB camera may not be plugged in, so it waits for Rescan.
+                if (uri.authority != com.gpic.android.data.upload.UriSource.MTP_AUTHORITY) scanDji(uri)
             }
         }
     }
@@ -175,10 +220,11 @@ class HomeViewModel(
                 val files = scanner.filesFromUris(uris)
                 _state.value = _state.value.copy(
                     djiFiles = files,
+                    progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null,
                     totalFiles = files.size,
                     totalBytes = files.sumOf { it.sizeBytes },
                     isScanning = false,
-                    scanError = if (files.isEmpty()) "No supported photos/videos in selected files" else null
+                    scanError = if (files.isEmpty()) "The picked files are gone or aren't photos/videos — choose again" else null
                 )
             } catch (e: Exception) {
                 _state.value = _state.value.copy(isScanning = false, scanError = e.message)
@@ -199,6 +245,8 @@ class HomeViewModel(
                 val files = scanner.scanViaSaf(uri).sortedBy { it.sizeBytes }
                 _state.value = _state.value.copy(
                     djiFiles = files,
+                    // A fresh list starts with no statuses (and the Upload button rather than Retry).
+                    progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null,
                     totalFiles = files.size,
                     totalBytes = files.sumOf { it.sizeBytes },
                     isScanning = false
@@ -215,16 +263,164 @@ class HomeViewModel(
 
     fun selectSource(source: Source) {
         if (_state.value.uploadRunning || source == _state.value.source) return
-        if (source == Source.DEVICE) cameraLink?.disconnect()
+        if (source != Source.CAMERA) cameraLink?.disconnect()
+        cleanupJob?.cancel()
         _state.update {
             it.copy(source = source, djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap(),
-                completed = 0, failed = 0, skipped = 0, cameraNotice = null, djiSource = "none")
+                completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null, djiSource = "none",
+                isScanning = false, scanError = null, cleanup = it.cleanup.copy(progress = null, error = null))
+        }
+        when (source) {
+            Source.DEVICE -> restoreDeviceSelection()
+            Source.CLEANUP -> scanCleanup()
+            Source.CAMERA -> {}
         }
     }
 
-    fun startUpload() {
+    private fun loadTypeFilter(): Set<MediaKind> =
+        prefs.getStringSet("type_filter", null)
+            ?.mapNotNull { runCatching { MediaKind.valueOf(it) }.getOrNull() }?.toSet()
+            ?.takeIf { it.isNotEmpty() } ?: MediaKind.entries.toSet()
+
+    /** Turn one file type on or off; the last one left stays on (an empty filter would upload nothing). */
+    fun toggleType(kind: MediaKind) {
         if (_state.value.uploadRunning) return
-        val files = _state.value.djiFiles.sortedBy { it.sizeBytes }
+        val now = _state.value.typeFilter.let { if (kind in it) it - kind else it + kind }
+        if (now.isEmpty()) return
+        prefs.edit().putStringSet("type_filter", now.mapTo(HashSet()) { it.name }).apply()
+        _state.update { it.copy(typeFilter = now, progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null) }
+    }
+
+    // ---- free up space ---------------------------------------------------------------------------
+
+    private fun loadCleanupPrefs(): CleanupState {
+        val uri = prefs.getString("cleanup_uri", null)?.let(Uri::parse)
+        val unit = runCatching { AgeUnit.valueOf(prefs.getString("cleanup_unit", null) ?: "") }.getOrDefault(AgeUnit.MONTHS)
+        return CleanupState(
+            folderUri = uri,
+            folderName = uri?.let(::folderLabel),
+            rule = AgeRule(prefs.getInt("cleanup_amount", 6).coerceIn(1, AgeRule.MAX_AMOUNT), unit),
+            recursive = prefs.getBoolean("cleanup_recursive", true),
+        )
+    }
+
+    private fun folderLabel(tree: Uri): String =
+        runCatching { DocumentsContract.getTreeDocumentId(tree).substringAfter(':').ifEmpty { "Internal storage" } }
+            .getOrDefault(tree.lastPathSegment ?: "folder")
+
+    fun setCleanupFolder(uri: Uri) {
+        scanner.takePersistablePermission(uri)
+        prefs.edit().putString("cleanup_uri", uri.toString()).apply()
+        cleanupAll = emptyList()
+        _state.update { it.copy(cleanup = it.cleanup.copy(folderUri = uri, folderName = folderLabel(uri))) }
+        scanCleanup()
+    }
+
+    fun setCleanupRule(rule: AgeRule) {
+        // At least 1: "older than 0 days" would select (and delete) everything.
+        val r = rule.copy(amount = rule.amount.coerceIn(1, AgeRule.MAX_AMOUNT))
+        prefs.edit().putInt("cleanup_amount", r.amount).putString("cleanup_unit", r.unit.name).apply()
+        _state.update { it.copy(cleanup = it.cleanup.copy(rule = r)) }
+        filterCleanup()
+    }
+
+    fun setCleanupRecursive(on: Boolean) {
+        prefs.edit().putBoolean("cleanup_recursive", on).apply()
+        _state.update { it.copy(cleanup = it.cleanup.copy(recursive = on)) }
+        scanCleanup()
+    }
+
+    /** List the folder, then apply the age filter. */
+    fun scanCleanup() {
+        if (_state.value.uploadRunning) return
+        val folder = _state.value.cleanup.folderUri ?: return
+        val recursive = _state.value.cleanup.recursive
+        cleanupJob?.cancel()
+        cleanupJob = viewModelScope.launch {
+            setCleanup { it.copy(progress = "Listing ${it.folderName ?: "folder"}…", error = null) }
+            try {
+                cleanupAll = scanner.listTree(folder, recursive)
+                setCleanup { it.copy(inFolder = cleanupAll.size) }
+                applyAgeFilter()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w("HomeViewModel", "cleanup scan failed", e)
+                cleanupAll = emptyList()
+                setCleanup { it.copy(progress = null, inFolder = 0, error = if (e is SecurityException) "Lost access to the folder. Choose it again." else "Couldn't read the folder: ${e.message}") }
+                setList(emptyList())
+            }
+        }
+    }
+
+    private fun filterCleanup() {
+        if (_state.value.uploadRunning || _state.value.cleanup.folderUri == null) return
+        cleanupJob?.cancel()
+        cleanupJob = viewModelScope.launch { applyAgeFilter() }
+    }
+
+    private suspend fun applyAgeFilter() {
+        val cutoff = _state.value.cleanup.rule.cutoffMs()
+        val all = cleanupAll
+        val toRead = all.filter { it.isPhoto && needsExif(it.lastModified, cutoff) && exifCache[it.key] == null }
+        if (toRead.isNotEmpty()) withContext(Dispatchers.IO) {
+            for ((i, f) in toRead.withIndex()) {
+                if (i % 25 == 0) setCleanup { it.copy(progress = "Reading photo dates ${i + 1} of ${toRead.size}…") }
+                kotlinx.coroutines.yield() // cancellable when the age changes mid-read
+                exifCache[f.key] = scanner.exifTakenMs(f) ?: -1L
+            }
+        }
+        val old = all.mapNotNull { f ->
+            val taken = takenMs(f.lastModified, exifCache[f.key]?.takeIf { it > 0 })
+            if (isOlderThan(taken, cutoff)) f.copy(takenMs = taken) else null
+        }.sortedBy { it.sizeBytes }
+        setCleanup { it.copy(progress = null, cutoffMs = cutoff) }
+        setList(old)
+    }
+
+    private fun plural(n: Int, word: String) = if (n == 1) "1 $word" else "$n ${word}s"
+
+    /** Google Photos keeps the old GPS-less upload; there's no API call here to edit or remove it. */
+    private fun staleCopiesNote(n: Int) =
+        "${plural(n, "photo")} re-uploaded with location. The older ${if (n == 1) "copy" else "copies"} without it " +
+            "(same date, no location) ${if (n == 1) "is" else "are"} still in Google Photos — delete ${if (n == 1) "it" else "them"} there."
+
+    private fun setCleanup(f: (CleanupState) -> CleanupState) = _state.update { it.copy(cleanup = f(it.cleanup)) }
+
+    private fun setList(files: List<DjiFile>) = _state.update {
+        it.copy(djiFiles = files, totalFiles = files.size, totalBytes = files.sumOf { f -> f.sizeBytes }, djiSource = "cleanup",
+            progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null)
+    }
+
+    /** After a free-up-space run: drop deleted files so the list (and a retry) only has what's left. */
+    private fun finishCleanup(result: Map<String, FileProgress>) {
+        val gone = result.values.filter { it.deleted }
+        val goneKeys = gone.mapTo(HashSet()) { it.filePath }
+        cleanupAll = cleanupAll.filter { it.key !in goneKeys }
+        // totalFiles stays the batch size: the progress header reads "done / total" for the finished run.
+        _state.update { st -> st.copy(djiFiles = st.djiFiles.filter { it.key !in goneKeys }) }
+        val left = _state.value.files
+        setCleanup { it.copy(inFolder = cleanupAll.size) }
+        val freed = gone.sumOf { it.totalBytes }
+        val relocated = result.values.count { it.staleKey != null }
+        notice(listOfNotNull(
+            when {
+                gone.isEmpty() -> "Nothing was deleted from the phone — see each file below for why."
+                left.isEmpty() -> "Freed ${formatSize(freed)}: deleted ${plural(gone.size, "backed-up file")} from the phone."
+                else -> "Freed ${formatSize(freed)}: deleted ${plural(gone.size, "file")}. ${left.size} kept — see each file for why."
+            },
+            relocated.takeIf { it > 0 }?.let { staleCopiesNote(it) },
+        ).joinToString("\n"))
+    }
+
+    /** Upload what failed or was cancelled in the last run (same source, same delete rules). */
+    fun retryFailed() = startUpload(_state.value.files.filter {
+        _state.value.progressMap[it.key]?.status in setOf(UploadStatus.ERROR, UploadStatus.CANCELLED)
+    })
+
+    fun startUpload(only: List<DjiFile>? = null) {
+        if (_state.value.uploadRunning) return
+        val files = (only ?: _state.value.files).sortedBy { it.sizeBytes }
         if (files.isEmpty()) return
         val cred = credentialStore.getActiveCredential() ?: return
         val cfg = credentialStore.loadConfig()
@@ -232,11 +428,17 @@ class HomeViewModel(
         viewModelScope.launch {
             batchCancelled = false
             _state.value = _state.value.copy(uploadRunning = true, cancelling = false, wasCancelled = false, progressMap = emptyMap(),
-                completed = 0, failed = 0, skipped = 0, cameraNotice = null)
+                totalFiles = files.size, totalBytes = files.sumOf { it.sizeBytes },
+                completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null)
             UploadService.start(context)
             try {
-                if (fromCamera && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) uploadFromCamera(files, cfg, cred)
-                else runUploads(files, cfg, cred)
+                when {
+                    fromCamera && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> uploadFromCamera(files, cfg, cred)
+                    // Free up space always deletes what made it (never on a name-only match; see UploadManager).
+                    _state.value.source == Source.CLEANUP -> finishCleanup(runUploads(files, cfg, cred, deleteAfter = true))
+                    else -> runUploads(files, cfg, cred).values.count { it.staleKey != null }
+                        .takeIf { it > 0 }?.let { notice(staleCopiesNote(it)) }
+                }
             } finally {
                 statsJob?.cancel()
                 UploadService.stop(context)
@@ -278,6 +480,8 @@ class HomeViewModel(
                     completed = tracker.completed,
                     failed = tracker.failed,
                     skipped = tracker.skipped,
+                    relocated = tracker.relocated,
+                    deleted = tracker.deleted,
                 )
                 // Throttle notification updates: progress emits several times per second.
                 val now = System.currentTimeMillis()
@@ -351,7 +555,7 @@ class HomeViewModel(
         val done = staged.filter { result[it.key]?.status in setOf(UploadStatus.COMPLETED, UploadStatus.SKIPPED) }
         stager(link).clean(done)
         val left = _state.value.djiFiles.filter { f -> done.none { it.key == f.key } }
-        _state.update { it.copy(djiFiles = left, totalFiles = left.size, totalBytes = left.sumOf { f -> f.sizeBytes }) }
+        _state.update { it.copy(djiFiles = left, totalBytes = left.sumOf { f -> f.sizeBytes }) }
         if (left.isNotEmpty()) notice("${left.size} files not uploaded yet; downloaded copies are kept for a retry.")
     }
 
@@ -416,7 +620,7 @@ class HomeViewModel(
         return false
     }
 
-    private fun notice(msg: String?) = _state.update { it.copy(cameraNotice = msg) }
+    private fun notice(msg: String?) = _state.update { it.copy(notice = msg) }
 
     /** Camera manifest record → list item. DJI names carry a local-time capture stamp. */
     private fun toDjiFile(f: CameraFile): DjiFile {

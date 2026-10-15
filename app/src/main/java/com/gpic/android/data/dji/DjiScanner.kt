@@ -5,6 +5,7 @@ import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
+import com.gpic.android.data.cleanup.parseExifDate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -94,6 +95,57 @@ class DjiScanner(private val context: Context) {
             } catch (_: Exception) {}
         }
         out.sortedBy { it.sizeBytes }
+    }
+
+    /**
+     * Every supported file under [treeUri], one DocumentsContract query per folder (DocumentFile costs
+     * several queries per file). Hidden entries (".thumbnails", ".trashed-…") are skipped.
+     */
+    suspend fun listTree(treeUri: Uri, recursive: Boolean): List<DjiFile> = withContext(Dispatchers.IO) {
+        val out = mutableListOf<DjiFile>()
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
+        val dirs = ArrayDeque(listOf(DocumentsContract.getTreeDocumentId(treeUri)))
+        while (dirs.isNotEmpty()) {
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, dirs.removeLast())
+            context.contentResolver.query(children, projection, null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0) ?: continue
+                    val name = c.getString(1) ?: continue
+                    if (name.startsWith(".")) continue
+                    if (c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        if (recursive) dirs.addLast(id)
+                        continue
+                    }
+                    if (name.substringAfterLast('.', "").lowercase() !in DjiFile.supported) continue
+                    out += DjiFile(
+                        displayName = name,
+                        sizeBytes = if (c.isNull(3)) 0 else c.getLong(3),
+                        lastModified = if (c.isNull(4)) 0 else c.getLong(4),
+                        uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, id),
+                    )
+                }
+            }
+        }
+        out
+    }
+
+    /** A photo's EXIF capture time (header only), or null for videos / no date / unreadable. */
+    fun exifTakenMs(f: DjiFile): Long? {
+        val uri = f.uri ?: return null
+        if (!f.isPhoto) return null
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { s ->
+                val exif = android.media.ExifInterface(s)
+                parseExifDate(exif.getAttribute(android.media.ExifInterface.TAG_DATETIME_ORIGINAL), exif.getAttribute(android.media.ExifInterface.TAG_OFFSET_TIME_ORIGINAL))
+                    ?: parseExifDate(exif.getAttribute(android.media.ExifInterface.TAG_DATETIME_DIGITIZED), exif.getAttribute(android.media.ExifInterface.TAG_OFFSET_TIME_DIGITIZED))
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     fun takePersistableFilePermission(uri: Uri) {

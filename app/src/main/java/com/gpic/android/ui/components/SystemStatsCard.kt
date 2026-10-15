@@ -1,6 +1,7 @@
 package com.gpic.android.ui.components
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -28,10 +29,16 @@ fun SystemStatsCard(
     totalFiles: Int,
     isUploading: Boolean,
     modifier: Modifier = Modifier,
+    /** Collapsed shows just the header line, so a long file list isn't pushed a screen down. */
+    expanded: Boolean = true,
+    onToggle: (() -> Unit)? = null,
 ) {
     Card(modifier = modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = if (onToggle != null) Modifier.fillMaxWidth().clickable(onClick = onToggle) else Modifier,
+            ) {
                 // pulsing dot equivalent: filled circle when live
                 Icon(
                     if (isUploading) Icons.Default.FiberManualRecord else Icons.Default.PauseCircle,
@@ -48,7 +55,15 @@ fun SystemStatsCard(
                 if (stats != null && stats.uploadSpeedBps > 0) {
                     Text(formatSpeed(stats.uploadSpeedBps), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 }
+                if (onToggle != null) {
+                    Icon(
+                        if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (expanded) "Hide device stats" else "Show device stats",
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
             }
+            if (!expanded) return@Column
 
             if (stats == null) {
                 Text("Starting live stats…", style = MaterialTheme.typography.bodySmall)

@@ -1,23 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Camera body with an upload arrow in the lens. Single colour, so it doubles as the themed
+     (monochrome) icon. Everything sits inside the 66dp adaptive-icon safe circle. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- GPic: camera + cloud upload icon -->
-    <path
-        android:fillColor="#4285F4"
-        android:pathData="M54,22 L62,30 L74,30 L74,74 L34,74 L34,30 L46,30 L54,22 Z" />
+    <!-- body + viewfinder hump, with the lens and flash punched out -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,38 m-14,0 a14,14 0 1,1 28,0 a14,14 0 1,1 -28,0"
-        android:fillAlpha="0.95" />
-    <path
-        android:fillColor="#4285F4"
-        android:pathData="M54,46 m-8,0 a8,8 0 1,1 16,0 a8,8 0 1,1 -16,0" />
-    <path
-        android:fillColor="#34A853"
-        android:pathData="M62,68 L72,58 L74,60 L74,74 L62,74 Z" />
+        android:fillType="evenOdd"
+        android:pathData="M37,40 L44,40 L46.6,35.2 A2.4,2.4 0 0 1 48.7,34 L59.3,34 A2.4,2.4 0 0 1 61.4,35.2 L64,40 L71,40 A9,9 0 0 1 80,49 L80,67 A9,9 0 0 1 71,76 L37,76 A9,9 0 0 1 28,67 L28,49 A9,9 0 0 1 37,40 Z M41,58 A13,13 0 1 0 67,58 A13,13 0 1 0 41,58 Z M70,47.5 A2.5,2.5 0 1 0 75,47.5 A2.5,2.5 0 1 0 70,47.5 Z" />
+    <!-- upload arrow inside the lens -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M66,62 L66,66 L62,66 L62,68 L66,68 L66,72 L68,72 L68,68 L72,68 L72,66 L68,66 L68,62 Z" />
+        android:pathData="M54,49 L61.5,57 L56.6,57 L56.6,66 L51.4,66 L51.4,57 L46.5,57 Z" />
 </vector>
