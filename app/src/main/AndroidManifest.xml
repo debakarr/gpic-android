@@ -34,6 +34,13 @@
     <!-- Saving an edited video to Movies/GPic needs it only before Android 10 (scoped storage). -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
+    <!-- The video editor opens Google Photos' own picker (stock or patched builds) so cloud clips can be chosen. -->
+    <queries>
+        <package android:name="com.google.android.apps.photos" />
+        <package android:name="app.morphe.android.apps.photos" />
+        <package android:name="app.revanced.android.apps.photos" />
+    </queries>
+
     <application
         android:name=".GpicApp"
         android:allowBackup="false"

@@ -57,4 +57,17 @@ class EditPlanTest {
         assertTrue(props.has("explanation"))
         assertEquals(listOf("dji", "none"), props.getJSONObject("lut").getJSONArray("enum").let { a -> (0 until a.length()).map { a.getString(it) } })
     }
+
+    @Test fun multiClipPartsKeepOrderAndDropUnknownClips() {
+        val durations = listOf(10_000L, 20_000L)
+        val p = EditPlan(segments = listOf(Segment(15_000, 18_000, 1), Segment(2_000, 4_000, 0), Segment(0, 5_000, 7), Segment(-1, 50_000, 1)))
+            .sanitized(durations, luts)
+        // Montage order is kept across clips; the clip-7 part goes; ranges clamp to their own clip.
+        assertEquals(listOf(Segment(15_000, 18_000, 1), Segment(2_000, 4_000, 0), Segment(0, 20_000, 1)), p.segments)
+        assertEquals(25_000, p.keptMs(durations))
+        assertTrue(EditPlan(segments = listOf(Segment(0, 10_000, 0), Segment(0, 20_000, 1))).sanitized(durations, luts).segments.isEmpty())
+        assertEquals(2, EditPlan().parts(durations).size)
+        val json = EditPlan(segments = listOf(Segment(1_000, 2_000, 1)), fades = true)
+        assertEquals(json, EditPlan.fromJson(json.toJson()))
+    }
 }

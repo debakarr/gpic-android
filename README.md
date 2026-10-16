@@ -17,7 +17,7 @@ Android app that uploads photos and videos to Google Photos — from a DJI Actio
 - **Album suggestions**: groups the photos GPic backed up by when they were taken, on the phone, and creates the album in Google Photos when you tap Create (one at a time, or tick several and create them all)
 - Thousands of new small files go fast: duplicate checks (100 per request) and commits (20 per request) are batched, so Google's per-account limits don't throttle the run, and the phone stays awake while uploading
 - Fast re-runs over big folders (a WhatsApp folder with thousands of images): one query per folder to scan, up to 8 "already backed up?" checks at once, and files confirmed on an earlier run are skipped without asking Google again; sticker folders are left out and files that aren't really media are never sent
-- **Video editor**: trim (or keep several parts), speed, colour LUT (DJI D-Log M → Rec.709 for Osmo Action 4 clips, or any `.cube`), brightness / contrast / saturation, camera-sound volume, background music, crop to 16:9 / 9:16 / 1:1, resize, rotate; exports H.264 to `Movies/GPic` on the phone. Optional **Ask Claude**: describe the edit and Claude sets the controls, using your own Anthropic API key
+- **Video editor**: pick clips straight from Google Photos (cloud clips too) or the phone; **Quick edit** cuts the liveliest moments of several clips into a 15/30/60 s Action, Travel, Cinematic or Reel edit with fades and music; or trim (or keep several parts), speed, colour LUT (DJI D-Log M → Rec.709 for Osmo Action 4 clips, or any `.cube`), brightness / contrast / saturation, camera-sound volume, background music, crop to 16:9 / 9:16 / 1:1, resize, rotate; exports H.264 to `Movies/GPic` on the phone. Optional **Ask Claude**: describe the edit and Claude sets the controls, using your own Anthropic API key
 
 ## Privacy & Data
 
@@ -124,7 +124,9 @@ You can also copy `~/.config/gpic/config.json` off a desktop that already runs g
 
 ## Video editor
 
-Film icon at the top of the home screen. Choose a video, then:
+Film icon at the top of the home screen. Pick one or more clips **From Google Photos** (its own picker, so clips that are only in the cloud work too; GPic copies them into its private storage for editing) or **From this phone**, then:
+
+- **Quick edit** (LightCut-style): choose a style (Action: 1.5 s cuts and punchy colour; Travel: 3 s moments with fades; Cinematic: 4.5 s shots, 16:9, muted colour; Reel: vertical 9:16, 2 s cuts) and a length (15/30/60 s). GPic scores every clip for motion and colour on the phone, keeps the liveliest moments, and applies the style's look, crop, fades and audio mix. Add music under Audio. It doesn't beat-sync, add titles or stabilise.
 
 - **Trim** with the slider; Claude can keep several parts (tap a part to drop it). The preview plays the cut, speed, colour and camera volume; music is only in the export.
 - **Colour LUT**: for Osmo Action 4 footage shot in D-Log M, get DJI's free *D-Log M to Rec.709* LUT from [DJI's Action 4 download page](https://www.dji.com/osmo-action-4/downloads) and tap *Add DJI LUT*. GPic doesn't bundle it (it's DJI's file); once added it's the default, and a DJI clip that looks flat opens with it on. Until then GPic's own approximate "Flat → vivid" look stands in. Any other 3D `.cube` LUT can be added too.

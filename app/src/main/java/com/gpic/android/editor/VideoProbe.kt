@@ -31,8 +31,8 @@ data class VideoInfo(
     val fromDji: Boolean get() = name.startsWith("DJI_", ignoreCase = true)
 }
 
-/** A sampled frame for Claude: when in the source it was taken, and a small JPEG. */
-class Frame(val timeMs: Long, val jpeg: ByteArray)
+/** A sampled frame for Claude: which clip, when in it, and a small JPEG. */
+class Frame(val timeMs: Long, val jpeg: ByteArray, val clip: Int = 0)
 
 object VideoProbe {
     fun probe(context: Context, uri: Uri): VideoInfo {
@@ -63,7 +63,7 @@ object VideoProbe {
     }
 
     /** [count] frames spread over the video (never the very first/last), longest side [maxSide] px. */
-    fun frames(context: Context, uri: Uri, durationMs: Long, count: Int, maxSide: Int = 512): List<Frame> {
+    fun frames(context: Context, uri: Uri, durationMs: Long, count: Int, maxSide: Int = 512, clip: Int = 0): List<Frame> {
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(context, uri)
@@ -73,12 +73,70 @@ object VideoProbe {
                 val out = ByteArrayOutputStream()
                 bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
                 bmp.recycle()
-                Frame(t, out.toByteArray())
+                Frame(t, out.toByteArray(), clip)
             }
         } finally {
             r.release()
         }
     }
+
+    /**
+     * How lively each moment of a clip is, for Quick edit: tiny frames (48 px) every [ClipScores.stepMs]
+     * (at least 1 s, at most 120 samples a clip), scored by change from the previous frame plus colourfulness,
+     * with very dark frames played down. Slow-ish on old phones (~0.1 s a frame), so it reports progress.
+     */
+    fun motionScores(context: Context, uri: Uri, durationMs: Long, onFrame: (Int, Int) -> Unit = { _, _ -> }): ClipScores {
+        val step = maxOf(1_000L, durationMs / MAX_SAMPLES)
+        val n = maxOf(1, (durationMs / step).toInt())
+        val scores = FloatArray(n)
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(context, uri)
+            var prev: IntArray? = null
+            for (i in 0 until n) {
+                val bmp = runCatching { frameAt(r, (i * step + step / 2) * 1000, 48) }.getOrNull()
+                if (bmp == null) { onFrame(i + 1, n); continue }
+                val px = IntArray(bmp.width * bmp.height)
+                bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+                bmp.recycle()
+                scores[i] = frameScore(px, prev)
+                prev = px
+                onFrame(i + 1, n)
+            }
+        } finally {
+            r.release()
+        }
+        val top = scores.maxOrNull()?.takeIf { it > 0f } ?: 1f
+        for (i in scores.indices) scores[i] /= top
+        return ClipScores(durationMs, step, scores)
+    }
+
+    /** Change from [prev] (mean absolute luma difference) weighted 0.7, colourfulness 0.3; dark frames x0.3. */
+    internal fun frameScore(px: IntArray, prev: IntArray?): Float {
+        var diff = 0f
+        var sat = 0f
+        var luma = 0f
+        for ((i, c) in px.withIndex()) {
+            val r = (c shr 16 and 0xFF) / 255f
+            val g = (c shr 8 and 0xFF) / 255f
+            val b = (c and 0xFF) / 255f
+            val y = 0.2126f * r + 0.7152f * g + 0.0722f * b
+            luma += y
+            val mx = maxOf(r, g, b)
+            sat += if (mx > 0f) (mx - minOf(r, g, b)) / mx else 0f
+            if (prev != null && prev.size == px.size) {
+                val p = prev[i]
+                val py = 0.2126f * (p shr 16 and 0xFF) / 255f + 0.7152f * (p shr 8 and 0xFF) / 255f + 0.0722f * (p and 0xFF) / 255f
+                diff += kotlin.math.abs(y - py)
+            }
+        }
+        val count = px.size.coerceAtLeast(1)
+        val motion = (diff / count * 4f).coerceAtMost(1f)
+        val score = 0.7f * motion + 0.3f * (sat / count)
+        return if (luma / count < 0.08f) score * 0.3f else score
+    }
+
+    private const val MAX_SAMPLES = 120L
 
     private fun frameAt(r: MediaMetadataRetriever, timeUs: Long, maxSide: Int): Bitmap? {
         val opt = MediaMetadataRetriever.OPTION_CLOSEST_SYNC

@@ -43,7 +43,15 @@ fun EditorScreen(vm: EditorViewModel, onBack: () -> Unit, onBackUp: (Uri) -> Uni
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); vm.messageShown() } }
 
-    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(vm::openVideo) }
+    // Where picked clips go: a fresh edit, or added to the current one.
+    var adding by remember { mutableStateOf(false) }
+    val onPicked: (List<Uri>) -> Unit = { uris -> if (adding) vm.addVideos(uris) else vm.openVideos(uris) }
+    val fromPhotos = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        onPicked(pickedUris(r.data))
+    }
+    val fromPhone = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { onPicked(it) }
+    val pickFromPhotos = { add: Boolean -> adding = add; fromPhotos.launch(photosPickIntent(context)) }
+    val pickFromPhone = { add: Boolean -> adding = add; fromPhone.launch(arrayOf("video/*")) }
     val pickMusic = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(vm::setMusic) }
     var lutAsDji by remember { mutableStateOf(false) }
     val pickLut = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { vm.importLut(it, lutAsDji) } }
@@ -55,7 +63,7 @@ fun EditorScreen(vm: EditorViewModel, onBack: () -> Unit, onBackUp: (Uri) -> Uni
                 title = { Text("Video editor") },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 actions = {
-                    if (state.video != null) TextButton(onClick = { pickVideo.launch(arrayOf("video/*")) }) { Text("Other video") }
+                    if (state.video != null) TextButton(onClick = { pickFromPhotos(false) }) { Text("New edit") }
                 },
             )
         },
@@ -63,38 +71,50 @@ fun EditorScreen(vm: EditorViewModel, onBack: () -> Unit, onBackUp: (Uri) -> Uni
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         val video = state.video
-        if (video == null) {
-            EmptyState(state.loading, Modifier.padding(padding)) { pickVideo.launch(arrayOf("video/*")) }
+        if (video == null || (state.loading != null && state.clips.isEmpty())) {
+            EmptyState(state.loading, Modifier.padding(padding), onPhotos = { pickFromPhotos(false) }, onPhone = { pickFromPhone(false) })
             return@Scaffold
         }
         Column(
             Modifier.padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Preview(video, state)
-            val out = state.plan.outputMs(video.durationMs)
+            Preview(state)
+            val total = state.durations.sum()
+            val out = state.plan.outputMs(state.durations)
             Text(
-                "${video.name} • ${video.displayWidth}×${video.displayHeight} • ${clock(video.durationMs)}" +
-                    if (out != video.durationMs) " → ${clock(out)}" else "",
+                (if (state.clips.size == 1) "${video.name} • ${video.displayWidth}×${video.displayHeight} • " else "${state.clips.size} clips • ") +
+                    clock(total) + if (out != total) " → ${clock(out)}" else "",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            ClipStrip(state, onRemove = vm::removeClip, onAddPhotos = { pickFromPhotos(true) }, onAddPhone = { pickFromPhone(true) })
+
+            QuickEditCard(state, vm)
 
             ClaudeCard(state, vm, onAddKey = { keyDialog = true })
 
             Section("Trim") {
                 val plan = state.plan
-                if (plan.segments.size > 1) {
-                    Text("Keeping ${plan.segments.size} parts:", style = MaterialTheme.typography.bodySmall)
+                if (state.clips.size > 1 || plan.segments.size > 1) {
+                    val parts = plan.parts(state.durations)
+                    Text(
+                        "Playing ${parts.size} part${if (parts.size == 1) "" else "s"} in this order. Tap one to drop it.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        plan.segments.forEach { s ->
+                        parts.forEach { s ->
                             InputChip(
-                                selected = false, onClick = { vm.update { p -> p.copy(segments = p.segments - s) } },
-                                label = { Text("${clock(s.startMs)}–${clock(s.endMs)}") },
+                                selected = false, onClick = { vm.update { p -> p.copy(segments = parts - s) } },
+                                label = { Text((if (state.clips.size > 1) "Clip ${s.clip + 1} · " else "") + "${clock(s.startMs)}–${clock(s.endMs)}") },
                                 trailingIcon = { Icon(Icons.Default.Close, "Drop this part", Modifier.size(16.dp)) },
                             )
                         }
                     }
-                    TextButton(onClick = { vm.update { it.copy(segments = emptyList()) } }) { Text("Use the whole video") }
+                    if (plan.segments.isNotEmpty()) {
+                        TextButton(onClick = { vm.update { it.copy(segments = emptyList()) } }) {
+                            Text(if (state.clips.size > 1) "Use every clip in full" else "Use the whole video")
+                        }
+                    }
                 } else {
                     val seg = plan.segments.firstOrNull() ?: Segment(0, video.durationMs)
                     var range by remember(seg) { mutableStateOf(seg.startMs.toFloat()..seg.endMs.toFloat()) }
@@ -127,7 +147,7 @@ fun EditorScreen(vm: EditorViewModel, onBack: () -> Unit, onBackUp: (Uri) -> Uni
             }
 
             Section("Audio") {
-                if (video.hasAudio) {
+                if (state.clips.any { it.hasAudio }) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Camera sound", Modifier.weight(1f))
                         Switch(checked = state.plan.keepOriginalAudio, onCheckedChange = { on -> vm.update { it.copy(keepOriginalAudio = on) } })
@@ -135,7 +155,7 @@ fun EditorScreen(vm: EditorViewModel, onBack: () -> Unit, onBackUp: (Uri) -> Uni
                     if (state.plan.keepOriginalAudio) {
                         LabeledSlider("Camera volume", state.plan.originalVolume, 0f..2f, center = 1f) { v -> vm.update { it.copy(originalVolume = v) } }
                     }
-                } else Text("This video has no sound.", style = MaterialTheme.typography.bodySmall)
+                } else Text(if (state.clips.size > 1) "These clips have no sound." else "This video has no sound.", style = MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.MusicNote, null)
                     Spacer(Modifier.width(8.dp))
@@ -154,6 +174,10 @@ fun EditorScreen(vm: EditorViewModel, onBack: () -> Unit, onBackUp: (Uri) -> Uni
             }
 
             Section("Frame") {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Fade between parts", Modifier.weight(1f))
+                    Switch(checked = state.plan.fades, onCheckedChange = { on -> vm.update { it.copy(fades = on) } })
+                }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Aspect.entries.forEach { a ->
                         FilterChip(selected = state.plan.aspect == a, onClick = { vm.update { it.copy(aspect = a) } }, label = { Text(a.label) })
@@ -181,36 +205,127 @@ fun EditorScreen(vm: EditorViewModel, onBack: () -> Unit, onBackUp: (Uri) -> Uni
 }
 
 @Composable
-private fun EmptyState(loading: Boolean, modifier: Modifier, onPick: () -> Unit) {
+private fun EmptyState(loading: String?, modifier: Modifier, onPhotos: () -> Unit, onPhone: () -> Unit) {
     Column(
         modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
     ) {
-        if (loading) { CircularProgressIndicator(); return@Column }
+        if (loading != null) {
+            CircularProgressIndicator()
+            Text(loading, style = MaterialTheme.typography.bodyMedium)
+            return@Column
+        }
         Icon(Icons.Default.MovieCreation, null, Modifier.size(56.dp), tint = MaterialTheme.colorScheme.primary)
-        Text("Edit a video", style = MaterialTheme.typography.titleLarge)
+        Text("Edit videos", style = MaterialTheme.typography.titleLarge)
         Text(
-            "Trim, change speed, add music, apply a colour LUT (DJI D-Log M → Rec.709 for Osmo Action 4 clips), " +
-                "or describe the edit and let Claude set it up. The video is edited on this phone and saved to Movies/GPic.",
+            "Pick one or more clips, then let Quick edit cut the best moments to a style and length, describe the edit " +
+                "to Claude, or trim and grade by hand (DJI D-Log M → Rec.709 for Osmo Action 4). Edited on this phone, " +
+                "saved to Movies/GPic.",
             style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Button(onClick = onPick) { Icon(Icons.Default.VideoLibrary, null); Spacer(Modifier.width(8.dp)); Text("Choose a video") }
+        Button(onClick = onPhotos) { Icon(Icons.Default.PhotoLibrary, null); Spacer(Modifier.width(8.dp)); Text("From Google Photos") }
+        OutlinedButton(onClick = onPhone) { Icon(Icons.Default.PhoneAndroid, null); Spacer(Modifier.width(8.dp)); Text("From this phone") }
+        Text(
+            "Clips that are only in the cloud are downloaded by Google Photos, then copied into GPic for editing.",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** The installed Google Photos (stock or a patched build) answers "pick videos", cloud items included. */
+private val PHOTOS_PACKAGES = listOf("com.google.android.apps.photos", "app.morphe.android.apps.photos", "app.revanced.android.apps.photos")
+
+private fun photosPickIntent(context: android.content.Context): Intent {
+    val base = Intent(Intent.ACTION_GET_CONTENT)
+        .setType("video/*")
+        .addCategory(Intent.CATEGORY_OPENABLE)
+        .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+    val pm = context.packageManager
+    val pkg = PHOTOS_PACKAGES.firstOrNull { p -> Intent(base).setPackage(p).resolveActivity(pm) != null }
+    return if (pkg != null) base.setPackage(pkg) else Intent.createChooser(base, "Pick videos")
+}
+
+private fun pickedUris(data: Intent?): List<Uri> {
+    data ?: return emptyList()
+    val clip = data.clipData
+    if (clip != null) return (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
+    return listOfNotNull(data.data)
+}
+
+@kotlin.OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ClipStrip(state: EditorUiState, onRemove: (Int) -> Unit, onAddPhotos: () -> Unit, onAddPhone: () -> Unit) {
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        state.clips.forEachIndexed { i, c ->
+            InputChip(
+                selected = false, onClick = {},
+                label = { Text("${i + 1} · ${c.name.take(18)} · ${clock(c.durationMs)}", maxLines = 1) },
+                trailingIcon = if (state.clips.size > 1) ({ IconButton(onClick = { onRemove(i) }, Modifier.size(20.dp)) { Icon(Icons.Default.Close, "Remove clip", Modifier.size(16.dp)) } }) else null,
+            )
+        }
+        var menu by remember { mutableStateOf(false) }
+        Box {
+            AssistChip(onClick = { menu = true }, label = { Text("Add clips") }, leadingIcon = { Icon(Icons.Default.Add, null, Modifier.size(18.dp)) },
+                enabled = state.loading == null)
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(text = { Text("From Google Photos") }, onClick = { menu = false; onAddPhotos() })
+                DropdownMenuItem(text = { Text("From this phone") }, onClick = { menu = false; onAddPhone() })
+            }
+        }
+    }
+    state.loading?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+}
+
+@kotlin.OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun QuickEditCard(state: EditorUiState, vm: EditorViewModel) {
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.AutoFixHigh, null)
+                Spacer(Modifier.width(8.dp))
+                Text("Quick edit", style = MaterialTheme.typography.titleSmall)
+            }
+            Text(
+                "Picks the liveliest moments of your clips (worked out on this phone) and cuts them to a style.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                com.gpic.android.editor.EditStyle.entries.forEach { st ->
+                    FilterChip(selected = state.style == st, onClick = { vm.setStyle(st) }, label = { Text(st.label) }, enabled = state.autoProgress == null)
+                }
+            }
+            Text(state.style.blurb, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onTertiaryContainer)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(15, 30, 60).forEach { sec ->
+                    FilterChip(selected = state.targetSec == sec, onClick = { vm.setTarget(sec) }, label = { Text("$sec s") }, enabled = state.autoProgress == null)
+                }
+            }
+            Button(onClick = vm::quickEdit, enabled = state.autoProgress == null && state.exportProgress == null) {
+                if (state.autoProgress != null) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                else Icon(Icons.Default.AutoFixHigh, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(state.autoProgress ?: "Make my edit")
+            }
+            state.autoNote?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+        }
     }
 }
 
 @OptIn(UnstableApi::class)
 @Composable
-private fun Preview(video: VideoInfo, state: EditorUiState) {
+private fun Preview(state: EditorUiState) {
     val context = LocalContext.current
-    val player = remember(video.uri) { ExoPlayer.Builder(context).build().apply { repeatMode = ExoPlayer.REPEAT_MODE_ALL } }
+    val video = state.clips.first()
+    val player = remember { ExoPlayer.Builder(context).build().apply { repeatMode = ExoPlayer.REPEAT_MODE_ALL } }
     DisposableEffect(player) { onDispose { player.release() } }
     val plan = state.plan
-    // Cuts: one clipped item per kept part, so the preview plays exactly what will be exported.
-    LaunchedEffect(player, plan.segments) {
-        val parts = plan.segments.ifEmpty { listOf(Segment(0, video.durationMs)) }
+    // Cuts: one clipped item per kept part, from whichever clip it's in, so the preview plays what will be exported.
+    LaunchedEffect(player, plan.segments, state.clips) {
+        val parts = plan.parts(state.durations)
         player.setMediaItems(parts.map { s ->
-            MediaItem.Builder().setUri(video.uri).setClippingConfiguration(
+            MediaItem.Builder().setUri(state.clips[s.clip].uri).setClippingConfiguration(
                 MediaItem.ClippingConfiguration.Builder().setStartPositionMs(s.startMs).setEndPositionMs(s.endMs).build()
             ).build()
         })

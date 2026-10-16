@@ -206,6 +206,16 @@ row = r·N + g, column = b). DJI's D-Log M → Rec.709 LUT isn't bundled (DJI's 
 `claude-opus-5-5`, effort medium, `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`), refusal and
 max_tokens handled; metadata + plan + request, frames (12 × 512 px) only when ticked. Key in the encrypted prefs.
 
+Multi-clip (1.5.0): `Segment.clip` indexes the editor's clip list; `EditPlan.parts()` spells out "every clip in
+full"; `sanitized(durations)` keeps montage order across clips. Export fits every part to one frame
+(`EditEffects.outputFrame`: first clip's shape or the chosen aspect, short side ≤ 1080); Media3 may encode sideways
+with a 90° rotation flag (checked: portrait output plays portrait). `FadeThroughBlack` is a time-varying `RgbMatrix`
+that counts from the first frame it sees (export only; the preview has no fades). Quick edit = `VideoProbe.motionScores`
+(≤ 120 tiny frames a clip: frame difference + colourfulness) → `AutoEdit.pick` (pure, tested) → `EditStyle` look.
+"From Google Photos" = `ACTION_GET_CONTENT video/*` aimed at the installed Photos package (needs `<queries>`; on the
+Redmi it opens Morphe Photos' `ExternalPickerActivity`); non-local picks are copied to cache/editor-clips.
+Claude gets every clip's metadata and up to 24 frames shared across clips.
+
 ### Album suggestions (Albums screen, top-bar icon)
 `MediaIndex` (filesDir JSON, singleton) records media key + EXIF capture time/GPS + local Uri for every
 file `UploadManager` uploads or matches (before any delete). `AlbumSuggester` (pure, unit-tested) groups

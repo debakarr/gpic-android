@@ -43,14 +43,48 @@ object EditEffects {
      * Picture effects, in order: colour first (LUTs expect camera colours), then geometry. [sourceShortSide]
      * keeps the height cap from upscaling a smaller video.
      */
-    fun video(plan: EditPlan, luts: LutStore, sourceShortSide: Int): List<Effect> = buildList {
+    fun video(plan: EditPlan, luts: LutStore, sourceShortSide: Int, frame: Pair<Int, Int>? = null): List<Effect> = buildList {
         plan.lutId?.let { add(SingleColorLut.createFromCube(luts.load(it).cube)) }
         if (plan.brightness != 0f) add(Brightness(plan.brightness))
         if (plan.contrast != 0f) add(Contrast(plan.contrast))
         if (plan.saturation != 0f) add(HslAdjustment.Builder().adjustSaturation(plan.saturation).build())
         if (plan.rotation != 0) add(ScaleAndRotateTransformation.Builder().setRotationDegrees(-plan.rotation.toFloat()).build())
-        plan.aspect.ratio?.let { add(Presentation.createForAspectRatio(it, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP)) }
-        if (plan.maxHeight > 0 && plan.maxHeight < sourceShortSide) add(Presentation.createForShortSide(plan.maxHeight))
+        if (frame != null) {
+            // Several clips: every part is fitted to one output frame (cropped to the chosen shape, or letterboxed
+            // when keeping the first clip's shape) so mixed sizes and orientations play as one video.
+            val layout = if (plan.aspect == Aspect.ORIGINAL) Presentation.LAYOUT_SCALE_TO_FIT else Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP
+            add(Presentation.createForWidthAndHeight(frame.first, frame.second, layout))
+        } else {
+            plan.aspect.ratio?.let { add(Presentation.createForAspectRatio(it, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP)) }
+            if (plan.maxHeight > 0 && plan.maxHeight < sourceShortSide) add(Presentation.createForShortSide(plan.maxHeight))
+        }
+    }
+
+    /** One output size for a multi-clip edit: the first clip's shape (or the chosen one), short side ≤ 1080. */
+    fun outputFrame(plan: EditPlan, first: VideoInfo): Pair<Int, Int> {
+        val w0 = first.displayWidth.coerceAtLeast(2)
+        val h0 = first.displayHeight.coerceAtLeast(2)
+        val ratio = plan.aspect.ratio ?: (w0.toFloat() / h0)
+        val short = listOf(minOf(w0, h0), 1080, plan.maxHeight.takeIf { it > 0 } ?: Int.MAX_VALUE).min()
+        val (w, h) = if (ratio >= 1f) (short * ratio).toInt() to short else short to (short / ratio).toInt()
+        return (w / 2 * 2) to (h / 2 * 2)
+    }
+
+    /**
+     * Fades a part in from black and out to black over [fadeUs]. Counts from the first frame it sees, so it
+     * doesn't depend on how the sequence offsets each part's timestamps.
+     */
+    class FadeThroughBlack(private val partUs: Long, private val fadeUs: Long) : androidx.media3.effect.RgbMatrix {
+        private var firstUs = Long.MIN_VALUE
+
+        override fun getMatrix(presentationTimeUs: Long, useHdr: Boolean): FloatArray {
+            if (firstUs == Long.MIN_VALUE) firstUs = presentationTimeUs
+            val t = (presentationTimeUs - firstUs).toFloat()
+            val k = minOf(t / fadeUs, (partUs - t) / fadeUs, 1f).coerceIn(0f, 1f)
+            return floatArrayOf(k, 0f, 0f, 0f, 0f, k, 0f, 0f, 0f, 0f, k, 0f, 0f, 0f, 0f, 1f)
+        }
+
+        override fun isNoOp(inputWidth: Int, inputHeight: Int) = false
     }
 
     fun volume(gain: Float): AudioProcessor = ChannelMixingAudioProcessor().apply {
@@ -72,40 +106,49 @@ class VideoExporter(private val context: Context, private val luts: LutStore) {
     private val main = Handler(Looper.getMainLooper())
 
     suspend fun export(
-        video: VideoInfo,
+        clips: List<VideoInfo>,
         plan: EditPlan,
         music: Uri?,
         onProgress: (Int) -> Unit,
     ): Uri {
         val out = File(context.cacheDir, "edit-${System.currentTimeMillis()}.mp4")
         try {
-            render(composition(video, plan, music), out, onProgress)
-            return saveToMovies(out, video.name)
+            render(composition(clips, plan, music), out, onProgress)
+            return saveToMovies(out, clips.first().name)
         } finally {
             out.delete()
         }
     }
 
-    private fun composition(video: VideoInfo, plan: EditPlan, music: Uri?): Composition {
-        val ranges = plan.segments.ifEmpty { listOf(Segment(0, video.durationMs)) }
-        val dropAudio = !plan.keepOriginalAudio || plan.originalVolume == 0f || !video.hasAudio
-        val clips = ranges.map { seg ->
+    private fun composition(videos: List<VideoInfo>, plan: EditPlan, music: Uri?): Composition {
+        val parts = plan.parts(videos.map { it.durationMs })
+        val keepCamera = plan.keepOriginalAudio && plan.originalVolume > 0f
+        val anyAudio = keepCamera && parts.any { videos[it.clip].hasAudio }
+        val frame = if (videos.size > 1) EditEffects.outputFrame(plan, videos.first()) else null
+        val items = parts.map { seg ->
+            val video = videos[seg.clip]
             val item = MediaItem.Builder()
                 .setUri(video.uri)
                 .setClippingConfiguration(
                     MediaItem.ClippingConfiguration.Builder().setStartPositionMs(seg.startMs).setEndPositionMs(seg.endMs).build()
                 )
                 .build()
+            val dropAudio = !keepCamera || !video.hasAudio
             val audio = if (!dropAudio && plan.originalVolume != 1f) listOf(EditEffects.volume(plan.originalVolume)) else emptyList()
+            val picture = EditEffects.video(plan, luts, minOf(video.width, video.height), frame) +
+                listOfNotNull(EditEffects.FadeThroughBlack((seg.durationMs * 1000 / plan.speed).toLong(), FADE_US).takeIf { plan.fades })
             EditedMediaItem.Builder(item)
                 .setRemoveAudio(dropAudio)
-                .setEffects(Effects(audio, EditEffects.video(plan, luts, minOf(video.width, video.height))))
+                .setEffects(Effects(audio, picture))
                 .apply { if (plan.speed != 1f) setSpeed(EditEffects.constantSpeed(plan.speed)) }
                 .build()
         }
         val sequences = mutableListOf(
-            // Without camera audio, a silent track keeps the video sequence's timeline for the music to mix into.
-            EditedMediaItemSequence.Builder(clips).apply { if (dropAudio && music != null) experimentalSetForceAudioTrack(true) }.build()
+            // Parts without camera sound get silence, so the sequence keeps one audio timeline (for the other
+            // parts' sound and for the music to mix into).
+            EditedMediaItemSequence.Builder(items)
+                .apply { if (anyAudio || music != null) experimentalSetForceAudioTrack(true) }
+                .build()
         )
         if (music != null && plan.musicVolume > 0f) {
             val track = MediaItem.Builder().setUri(music)
@@ -120,6 +163,10 @@ class VideoExporter(private val context: Context, private val luts: LutStore) {
         }
         // The output is H.264 SDR and the LUTs are SDR looks, so HLG/HDR10 clips are tone-mapped down.
         return Composition.Builder(sequences).setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL).build()
+    }
+
+    private companion object {
+        const val FADE_US = 350_000L
     }
 
     private suspend fun render(composition: Composition, out: File, onProgress: (Int) -> Unit) =

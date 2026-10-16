@@ -39,28 +39,31 @@ class ClaudeEditPlanner(apiKey: String) {
 
     fun plan(
         request: String,
-        video: VideoInfo,
+        clips: List<VideoInfo>,
         current: EditPlan,
         luts: List<LutInfo>,
         musicName: String?,
         frames: List<Frame>,
     ): PlannedEdit {
         val context = JSONObject()
-            .put("video", JSONObject()
-                .put("name", video.name)
-                .put("duration_s", video.durationMs / 1000.0)
-                .put("size_px", "${video.displayWidth}x${video.displayHeight}")
-                .put("frame_rate", video.frameRate ?: JSONObject.NULL)
-                .put("has_audio", video.hasAudio)
-                .put("shot_on_dji_camera", video.fromDji)
-                .put("middle_frame_looks_flat_like_log", video.looksFlat ?: JSONObject.NULL))
+            .put("clips", JSONArray(clips.mapIndexed { i, video ->
+                JSONObject()
+                    .put("clip", i)
+                    .put("name", video.name)
+                    .put("duration_s", video.durationMs / 1000.0)
+                    .put("size_px", "${video.displayWidth}x${video.displayHeight}")
+                    .put("frame_rate", video.frameRate ?: JSONObject.NULL)
+                    .put("has_audio", video.hasAudio)
+                    .put("shot_on_dji_camera", video.fromDji)
+                    .put("middle_frame_looks_flat_like_log", video.looksFlat ?: JSONObject.NULL)
+            }))
             .put("current_plan", current.toJson())
             .put("luts", JSONArray(luts.map { JSONObject().put("id", it.id).put("title", it.title).put("use_for", it.description) }))
             .put("music_track", musicName ?: JSONObject.NULL)
         val blocks = mutableListOf<ContentBlockParam>()
         blocks += ContentBlockParam.ofText("Video and current edit:\n$context")
         for (f in frames) {
-            blocks += ContentBlockParam.ofText("Frame at ${"%.1f".format(f.timeMs / 1000.0)} s:")
+            blocks += ContentBlockParam.ofText("Clip ${f.clip}, frame at ${"%.1f".format(f.timeMs / 1000.0)} s:")
             blocks += ContentBlockParam.ofImage(
                 Base64ImageSource.builder()
                     .data(Base64.encodeToString(f.jpeg, Base64.NO_WRAP))
@@ -118,7 +121,7 @@ class ClaudeEditPlanner(apiKey: String) {
         }
         val text = response.content().mapNotNull { it.text().orElse(null)?.text() }.joinToString("")
         val json = runCatching { JSONObject(text) }.getOrElse { throw ClaudeException("Claude's answer wasn't a usable plan.") }
-        val plan = EditPlan.fromJson(json, base = current).sanitized(video.durationMs, luts.mapTo(HashSet()) { it.id })
+        val plan = EditPlan.fromJson(json, base = current).sanitized(clips.map { it.durationMs }, luts.mapTo(HashSet()) { it.id })
         return PlannedEdit(plan, json.optString("explanation").ifBlank { "Updated the edit." })
     }
 
@@ -128,20 +131,27 @@ class ClaudeEditPlanner(apiKey: String) {
 
     companion object {
         const val MODEL = "claude-opus-5-5"
-        /** Frames sent when the user lets Claude look; each is at most 512 px on its long side. */
-        const val FRAME_COUNT = 12
+        /** Frames sent when the user lets Claude look, shared across all clips; each ≤ 512 px on its long side. */
+        const val FRAME_COUNT = 24
+
+        /** How many of [FRAME_COUNT] each clip gets: by length, at least 2 a clip. */
+        fun framesPerClip(durations: List<Long>): List<Int> {
+            val total = durations.sum().coerceAtLeast(1)
+            return durations.map { d -> maxOf(2, (FRAME_COUNT * d / total).toInt()) }
+        }
 
         private val SYSTEM = """
-            You plan edits for one video inside GPic, an Android app. The user says what they want; you return the
-            complete edit plan as JSON matching the schema, starting from current_plan and changing only what the
-            request asks for.
-            The app can only: keep segments of the source in order (cutting = leaving parts out), change the speed of
-            the whole output, apply one colour LUT, adjust brightness/contrast/saturation, keep or mute the camera
-            audio and set its volume, mix in the one music track the user picked (volume and start offset), crop to an
-            aspect ratio, cap the output height, and rotate. For anything else (titles, transitions, stabilisation,
-            per-segment speed, music the user hasn't picked) do what you can and say plainly in explanation what you
-            couldn't do.
-            Times are seconds of the source video and must stay within 0..duration_s.
+            You plan video edits inside GPic, an Android app, from one or more clips. The user says what they want;
+            you return the complete edit plan as JSON matching the schema, starting from current_plan and changing
+            only what the request asks for.
+            The app can only: play parts of the clips in the order you list them (a montage may use any clip, in any
+            order; cutting = leaving parts out), change the speed of the whole output, fade each part in and out
+            through black, apply one colour LUT, adjust brightness/contrast/saturation, keep or mute the camera audio
+            and set its volume, mix in the one music track the user picked (volume and start offset), crop to an
+            aspect ratio, cap the output height, and rotate. For anything else (titles, other transitions,
+            stabilisation, per-part speed, beat matching, music the user hasn't picked) do what you can and say
+            plainly in explanation what you couldn't do.
+            Times are seconds within the part's clip and must stay within 0..that clip's duration_s.
             LUTs: use each one only for what its use_for says. A D-Log M LUT on footage shot in normal colour looks
             wrong, so apply one when the user asks for it or the footage is clearly flat/log (a DJI clip whose frames
             look grey and washed out); otherwise leave lut as it is.
