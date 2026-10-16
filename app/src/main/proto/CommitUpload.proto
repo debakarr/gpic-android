@@ -22,7 +22,8 @@ message CommitUpload {
     int64 field10 = 10;
     int64 field17 = 17;
   }
-  Field1Type field1 = 1;
+  // Repeated: one request can commit many uploads (replies come back in the same order).
+  repeated Field1Type field1 = 1;
   message Field2Type {
     string model = 3;
     string make = 4;

@@ -47,6 +47,16 @@ class GooglePhotosApi(
     companion object {
         /** Shared by every request in the app: Google's limit is per account, not per connection. */
         @Volatile private var quotaPauseUntil = 0L
+        @Volatile private var quotaLogged = false
+
+        fun hex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
+
+        private const val LIBRARY_HOST = "https://photosdata-pa.googleapis.com/"
+        /**
+         * Duplicate checks and commits share Google's per-minute, per-account limit on this host; 429s were seen
+         * at ~540 calls/min. Start a little under it and let [Pacer] find the edge.
+         */
+        val libraryPacer = Pacer(initialPerSec = 8.0, minPerSec = 1.0, maxPerSec = 12.0)
 
         @Synchronized private fun pauseForQuota(ms: Long) {
             quotaPauseUntil = maxOf(quotaPauseUntil, System.currentTimeMillis() + ms)
@@ -94,8 +104,10 @@ class GooglePhotosApi(
         var lastError: Exception? = null
         var attempt = 0
         var quotaHits = 0
+        val paced = url.startsWith(LIBRARY_HOST)
         while (true) {
             awaitQuota()
+            if (paced) libraryPacer.await()
             try {
                 val req = Request.Builder()
                     .url(url)
@@ -103,7 +115,10 @@ class GooglePhotosApi(
                     .post(data.toRequestBody("application/x-protobuf".toMediaType()))
                     .build()
                 val resp = client.newCall(req).execute()
-                if (resp.isSuccessful) return resp
+                if (resp.isSuccessful) {
+                    if (paced) libraryPacer.onSuccess()
+                    return resp
+                }
                 val code = resp.code
                 val retryAfter = resp.header("Retry-After")?.trim()?.toLongOrNull()?.times(1000)
                 val bodyPreview = readPreview(resp)
@@ -115,6 +130,7 @@ class GooglePhotosApi(
                 if (code == 429) {
                     // Google limits these calls per minute per account. Pause every worker (not just this one) long
                     // enough for the window to roll over, instead of failing files after a few seconds of retries.
+                    if (paced) libraryPacer.onRateLimited()
                     if (++quotaHits > QUOTA_RETRIES) break
                     val wait = retryAfter ?: QUOTA_WAITS_MS[minOf(quotaHits - 1, QUOTA_WAITS_MS.lastIndex)]
                     pauseForQuota(wait)
@@ -151,8 +167,13 @@ class GooglePhotosApi(
 
     private fun readPreview(resp: okhttp3.Response): String {
         return try {
-            val raw = resp.body?.bytes()?.take(1200)?.toByteArray() ?: return ""
-            previewBytes(gunzipMaybe(raw))
+            // Whole body (error replies are small): a cut-off gzip stream doesn't inflate.
+            val text = resp.body?.bytes()?.let { gunzipMaybe(it) } ?: return ""
+            if (resp.code == 429 && !quotaLogged) {
+                quotaLogged = true
+                Log.w("GooglePhotosApi", "429 body: " + String(text).filter { it.code in 32..126 })
+            }
+            previewBytes(text)
         } catch (_: Exception) { "" } ?: ""
     }
 
@@ -379,33 +400,50 @@ class GooglePhotosApi(
     private fun uploadUrl(uploadId: String) =
         "https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=$uploadId"
 
+    /** One upload to commit: what the PUT returned, plus the file's name, SHA-1 and modified time (seconds). */
+    class CommitItem(
+        val token: CommitTokenOuterClass.CommitToken,
+        val fileName: String,
+        val sha1Hash: ByteArray,
+        val timestamp: Long,
+    )
+
     fun commitUpload(
         commitToken: CommitTokenOuterClass.CommitToken,
         fileName: String,
         sha1Hash: ByteArray,
         timestamp: Long,
-    ): String {
+    ): String = commitUploads(listOf(CommitItem(commitToken, fileName, sha1Hash, timestamp))).single()
+        ?: throw RejectedByPhotosException()
+
+    /**
+     * Commits several uploads in one request. Google handles one account's commits one at a time (~1 s each,
+     * however many are sent in parallel), but a request with 20 items also takes ~1 s: measured, keys verified.
+     * Returns one media key per item in order; null where Photos refused that item (no key).
+     */
+    fun commitUploads(items: List<CommitItem>): List<String?> {
+        require(items.isNotEmpty())
         val msg = CommitUploadOuterClass.CommitUpload.newBuilder()
-            .setField1(
+            .addAllField1(items.map { item ->
                 CommitUploadOuterClass.CommitUpload.Field1Type.newBuilder()
                     .setField1(
                         CommitUploadOuterClass.CommitUpload.Field1Type.InnerField1Type.newBuilder()
-                            .setField1(commitToken.field1)
-                            .setField2(commitToken.field2)
+                            .setField1(item.token.field1)
+                            .setField2(item.token.field2)
                             .build()
                     )
-                    .setFileName(fileName)
-                    .setSha1Hash(com.google.protobuf.ByteString.copyFrom(sha1Hash))
+                    .setFileName(item.fileName)
+                    .setSha1Hash(com.google.protobuf.ByteString.copyFrom(item.sha1Hash))
                     .setField4(
                         CommitUploadOuterClass.CommitUpload.Field1Type.Field4Type.newBuilder()
-                            .setFileLastModifiedTimestamp(timestamp)
+                            .setFileLastModifiedTimestamp(item.timestamp)
                             .setField2(46000000)
                             .build()
                     )
                     .setQuality(if (model == "Pixel 2") 1 else 3)
                     .setField10(1)
                     .build()
-            )
+            })
             .setField2(
                 CommitUploadOuterClass.CommitUpload.Field2Type.newBuilder()
                     .setModel(model)
@@ -430,22 +468,32 @@ class GooglePhotosApi(
             } catch (e: Exception) {
                 throw RuntimeException("[commitUpload] bad reply (" + bytes.size + "B): " + previewBytes(bytes))
             }
-            val mediaKey = parsed.field1.field3.mediaKey
-            // The bytes arrived but Photos won't make an item of them (seen with WhatsApp sticker .webp files).
-            if (mediaKey.isNullOrEmpty()) throw RejectedByPhotosException()
-            return mediaKey
+            // Keys are matched to items by position, so a reply that doesn't line up is unusable.
+            if (parsed.field1Count != items.size) {
+                throw RuntimeException("[commitUpload] reply has ${parsed.field1Count} items for ${items.size} uploads")
+            }
+            // A missing key: the bytes arrived but Photos won't make an item of them (seen with WhatsApp stickers).
+            return parsed.field1List.map { r -> r.field3.mediaKey.takeIf { k -> !k.isNullOrEmpty() } }
         }
     }
 
-    fun findMediaByHash(sha1Hash: ByteArray): String {
+    fun findMediaByHash(sha1Hash: ByteArray): String = findMediaByHashes(listOf(sha1Hash))[hex(sha1Hash)] ?: ""
+
+    /**
+     * Which of [hashes] are already in the library, in one request (100 hashes took ~0.6 s). Each match echoes
+     * its hash, so the map is keyed by lowercase hex SHA-1; hashes with no match are absent.
+     * Dedup is best-effort: an unreadable reply means "none found" and those files simply upload.
+     */
+    fun findMediaByHashes(hashes: List<ByteArray>): Map<String, String> {
+        require(hashes.isNotEmpty())
         val msg = HashCheckOuterClass.HashCheck.newBuilder()
             .setField1(
                 HashCheckOuterClass.HashCheck.Field1Type.newBuilder()
-                    .setField1(
+                    .addAllField1(hashes.map { h ->
                         HashCheckOuterClass.HashCheck.Field1Type.InnerField1Type.newBuilder()
-                            .setSha1Hash(com.google.protobuf.ByteString.copyFrom(sha1Hash))
+                            .setSha1Hash(com.google.protobuf.ByteString.copyFrom(h))
                             .build()
-                    )
+                    })
                     .setField2(HashCheckOuterClass.HashCheck.Field1Type.InnerField2Type.newBuilder().build())
                     .build()
             )
@@ -456,19 +504,18 @@ class GooglePhotosApi(
         endpoint = "hashCheck"
         )
         resp.use {
-            val raw = it.body?.bytes() ?: return ""
+            val raw = it.body?.bytes() ?: return emptyMap()
             val bytes = gunzipMaybe(raw)
             val parsed = try {
                 RemoteMatchesOuterClass.RemoteMatches.parseFrom(bytes)
             } catch (e: Exception) {
-                // Dedup is best-effort: a garbled check reply must not block the upload.
-                // Proceed as not-found; upload/commit steps will surface real errors with phase tags.
                 Log.w("GooglePhotosApi", "[hashCheck] unparseable reply (" + bytes.size + "B): " + previewBytes(bytes))
-                return ""
+                return emptyMap()
             }
-            return if (parsed.hasField1() && parsed.field1.hasField2() && parsed.field1.field2.hasField2()) {
-                parsed.field1.field2.field2.mediaKey ?: ""
-            } else ""
+            if (!parsed.hasField1()) return emptyMap()
+            return parsed.field1.field2List
+                .filter { m -> m.hasField2() && !m.field2.mediaKey.isNullOrEmpty() }
+                .associate { m -> hex(m.field1.sha1Hash.toByteArray()) to m.field2.mediaKey }
         }
     }
 

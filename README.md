@@ -15,6 +15,7 @@ Android app that uploads photos and videos to Google Photos — from a DJI Actio
 - **Free up space**: back up a folder's photos and videos older than N days / weeks / months / years, then delete them from the phone (only once Google Photos has them)
 - File-type filter (Photos / RAW / Videos) for every source
 - **Album suggestions**: groups the photos GPic backed up by when they were taken, on the phone, and creates the album in Google Photos when you tap Create (one at a time, or tick several and create them all)
+- Thousands of new small files go fast: duplicate checks (100 per request) and commits (20 per request) are batched, so Google's per-account limits don't throttle the run, and the phone stays awake while uploading
 - Fast re-runs over big folders (a WhatsApp folder with thousands of images): one query per folder to scan, up to 8 "already backed up?" checks at once, and files confirmed on an earlier run are skipped without asking Google again; sticker folders are left out and files that aren't really media are never sent
 - **Video editor**: trim (or keep several parts), speed, colour LUT (DJI D-Log M → Rec.709 for Osmo Action 4 clips, or any `.cube`), brightness / contrast / saturation, camera-sound volume, background music, crop to 16:9 / 9:16 / 1:1, resize, rotate; exports H.264 to `Movies/GPic` on the phone. Optional **Ask Claude**: describe the edit and Claude sets the controls, using your own Anthropic API key
 

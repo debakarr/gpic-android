@@ -27,13 +27,43 @@ class UploadService : Service() {
         // Must reach startForeground even when the batch already ended, or the system crashes us.
         startForeground(Constants.NOTIF_ID, buildNotification(this, "Preparing upload…", 0, 0))
         running = true
+        holdLocks()
         if (stopRequested) stopSelf()
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         running = false
+        releaseLocks()
         super.onDestroy()
+    }
+
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+
+    /**
+     * A long run (thousands of WhatsApp photos) with the screen off: without these the CPU naps between
+     * network replies and WiFi drops to power-save, which stretches every round trip. Held only while running.
+     */
+    private fun holdLocks() {
+        if (wakeLock?.isHeld != true) {
+            wakeLock = (getSystemService(Context.POWER_SERVICE) as android.os.PowerManager)
+                .newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "GPic:upload")
+                .apply { setReferenceCounted(false); acquire(MAX_LOCK_MS) }
+        }
+        if (wifiLock?.isHeld != true) {
+            @Suppress("DEPRECATION")
+            wifiLock = (applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager)
+                .createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "GPic:upload")
+                .apply { setReferenceCounted(false); runCatching { acquire() } }
+        }
+    }
+
+    private fun releaseLocks() {
+        runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
+        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+        wakeLock = null
+        wifiLock = null
     }
 
     // Android 15+ caps dataSync services (~6 h/day); drop background protection instead of crashing.
@@ -44,6 +74,8 @@ class UploadService : Service() {
     companion object {
         // Main-thread only (ViewModel + service callbacks), so no locking needed.
         private var running = false
+        /** Safety net if a run never ends cleanly. */
+        private const val MAX_LOCK_MS = 6 * 60 * 60 * 1000L
         private var stopRequested = false
 
         fun start(context: Context) {

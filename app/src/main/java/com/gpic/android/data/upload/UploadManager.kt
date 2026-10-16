@@ -38,6 +38,9 @@ class UploadManager(
     private val sourceFor: (DjiFile) -> MediaSource = { it.defaultSource(context) },
 ) {
     private var api: GooglePhotosApi? = null
+    // Per run (see [start]): duplicate checks and commits from all workers, sent as one request each.
+    private lateinit var hashBatcher: Batcher<ByteArray, String>
+    private lateinit var commitBatcher: Batcher<GooglePhotosApi.CommitItem, String>
     private val cache by lazy { UploadCache(context) }
     private val history by lazy { UploadHistory(context) }
     private val checked by lazy { CheckedCache(context) }
@@ -135,8 +138,27 @@ class UploadManager(
         // Two pools: uploads use the thread setting; the "already backed up?" step (a read + one round trip of
         // ~0.5 s) gets at least CHECK_PARALLEL, so big batches of small files aren't paced by the upload count.
         val uploadSlots = Semaphore(effectiveThreads)
+        // Small files spend their time waiting on Google (token, commit), not sending bytes: give them more slots.
+        // The library calls are paced app-wide, so this can't push past Google's per-minute limit.
+        val smallSlots = Semaphore(cap?.let { minOf(it, SMALL_PARALLEL) } ?: maxOf(effectiveThreads, SMALL_PARALLEL))
         val checkSlots = Semaphore(maxOf(effectiveThreads, cap?.let { minOf(it, CHECK_PARALLEL) } ?: CHECK_PARALLEL))
         try { coroutineScope {
+            val api = api!!
+            hashBatcher = Batcher(this, maxSize = HASH_BATCH, maxWaitMs = 250) { hashes ->
+                val found = api.findMediaByHashes(hashes.distinctBy { GooglePhotosApi.hex(it) })
+                hashes.map { Result.success(found[GooglePhotosApi.hex(it)] ?: "") }
+            }
+            commitBatcher = Batcher(this, maxSize = COMMIT_BATCH, maxWaitMs = 300) { items ->
+                val keys = try {
+                    api.commitUploads(items)
+                } catch (e: Exception) {
+                    // One odd item mustn't fail its neighbours: commit them one by one instead.
+                    if (items.size == 1) throw e
+                    Log.w("UploadManager", "batch commit of ${items.size} failed (${e.message}); committing singly")
+                    return@Batcher items.map { runCatching { api.commitUpload(it.token, it.fileName, it.sha1Hash, it.timestamp) } }
+                }
+                keys.map { k -> if (k != null) Result.success(k) else Result.failure(com.gpic.android.data.api.RejectedByPhotosException()) }
+            }
             val ticker = launch {
                 while (isActive) {
                     delay(PROGRESS_INTERVAL_MS)
@@ -146,7 +168,7 @@ class UploadManager(
             sources.map { source ->
                 async {
                     try {
-                        val result = uploadOne(source, checkSlots, uploadSlots) ?: return@async
+                        val result = uploadOne(source, checkSlots, if (source.sizeBytes < SMALL_FILE_BYTES) smallSlots else uploadSlots) ?: return@async
                         synchronized(_results) { _results.add(result) }
                         _events.value = UploadEvent.FileResult(result)
                     } catch (e: CancellationException) {
@@ -161,13 +183,16 @@ class UploadManager(
                 try { d.await() } catch (e: CancellationException) {} catch (e: Exception) { Log.e("UploadManager","job failed ${e.message}") }
             }
             ticker.cancel()
+            hashBatcher.close()
+            commitBatcher.close()
         } } finally {
             // Also on cancellation: both stores batch their writes.
             perf.time("indexFlush") { MediaIndex.get(context).flush() }
             perf.time("historyWrite") { history.flush(); checked.flush() }
         }
         publishProgress()
-        Log.i(Perf.TAG, "batch ${sources.size} files, $effectiveThreads threads: ${(System.nanoTime() - batchStart) / 1_000_000}ms total; ${perf.summary()}")
+        Log.i(Perf.TAG, "batch ${sources.size} files, $effectiveThreads threads, library pace ${"%.1f".format(GooglePhotosApi.libraryPacer.perSec)}/s: " +
+            "${(System.nanoTime() - batchStart) / 1_000_000}ms total; ${perf.summary()}")
         _events.value = UploadEvent.UploadDone
     }
 
@@ -325,14 +350,14 @@ class UploadManager(
 
                 Log.i("GPicMedia", "${source.displayName} sha1=${sha1.joinToString("") { "%02x".format(it) }} lostLocation=${source.mayHaveLostLocation}")
                 enter(UploadStatus.CHECKING, "Checking if already backed up…")
-                val existingKey = perf.time("hashCheck") { api.findMediaByHash(sha1) }
+                val existingKey = perf.time("hashCheck") { hashBatcher.submit(sha1) }
                 if (existingKey.isNotEmpty()) return skipped(source, fp, existingKey, ALREADY_IN_LIBRARY)
                 // Not there as-is. An older GPic read this photo with its GPS stripped; if that copy is
                 // what's in the library, this upload is the one that brings the location.
                 source.openRedacted?.let { openPlain -> perf.time("plainRecheck") {
                     enter(UploadStatus.CHECKING, "Checking for a copy without location…")
                     val plain = api.calculateSha1WithProgress(openPlain, size)
-                    if (!plain.contentEquals(sha1)) staleKey = api.findMediaByHash(plain).ifEmpty { null }
+                    if (!plain.contentEquals(sha1)) staleKey = hashBatcher.submit(plain).ifEmpty { null }
                     Log.i("GPicMedia", "${source.displayName} plain sha1=${plain.joinToString("") { "%02x".format(it) }} staleCopy=${staleKey != null}")
                     if (cancelled) return cancelledResult(source, fp)
                 } }
@@ -342,7 +367,8 @@ class UploadManager(
             if (cancelled) return cancelledResult(source, fp)
             endCheck()
             enter(UploadStatus.QUEUED, "Not backed up yet • waiting for an upload slot")
-            return uploadSlots.withPermit {
+            // The slot covers sending bytes; the commit waits in a shared batch without holding one.
+            val committable = uploadSlots.withPermit {
                 if (cancelled) return cancelledResult(source, fp)
 
                 // Resume an interrupted session for this file if the server still has it.
@@ -392,29 +418,33 @@ class UploadManager(
                     enter(UploadStatus.HASHING, "Hashing for commit…")
                     sha1 = api.calculateSha1WithProgress(source::open, size)
                 }
-
-                enter(UploadStatus.COMMITTING, "Finalizing…")
-                val mediaKey = perf.time("commit") { api.commitUpload(commitToken!!, source.displayName, sha1!!, source.lastModifiedMs.takeIf { it > 0 }?.div(1000) ?: (System.currentTimeMillis() / 1000)) }
-                perf.time("cacheWrite") { cache.remove(source.key) }
-                perf.time("historyWrite") {
+                commitToken!!
+            }
+            enter(UploadStatus.COMMITTING, "Finalizing…")
+            val mediaKey = perf.time("commit") {
+                commitBatcher.submit(GooglePhotosApi.CommitItem(committable, source.displayName, sha1!!,
+                    source.lastModifiedMs.takeIf { it > 0 }?.div(1000) ?: (System.currentTimeMillis() / 1000)))
+            }
+            perf.time("cacheWrite") { cache.remove(source.key) }
+            Log.i("GPicMedia", "${source.displayName} committed key=${mediaKey.take(12)}…")
+            perf.time("historyWrite") {
                 history.record(source.displayName, size, mediaKey)
                 remember(source, mediaKey)
             }
 
-                fp.status = UploadStatus.COMPLETED
-                fp.message = if (source.knownStrippedGps) "Uploaded without its location: Android hides it from apps in folders with a .nomedia file" else "Uploaded"
-                fp.bytesUploaded = size
-                progress.incCompleted()
-                index(source, mediaKey)
-                if (staleKey != null) {
-                    fp.staleKey = staleKey
-                    fp.message = "Uploaded with location • the older copy without it is still in Google Photos (delete it there)"
-                    progress.incRelocated()
-                }
-                if (deleteAfter) deleteOriginal(source, fp)
-                emitProgress()
-                UploadResult(source.key, source.displayName, true, mediaKey)
+            fp.status = UploadStatus.COMPLETED
+            fp.message = if (source.knownStrippedGps) "Uploaded without its location: Android hides it from apps in folders with a .nomedia file" else "Uploaded"
+            fp.bytesUploaded = size
+            progress.incCompleted()
+            index(source, mediaKey)
+            if (staleKey != null) {
+                fp.staleKey = staleKey
+                fp.message = "Uploaded with location • the older copy without it is still in Google Photos (delete it there)"
+                progress.incRelocated()
             }
+            if (deleteAfter) deleteOriginal(source, fp)
+            emitProgress()
+            return UploadResult(source.key, source.displayName, true, mediaKey)
         } catch (e: CancellationException) {
             throw e
         } catch (e: com.gpic.android.data.api.RejectedByPhotosException) {
@@ -454,4 +484,9 @@ class UploadManager(
 private const val ALREADY_IN_LIBRARY = "Already in library"
 private const val CHECKED_BEFORE = "Already in library (checked on an earlier run)"
 private const val PROGRESS_INTERVAL_MS = 250L
-private const val CHECK_PARALLEL = 8
+private const val CHECK_PARALLEL = 32
+/** Hashes per duplicate-check request (100 took ~0.6 s) and uploads per commit request (20 took ~1.1 s). */
+private const val HASH_BATCH = 100
+private const val COMMIT_BATCH = 20
+private const val SMALL_PARALLEL = 24
+private const val SMALL_FILE_BYTES = 2L * 1024 * 1024

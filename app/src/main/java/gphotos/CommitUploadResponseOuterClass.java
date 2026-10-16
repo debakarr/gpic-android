@@ -19,19 +19,48 @@ public final class CommitUploadResponseOuterClass {
       com.google.protobuf.MessageOrBuilder {
 
     /**
-     * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
-     * @return Whether the field1 field is set.
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
      */
-    boolean hasField1();
+    java.util.List<gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type> 
+        getField1List();
     /**
-     * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
-     * @return The field1.
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
      */
-    gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type getField1();
+    gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type getField1(int index);
     /**
-     * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
      */
-    gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder getField1OrBuilder();
+    int getField1Count();
+    /**
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+     */
+    java.util.List<? extends gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder> 
+        getField1OrBuilderList();
+    /**
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+     */
+    gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder getField1OrBuilder(
+        int index);
   }
   /**
    * Protobuf type {@code gphotos.CommitUploadResponse}
@@ -46,6 +75,7 @@ public final class CommitUploadResponseOuterClass {
       super(builder);
     }
     private CommitUploadResponse() {
+      field1_ = java.util.Collections.emptyList();
     }
 
     @java.lang.Override
@@ -2730,29 +2760,64 @@ public final class CommitUploadResponseOuterClass {
     }
 
     public static final int FIELD1_FIELD_NUMBER = 1;
-    private gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type field1_;
+    @SuppressWarnings("serial")
+    private java.util.List<gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type> field1_;
     /**
-     * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
-     * @return Whether the field1 field is set.
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
      */
     @java.lang.Override
-    public boolean hasField1() {
-      return field1_ != null;
+    public java.util.List<gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type> getField1List() {
+      return field1_;
     }
     /**
-     * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
-     * @return The field1.
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
      */
     @java.lang.Override
-    public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type getField1() {
-      return field1_ == null ? gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.getDefaultInstance() : field1_;
+    public java.util.List<? extends gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder> 
+        getField1OrBuilderList() {
+      return field1_;
     }
     /**
-     * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
      */
     @java.lang.Override
-    public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder getField1OrBuilder() {
-      return field1_ == null ? gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.getDefaultInstance() : field1_;
+    public int getField1Count() {
+      return field1_.size();
+    }
+    /**
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+     */
+    @java.lang.Override
+    public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type getField1(int index) {
+      return field1_.get(index);
+    }
+    /**
+     * <pre>
+     * One per committed item, in request order.
+     * </pre>
+     *
+     * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+     */
+    @java.lang.Override
+    public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder getField1OrBuilder(
+        int index) {
+      return field1_.get(index);
     }
 
     private byte memoizedIsInitialized = -1;
@@ -2769,8 +2834,8 @@ public final class CommitUploadResponseOuterClass {
     @java.lang.Override
     public void writeTo(com.google.protobuf.CodedOutputStream output)
                         throws java.io.IOException {
-      if (field1_ != null) {
-        output.writeMessage(1, getField1());
+      for (int i = 0; i < field1_.size(); i++) {
+        output.writeMessage(1, field1_.get(i));
       }
       getUnknownFields().writeTo(output);
     }
@@ -2781,9 +2846,9 @@ public final class CommitUploadResponseOuterClass {
       if (size != -1) return size;
 
       size = 0;
-      if (field1_ != null) {
+      for (int i = 0; i < field1_.size(); i++) {
         size += com.google.protobuf.CodedOutputStream
-          .computeMessageSize(1, getField1());
+          .computeMessageSize(1, field1_.get(i));
       }
       size += getUnknownFields().getSerializedSize();
       memoizedSize = size;
@@ -2800,11 +2865,8 @@ public final class CommitUploadResponseOuterClass {
       }
       gphotos.CommitUploadResponseOuterClass.CommitUploadResponse other = (gphotos.CommitUploadResponseOuterClass.CommitUploadResponse) obj;
 
-      if (hasField1() != other.hasField1()) return false;
-      if (hasField1()) {
-        if (!getField1()
-            .equals(other.getField1())) return false;
-      }
+      if (!getField1List()
+          .equals(other.getField1List())) return false;
       if (!getUnknownFields().equals(other.getUnknownFields())) return false;
       return true;
     }
@@ -2816,9 +2878,9 @@ public final class CommitUploadResponseOuterClass {
       }
       int hash = 41;
       hash = (19 * hash) + getDescriptor().hashCode();
-      if (hasField1()) {
+      if (getField1Count() > 0) {
         hash = (37 * hash) + FIELD1_FIELD_NUMBER;
-        hash = (53 * hash) + getField1().hashCode();
+        hash = (53 * hash) + getField1List().hashCode();
       }
       hash = (29 * hash) + getUnknownFields().hashCode();
       memoizedHashCode = hash;
@@ -2949,11 +3011,13 @@ public final class CommitUploadResponseOuterClass {
       public Builder clear() {
         super.clear();
         bitField0_ = 0;
-        field1_ = null;
-        if (field1Builder_ != null) {
-          field1Builder_.dispose();
-          field1Builder_ = null;
+        if (field1Builder_ == null) {
+          field1_ = java.util.Collections.emptyList();
+        } else {
+          field1_ = null;
+          field1Builder_.clear();
         }
+        bitField0_ = (bitField0_ & ~0x00000001);
         return this;
       }
 
@@ -2980,18 +3044,26 @@ public final class CommitUploadResponseOuterClass {
       @java.lang.Override
       public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse buildPartial() {
         gphotos.CommitUploadResponseOuterClass.CommitUploadResponse result = new gphotos.CommitUploadResponseOuterClass.CommitUploadResponse(this);
+        buildPartialRepeatedFields(result);
         if (bitField0_ != 0) { buildPartial0(result); }
         onBuilt();
         return result;
       }
 
+      private void buildPartialRepeatedFields(gphotos.CommitUploadResponseOuterClass.CommitUploadResponse result) {
+        if (field1Builder_ == null) {
+          if (((bitField0_ & 0x00000001) != 0)) {
+            field1_ = java.util.Collections.unmodifiableList(field1_);
+            bitField0_ = (bitField0_ & ~0x00000001);
+          }
+          result.field1_ = field1_;
+        } else {
+          result.field1_ = field1Builder_.build();
+        }
+      }
+
       private void buildPartial0(gphotos.CommitUploadResponseOuterClass.CommitUploadResponse result) {
         int from_bitField0_ = bitField0_;
-        if (((from_bitField0_ & 0x00000001) != 0)) {
-          result.field1_ = field1Builder_ == null
-              ? field1_
-              : field1Builder_.build();
-        }
       }
 
       @java.lang.Override
@@ -3038,8 +3110,31 @@ public final class CommitUploadResponseOuterClass {
 
       public Builder mergeFrom(gphotos.CommitUploadResponseOuterClass.CommitUploadResponse other) {
         if (other == gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.getDefaultInstance()) return this;
-        if (other.hasField1()) {
-          mergeField1(other.getField1());
+        if (field1Builder_ == null) {
+          if (!other.field1_.isEmpty()) {
+            if (field1_.isEmpty()) {
+              field1_ = other.field1_;
+              bitField0_ = (bitField0_ & ~0x00000001);
+            } else {
+              ensureField1IsMutable();
+              field1_.addAll(other.field1_);
+            }
+            onChanged();
+          }
+        } else {
+          if (!other.field1_.isEmpty()) {
+            if (field1Builder_.isEmpty()) {
+              field1Builder_.dispose();
+              field1Builder_ = null;
+              field1_ = other.field1_;
+              bitField0_ = (bitField0_ & ~0x00000001);
+              field1Builder_ = 
+                com.google.protobuf.GeneratedMessageV3.alwaysUseFieldBuilders ?
+                   getField1FieldBuilder() : null;
+            } else {
+              field1Builder_.addAllMessages(other.field1_);
+            }
+          }
         }
         this.mergeUnknownFields(other.getUnknownFields());
         onChanged();
@@ -3068,10 +3163,16 @@ public final class CommitUploadResponseOuterClass {
                 done = true;
                 break;
               case 10: {
-                input.readMessage(
-                    getField1FieldBuilder().getBuilder(),
-                    extensionRegistry);
-                bitField0_ |= 0x00000001;
+                gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type m =
+                    input.readMessage(
+                        gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.parser(),
+                        extensionRegistry);
+                if (field1Builder_ == null) {
+                  ensureField1IsMutable();
+                  field1_.add(m);
+                } else {
+                  field1Builder_.addMessage(m);
+                }
                 break;
               } // case 10
               default: {
@@ -3091,118 +3192,311 @@ public final class CommitUploadResponseOuterClass {
       }
       private int bitField0_;
 
-      private gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type field1_;
-      private com.google.protobuf.SingleFieldBuilderV3<
-          gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder> field1Builder_;
-      /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
-       * @return Whether the field1 field is set.
-       */
-      public boolean hasField1() {
-        return ((bitField0_ & 0x00000001) != 0);
+      private java.util.List<gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type> field1_ =
+        java.util.Collections.emptyList();
+      private void ensureField1IsMutable() {
+        if (!((bitField0_ & 0x00000001) != 0)) {
+          field1_ = new java.util.ArrayList<gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type>(field1_);
+          bitField0_ |= 0x00000001;
+         }
       }
+
+      private com.google.protobuf.RepeatedFieldBuilderV3<
+          gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder> field1Builder_;
+
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
-       * @return The field1.
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
-      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type getField1() {
+      public java.util.List<gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type> getField1List() {
         if (field1Builder_ == null) {
-          return field1_ == null ? gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.getDefaultInstance() : field1_;
+          return java.util.Collections.unmodifiableList(field1_);
         } else {
-          return field1Builder_.getMessage();
+          return field1Builder_.getMessageList();
         }
       }
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
-      public Builder setField1(gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type value) {
+      public int getField1Count() {
+        if (field1Builder_ == null) {
+          return field1_.size();
+        } else {
+          return field1Builder_.getCount();
+        }
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type getField1(int index) {
+        if (field1Builder_ == null) {
+          return field1_.get(index);
+        } else {
+          return field1Builder_.getMessage(index);
+        }
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public Builder setField1(
+          int index, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type value) {
         if (field1Builder_ == null) {
           if (value == null) {
             throw new NullPointerException();
           }
-          field1_ = value;
+          ensureField1IsMutable();
+          field1_.set(index, value);
+          onChanged();
         } else {
-          field1Builder_.setMessage(value);
+          field1Builder_.setMessage(index, value);
         }
-        bitField0_ |= 0x00000001;
-        onChanged();
         return this;
       }
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
       public Builder setField1(
+          int index, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder builderForValue) {
+        if (field1Builder_ == null) {
+          ensureField1IsMutable();
+          field1_.set(index, builderForValue.build());
+          onChanged();
+        } else {
+          field1Builder_.setMessage(index, builderForValue.build());
+        }
+        return this;
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public Builder addField1(gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type value) {
+        if (field1Builder_ == null) {
+          if (value == null) {
+            throw new NullPointerException();
+          }
+          ensureField1IsMutable();
+          field1_.add(value);
+          onChanged();
+        } else {
+          field1Builder_.addMessage(value);
+        }
+        return this;
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public Builder addField1(
+          int index, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type value) {
+        if (field1Builder_ == null) {
+          if (value == null) {
+            throw new NullPointerException();
+          }
+          ensureField1IsMutable();
+          field1_.add(index, value);
+          onChanged();
+        } else {
+          field1Builder_.addMessage(index, value);
+        }
+        return this;
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public Builder addField1(
           gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder builderForValue) {
         if (field1Builder_ == null) {
-          field1_ = builderForValue.build();
+          ensureField1IsMutable();
+          field1_.add(builderForValue.build());
+          onChanged();
         } else {
-          field1Builder_.setMessage(builderForValue.build());
+          field1Builder_.addMessage(builderForValue.build());
         }
-        bitField0_ |= 0x00000001;
-        onChanged();
         return this;
       }
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
-      public Builder mergeField1(gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type value) {
+      public Builder addField1(
+          int index, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder builderForValue) {
         if (field1Builder_ == null) {
-          if (((bitField0_ & 0x00000001) != 0) &&
-            field1_ != null &&
-            field1_ != gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.getDefaultInstance()) {
-            getField1Builder().mergeFrom(value);
-          } else {
-            field1_ = value;
-          }
+          ensureField1IsMutable();
+          field1_.add(index, builderForValue.build());
+          onChanged();
         } else {
-          field1Builder_.mergeFrom(value);
+          field1Builder_.addMessage(index, builderForValue.build());
         }
-        bitField0_ |= 0x00000001;
-        onChanged();
         return this;
       }
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public Builder addAllField1(
+          java.lang.Iterable<? extends gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type> values) {
+        if (field1Builder_ == null) {
+          ensureField1IsMutable();
+          com.google.protobuf.AbstractMessageLite.Builder.addAll(
+              values, field1_);
+          onChanged();
+        } else {
+          field1Builder_.addAllMessages(values);
+        }
+        return this;
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
       public Builder clearField1() {
-        bitField0_ = (bitField0_ & ~0x00000001);
-        field1_ = null;
-        if (field1Builder_ != null) {
-          field1Builder_.dispose();
-          field1Builder_ = null;
+        if (field1Builder_ == null) {
+          field1_ = java.util.Collections.emptyList();
+          bitField0_ = (bitField0_ & ~0x00000001);
+          onChanged();
+        } else {
+          field1Builder_.clear();
         }
-        onChanged();
         return this;
       }
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
-      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder getField1Builder() {
-        bitField0_ |= 0x00000001;
-        onChanged();
-        return getField1FieldBuilder().getBuilder();
+      public Builder removeField1(int index) {
+        if (field1Builder_ == null) {
+          ensureField1IsMutable();
+          field1_.remove(index);
+          onChanged();
+        } else {
+          field1Builder_.remove(index);
+        }
+        return this;
       }
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
-      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder getField1OrBuilder() {
-        if (field1Builder_ != null) {
-          return field1Builder_.getMessageOrBuilder();
-        } else {
-          return field1_ == null ?
-              gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.getDefaultInstance() : field1_;
+      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder getField1Builder(
+          int index) {
+        return getField1FieldBuilder().getBuilder(index);
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder getField1OrBuilder(
+          int index) {
+        if (field1Builder_ == null) {
+          return field1_.get(index);  } else {
+          return field1Builder_.getMessageOrBuilder(index);
         }
       }
       /**
-       * <code>.gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
        */
-      private com.google.protobuf.SingleFieldBuilderV3<
+      public java.util.List<? extends gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder> 
+           getField1OrBuilderList() {
+        if (field1Builder_ != null) {
+          return field1Builder_.getMessageOrBuilderList();
+        } else {
+          return java.util.Collections.unmodifiableList(field1_);
+        }
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder addField1Builder() {
+        return getField1FieldBuilder().addBuilder(
+            gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.getDefaultInstance());
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder addField1Builder(
+          int index) {
+        return getField1FieldBuilder().addBuilder(
+            index, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.getDefaultInstance());
+      }
+      /**
+       * <pre>
+       * One per committed item, in request order.
+       * </pre>
+       *
+       * <code>repeated .gphotos.CommitUploadResponse.Field1Type field1 = 1;</code>
+       */
+      public java.util.List<gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder> 
+           getField1BuilderList() {
+        return getField1FieldBuilder().getBuilderList();
+      }
+      private com.google.protobuf.RepeatedFieldBuilderV3<
           gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder> 
           getField1FieldBuilder() {
         if (field1Builder_ == null) {
-          field1Builder_ = new com.google.protobuf.SingleFieldBuilderV3<
+          field1Builder_ = new com.google.protobuf.RepeatedFieldBuilderV3<
               gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1Type.Builder, gphotos.CommitUploadResponseOuterClass.CommitUploadResponse.Field1TypeOrBuilder>(
-                  getField1(),
+                  field1_,
+                  ((bitField0_ & 0x00000001) != 0),
                   getParentForChildren(),
                   isClean());
           field1_ = null;
@@ -3308,7 +3602,7 @@ public final class CommitUploadResponseOuterClass {
   static {
     java.lang.String[] descriptorData = {
       "\n\032CommitUploadResponse.proto\022\007gphotos\"\265\003" +
-      "\n\024CommitUploadResponse\0228\n\006field1\030\001 \001(\0132(" +
+      "\n\024CommitUploadResponse\0228\n\006field1\030\001 \003(\0132(" +
       ".gphotos.CommitUploadResponse.Field1Type" +
       "\032\342\002\n\nField1Type\022H\n\006field1\030\001 \001(\01328.gphoto" +
       "s.CommitUploadResponse.Field1Type.InnerF" +

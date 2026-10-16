@@ -20,5 +20,6 @@ message CommitUploadResponse {
     }
     Field5Type field5 = 5;
   }
-  Field1Type field1 = 1;
+  // One per committed item, in request order.
+  repeated Field1Type field1 = 1;
 }

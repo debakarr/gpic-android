@@ -25,7 +25,7 @@ message RemoteMatches {
       }
       RMField2Inner field2 = 2;
     }
-    RMField2Type field2 = 2;
+    repeated RMField2Type field2 = 2;
   }
   RMField1Type field1 = 1;
 }

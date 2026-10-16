@@ -8,7 +8,8 @@ message HashCheck {
     message InnerField1Type {
       bytes sha1_hash = 1;
     }
-    InnerField1Type field1 = 1;
+    // Repeated: one request can check many hashes (each match echoes its hash).
+    repeated InnerField1Type field1 = 1;
     message InnerField2Type {}
     InnerField2Type field2 = 2;
   }

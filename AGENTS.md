@@ -174,6 +174,19 @@ open with `setRequireOriginal` (SecurityException), so the zeroed/real check is 
 `CheckedCache` skips files confirmed on an earlier run (same key, size, mtime; ≤ 30 days) — never when deleting
 originals (Free up space needs today's exact-hash answer) and never for reads that may have lost GPS.
 
+### Batched library calls (the big speedup for thousands of new files)
+Measured from the PC against a real account (scratch script, test items dated 2001-01-01): Google serializes one
+account's commits (~1.1 s each; 6 in parallel took 6.5 s), but `CommitUpload.field1` is repeated: 20 items in one
+request committed in 1.09 s, replies in request order (verified by hash lookup). `HashCheck.field1.field1` is
+repeated too: 100 hashes in 0.6 s, each match echoes its SHA-1. Re-committing identical bytes returns the existing
+media key (no duplicate) but the reply doesn't say it already existed, so the per-file duplicate check stays.
+`UploadManager` routes every check and commit through `Batcher` (100 hashes / 250 ms, 20 commits / 300 ms; a failed
+commit batch falls back to single commits); the upload slot is released before the commit wait; small files
+(< 2 MB) get 24 upload slots; checks 32. Library calls are paced app-wide (`Pacer`, AIMD, 8/s start).
+On the Redmi 3S: 30 new small files 63.8 s before → 60 new files 11.6 s. `UploadService` holds a partial wake lock
+and a WiFi high-perf lock while running. The protos' Java classes are checked in: regenerate with the system
+`protoc` 3.21.12 (`protoc --java_out=../java X.proto` from app/src/main/proto).
+
 ### Not media / refused by Google
 Folder scans skip subfolders named like "WhatsApp Stickers" (`DjiScanner.listTree`, shown as `scanNote`). Before
 hashing, `MediaSniff` checks the first 16 bytes against the extension for jpg/png/gif/webp/bmp/heic/avif/mp4/mov/3gp
