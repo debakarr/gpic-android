@@ -20,8 +20,8 @@ android {
         applicationId = "com.gpic.android"
         minSdk = 26
         targetSdk = 37
-        versionCode = 14
-        versionName = "1.4.2"
+        versionCode = 15
+        versionName = "1.4.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -125,7 +125,7 @@ dependencies {
 
 // Version-numbered APK filenames for release uploads (streambox convention:
 // `make publish V=<versionName> CODE=<versionCode>` keeps these in sync).
-val releaseVersion = "1.4.2"
+val releaseVersion = "1.4.3"
 val versionApks by tasks.registering(Copy::class) {
     dependsOn("assembleRelease")
     from(layout.buildDirectory.dir("outputs/apk/release"))
