@@ -12,7 +12,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -35,7 +34,39 @@ fun AlbumsScreen(vm: AlbumsViewModel, onBack: () -> Unit) {
             TopAppBar(
                 title = { Text("Album suggestions") },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                actions = {
+                    if (state.suggestions.size > 1) {
+                        val all = state.selected.size == state.suggestions.size
+                        TextButton(onClick = { if (all) vm.clearSelection() else vm.selectAll() }, enabled = !state.busy) {
+                            Text(if (all) "Select none" else "Select all")
+                        }
+                    }
+                },
             )
+        },
+        bottomBar = {
+            if (state.selected.isNotEmpty() || state.batchProgress != null) {
+                Surface(tonalElevation = 3.dp, shadowElevation = 6.dp) {
+                    Row(
+                        Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        val count = state.selected.size
+                        val items = state.suggestions.filter { it.id in state.selected }.sumOf { it.items.size }
+                        Text(
+                            state.batchProgress?.let { "Creating $it…" } ?: "$count selected • $items items",
+                            style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = vm::clearSelection, enabled = !state.busy) { Text("Clear") }
+                        Button(onClick = vm::createSelected, enabled = !state.busy && count > 0) {
+                            if (state.busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            else Icon(Icons.Default.PhotoAlbum, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (state.busy) "Creating…" else if (count == 1) "Create album" else "Create $count albums")
+                        }
+                    }
+                }
+            }
         },
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
@@ -94,9 +125,13 @@ fun AlbumsScreen(vm: AlbumsViewModel, onBack: () -> Unit) {
             items(state.suggestions, key = { it.id }) { s ->
                 SuggestionCard(
                     s = s,
+                    name = state.nameOf(s),
+                    selected = s.id in state.selected,
                     creating = state.creatingId == s.id,
-                    busy = state.creatingId != null,
-                    onCreate = { name -> vm.create(s, name) },
+                    busy = state.busy,
+                    onRename = { vm.rename(s, it) },
+                    onToggle = { vm.toggleSelected(s) },
+                    onCreate = { vm.create(s) },
                     onDismiss = { vm.dismiss(s) },
                 )
             }
@@ -105,15 +140,30 @@ fun AlbumsScreen(vm: AlbumsViewModel, onBack: () -> Unit) {
 }
 
 @Composable
-private fun SuggestionCard(s: Suggestion, creating: Boolean, busy: Boolean, onCreate: (String) -> Unit, onDismiss: () -> Unit) {
-    var name by rememberSaveable(s.id) { mutableStateOf(AlbumSuggester.title(s)) }
-    Card(Modifier.fillMaxWidth()) {
+private fun SuggestionCard(
+    s: Suggestion,
+    name: String,
+    selected: Boolean,
+    creating: Boolean,
+    busy: Boolean,
+    onRename: (String) -> Unit,
+    onToggle: () -> Unit,
+    onCreate: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = if (selected) CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer) else CardDefaults.cardColors(),
+    ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedTextField(
-                value = name, onValueChange = { name = it },
-                label = { Text("Album name") }, singleLine = true, enabled = !busy,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = selected, onCheckedChange = { onToggle() }, enabled = !busy)
+                OutlinedTextField(
+                    value = name, onValueChange = onRename,
+                    label = { Text("Album name") }, singleLine = true, enabled = !busy,
+                    modifier = Modifier.weight(1f),
+                )
+            }
             val located = if (s.withLocation > 0) " • ${s.withLocation} with location" else ""
             Text("${s.items.size} items$located", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             val thumbs = s.items.filter { it.localUri != null }.take(8)
@@ -133,7 +183,7 @@ private fun SuggestionCard(s: Suggestion, creating: Boolean, busy: Boolean, onCr
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Button(onClick = { onCreate(name) }, enabled = !busy) {
+                Button(onClick = onCreate, enabled = !busy) {
                     if (creating) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                     else Icon(Icons.Default.PhotoAlbum, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))

@@ -14,14 +14,17 @@ Android app that uploads photos and videos to Google Photos — from a DJI Actio
 - Keeps photo locations: reads the original file (Android strips GPS from photos for apps without media-location access), and re-uploads photos an earlier version sent without their location
 - **Free up space**: back up a folder's photos and videos older than N days / weeks / months / years, then delete them from the phone (only once Google Photos has them)
 - File-type filter (Photos / RAW / Videos) for every source
-- **Album suggestions**: groups the photos GPic backed up by when they were taken, on the phone, and creates the album in Google Photos when you tap Create
+- **Album suggestions**: groups the photos GPic backed up by when they were taken, on the phone, and creates the album in Google Photos when you tap Create (one at a time, or tick several and create them all)
+- Fast re-runs over big folders (a WhatsApp folder with thousands of images): one query per folder to scan, up to 8 "already backed up?" checks at once, and files confirmed on an earlier run are skipped without asking Google again
+- **Video editor**: trim (or keep several parts), speed, colour LUT (DJI D-Log M → Rec.709 for Osmo Action 4 clips, or any `.cube`), brightness / contrast / saturation, camera-sound volume, background music, crop to 16:9 / 9:16 / 1:1, resize, rotate; exports H.264 to `Movies/GPic` on the phone. Optional **Ask Claude**: describe the edit and Claude sets the controls, using your own Anthropic API key
 
 ## Privacy & Data
 
-- **No analytics, no crash reporting, no ads, no third-party SDKs.** Dependencies are AndroidX, OkHttp, Gson, protobuf and Coil only.
-- **Your photos go from your storage to Google, nowhere else.** The app talks only to Google endpoints: `android.googleapis.com/auth` (token exchange), `photos.googleapis.com` (uploads) and `photosdata-pa.googleapis.com` (library calls).
+- **No analytics, no crash reporting, no ads.** Dependencies are AndroidX (incl. Media3 for video editing), OkHttp, Gson, protobuf, Coil and Anthropic's Java SDK (used only by Ask Claude).
+- **Your photos go from your storage to Google, nowhere else.** Uploads talk only to Google endpoints: `android.googleapis.com/auth` (token exchange), `photos.googleapis.com` (uploads) and `photosdata-pa.googleapis.com` (library calls).
+- **Ask Claude (video editor, optional)** talks to `api.anthropic.com` only when you tap it, with your own API key (stored in `EncryptedSharedPreferences`). It sends the video's name, length, size and frame rate, the current edit settings, the LUT names, the music track's file name and your request. With "Let Claude see frames" ticked it also sends 12 small JPEG frames (512 px). The video file itself is never sent; editing and export happen on the phone.
 - **The Photos credential you paste** (`androidId`/`Email`/`Token`) is kept in `EncryptedSharedPreferences` on the device and sent only to Google. The short-lived bearer token lives in RAM and is refreshed as needed. Nothing is uploaded anywhere except Google Photos.
-- **Local state** is an upload-resume cache (`upload_cache.json`, 24h expiry) in the app cache dir, an upload history and a media index (media key, capture time, GPS and local file link of what GPic backed up; used only for album suggestions, never sent anywhere), plus your picker selection and settings. App backups are off. Clearing app data wipes all of it.
+- **Local state** is an upload-resume cache (`upload_cache.json`, 24h expiry) in the app cache dir, an upload history, a list of files confirmed in Google Photos (path, size, date and media key; 30 days, so re-runs can skip them), imported LUTs, and a media index (media key, capture time, GPS and local file link of what GPic backed up; used only for album suggestions, never sent anywhere), plus your picker selection and settings. App backups are off. Clearing app data wipes all of it.
 - **Album suggestions** are computed on the phone. Creating an album sends Google the album name and which of your photos go in it — nothing else. Album names are dates; GPic doesn't look up place names, which would send coordinates to a server.
 - **Permissions** used: `INTERNET`, `ACCESS_NETWORK_STATE`, foreground-service + notifications (to keep uploads alive in background), `READ_MEDIA_IMAGES`/`READ_MEDIA_VIDEO` + `ACCESS_MEDIA_LOCATION` (`READ_EXTERNAL_STORAGE` on Android 12 and older) so photos keep their location, USB host (to detect the camera), and Bluetooth + nearby WiFi for camera over WiFi.
 - The app cannot read your Photos login by itself (Android sandbox). That is why setup asks you to paste the auth string manually.
@@ -118,11 +121,20 @@ You can also copy `~/.config/gpic/config.json` off a desktop that already runs g
 4. Each file card shows live percent, speed and time left. Interrupted uploads resume.
 5. `Already in library` means the SHA-1 matched and the file was skipped. `Force re-upload` and `Delete after upload` are in Settings.
 
+## Video editor
+
+Film icon at the top of the home screen. Choose a video, then:
+
+- **Trim** with the slider; Claude can keep several parts (tap a part to drop it). The preview plays the cut, speed, colour and camera volume; music is only in the export.
+- **Colour LUT**: for Osmo Action 4 footage shot in D-Log M, get DJI's free *D-Log M to Rec.709* LUT from [DJI's Action 4 download page](https://www.dji.com/osmo-action-4/downloads) and tap *Add DJI LUT*. GPic doesn't bundle it (it's DJI's file); once added it's the default, and a DJI clip that looks flat opens with it on. Until then GPic's own approximate "Flat → vivid" look stands in. Any other 3D `.cube` LUT can be added too.
+- **Export** writes an H.264/AAC MP4 to `Movies/GPic`; *Back up* puts it in the Phone list for upload. HDR clips are tone-mapped to SDR. Old phones may not decode 4K or 10-bit HEVC (the Action 4's high-quality modes); the error says so.
+- **Ask Claude**: add an Anthropic API key (console.anthropic.com), describe the edit, and Claude (`claude-opus-5-5`) fills in the controls and says what it changed. Nothing is exported until you tap Export. If Anthropic's safety filter declines a request, the API retries it on a fallback model (`fallbacks: "default"`).
+
 ## Status meanings
 
 | Status | Meaning |
 |---|---|
-| Queued | Waiting for a free upload slot |
+| Queued | Waiting for a free check or upload slot |
 | Preparing | Opening the file on the camera |
 | Hashing | Computing SHA-1 for the duplicate check |
 | Checking | Asking Google if the file is already in the library |
@@ -130,7 +142,7 @@ You can also copy `~/.config/gpic/config.json` off a desktop that already runs g
 | Resuming | Continuing an interrupted upload from X% |
 | Finalizing | Server is committing the file to the library |
 | Done | Uploaded and committed |
-| Already backed up | Hash matched, skipped |
+| Already backed up | Hash matched, skipped (or confirmed on an earlier run and unchanged since) |
 | Failed | Copy icon on the row copies the full error for debugging |
 
 ## How uploading works

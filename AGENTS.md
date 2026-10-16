@@ -22,6 +22,8 @@
 | Prefs | EncryptedSharedPreferences + DataStore | security-crypto 1.1.0-alpha06 |
 | DB | Room + KSP | 2.8.4 / 2.3.10 |
 | Network | OkHttp (+logging) + Gson, protobuf-java | 4.12.0 / 4.28.2 |
+| Video | Media3 Transformer + effect + ExoPlayer/UI | 1.10.1 |
+| Claude | anthropic-java (OkHttp client; ships its own R8 rules) | 2.73.0 |
 | Async | Coroutines | 1.10.2 |
 | USB/SAF | DocumentFile | 1.0.1 |
 | Build | AGP | 9.1.1, Gradle 9.6.1 |
@@ -81,7 +83,11 @@ app/src/main/
       stats/    SystemStatsCollector.kt (/proc/stat + TrafficStats), SystemStats.kt
       upload/   UploadManager.kt (one pipeline over MediaSource: hash→dedup→resume→stream→commit), MediaSource.kt, OriginalMedia.kt (unredacted GPS)
       cache/    UploadCache.kt (resume ids) + UploadHistory.kt (name+size → media key, for single-pass sources)
+                + CheckedCache.kt (files confirmed in the library: key+size+mtime → media key, 30 days)
       cleanup/  AgeRule.kt (free-up-space age cutoff, EXIF date parsing; pure, unit-tested)
+    editor/     EditPlan.kt (the edit model + Claude JSON schema; pure), CubeLut.kt (.cube parser, built-in look; pure),
+                LutStore.kt, VideoProbe.kt (metadata, frames, flat-footage guess), VideoExporter.kt (Media3 Transformer),
+                ClaudeEditPlanner.kt (Anthropic SDK, structured output → EditPlan)
     camera/     CameraLink.kt (BLE pair → camera WiFi → DUML list), CameraTransfer.kt (self-resuming HTTP stream, stager)
       osmosis/  vendored KonradIT/osmosis protocol code (MIT, see NOTICE.md); only change: CameraNet socket binding
     ui/
@@ -91,6 +97,8 @@ app/src/main/
         home/     HomeScreen.kt + HomeViewModel (DJI pick → scan → upload + live stats)
         auth/     AuthScreen.kt (paste master-token string, service validation)
         settings/ SettingsScreen.kt (threads, force, saver/quota, delete-after)
+        albums/   AlbumsScreen.kt + AlbumsViewModel (suggestions, multi-select "Create N albums")
+        editor/   EditorScreen.kt + EditorViewModel (preview via ExoPlayer.setVideoEffects, export, Ask Claude)
     upload/ UploadService.kt (foreground service)
     util/   Format.kt, Constants.kt
   proto/ AddMediaToAlbum|CommitToken|CommitUpload|CommitUploadResponse|CreateAlbum|CreateAlbumResponse|GetUploadToken|HashCheck|RemoteMatches.proto
@@ -150,6 +158,32 @@ After a run the FAB becomes "Retry N" (failed/cancelled only) or disappears; a n
 Progress card sits right under the account card; the top bar shows "Uploading n of N" (tap → top); a
 small go-to-top FAB appears once scrolled; device stats collapse; list chips All / Not done / Failed.
 A saved phone-storage folder is rescanned on launch (MTP camera folders wait for Rescan).
+
+### Big folders (WhatsApp) — speed
+Measured on the Redmi 3S with 600 tiny JPEGs already in the library (`adb logcat -s GPicPerf` prints per-step totals):
+folder scan 33.4 s → 1.0 s (`listTree`: one DocumentsContract query per folder; DocumentFile did ~5 IPCs per file);
+upload run 146.5 s → 68.9 s, and a re-run of the same folder 6.0 s (`CheckedCache`). A first run is bound by `hashCheck` round trips (~0.5–0.9 s each), so `UploadManager`
+has two pools: checks get `max(threads, 8)` slots (MTP/camera caps still apply), transfers use the thread setting
+(default now Auto; configs still on the old default 3 migrate once via `threads_v2`). Google rate-limits these calls
+per minute per account (429 "PhotosFeService RPC calls per minute per user", hit after ~1,800 checks in a few minutes):
+`postProtoRaw` then pauses every request app-wide (Retry-After, else 10/20/40/60 s, up to 6 times) instead of failing files. Progress is published by a
+250 ms ticker (a snapshot copies every row; per-step emits were quadratic). History/index/checked writes are batched.
+`UriSource` reads the first 128 KB once: a JPEG with no GPS tags, or with real (non-zero) coordinates, is read as is
+(no MediaStore lookup or second hash). `.nomedia` folders (WhatsApp Sent) are indexed as plain files that apps can't
+open with `setRequireOriginal` (SecurityException), so the zeroed/real check is what decides there.
+`CheckedCache` skips files confirmed on an earlier run (same key, size, mtime; ≤ 30 days) — never when deleting
+originals (Free up space needs today's exact-hash answer) and never for reads that may have lost GPS.
+
+### Video editor (film icon on Home)
+`EditPlan` is the single model: the controls edit it and Claude returns one (strict JSON schema, `explanation` +
+every field; `sanitized()` clamps it). Export = Media3 `Composition`: one clipped `EditedMediaItem` per kept segment
+(speed via `setSpeed`, camera volume via `ChannelMixingAudioProcessor`, video effects LUT → brightness/contrast/HSL →
+rotate → `Presentation` crop/resize), plus a looping music sequence; HDR is tone-mapped to SDR; H.264/AAC into
+`Movies/GPic` via MediaStore. `SingleColorLut.createFromCube` indexes `[r][g][b]` (checked in the shader:
+row = r·N + g, column = b). DJI's D-Log M → Rec.709 LUT isn't bundled (DJI's download); importing it into the
+`dji_dlogm_rec709` slot makes it the default, and a flat-looking `DJI_*` clip opens with it on. Ask Claude:
+`claude-opus-5-5`, effort medium, `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`), refusal and
+max_tokens handled; metadata + plan + request, frames (12 × 512 px) only when ticked. Key in the encrypted prefs.
 
 ### Album suggestions (Albums screen, top-bar icon)
 `MediaIndex` (filesDir JSON, singleton) records media key + EXIF capture time/GPS + local Uri for every

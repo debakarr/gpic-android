@@ -18,6 +18,8 @@ gson = "2.11.0"
 protobuf = "4.28.2"
 coil = "2.7.0"
 coroutines = "1.10.2"
+anthropic = "2.73.0"
+json = "20250517"
 documentfile = "1.0.1"
 junit = "4.13.2"
 androidxJunit = "1.2.1"
@@ -43,6 +45,11 @@ androidx-datastore = { group = "androidx.datastore", name = "datastore-preferenc
 androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "security" }
 androidx-documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
 media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
+media3-transformer = { group = "androidx.media3", name = "media3-transformer", version.ref = "media3" }
+media3-effect = { group = "androidx.media3", name = "media3-effect", version.ref = "media3" }
+media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
+anthropic-java = { group = "com.anthropic", name = "anthropic-java", version.ref = "anthropic" }
+json = { group = "org.json", name = "json", version.ref = "json" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 okhttp-logging = { group = "com.squareup.okhttp3", name = "logging-interceptor", version.ref = "okhttp" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }

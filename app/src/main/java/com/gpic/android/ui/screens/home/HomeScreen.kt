@@ -57,6 +57,7 @@ fun HomeScreen(
     onNavigateAuth: () -> Unit,
     onNavigateSettings: () -> Unit,
     onNavigateAlbums: () -> Unit = {},
+    onNavigateEditor: () -> Unit = {},
     albumSuggestions: Int = 0,
 ) {
     val state by vm.state.collectAsState()
@@ -169,6 +170,7 @@ fun HomeScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onNavigateEditor) { Icon(Icons.Default.MovieCreation, "Video editor") }
                     IconButton(onClick = onNavigateAlbums) {
                         BadgedBox(badge = { if (albumSuggestions > 0) Badge { Text("$albumSuggestions") } }) {
                             Icon(Icons.Default.PhotoAlbum, "Album suggestions")

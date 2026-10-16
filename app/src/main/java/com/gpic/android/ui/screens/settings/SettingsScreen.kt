@@ -91,7 +91,8 @@ fun SettingsScreen(store: CredentialStore, onBack: () -> Unit) {
             )
             SwitchItem(
                 title = "Skip files already in Google Photos",
-                detail = "Hashes each file first and asks Google whether it's already backed up",
+                detail = "Hashes each file first and asks Google whether it's already backed up. Unchanged files " +
+                    "confirmed on an earlier run are skipped without asking again (for 30 days; not when deleting originals).",
                 checked = !config.forceUpload,
                 onChange = { skip -> save { copy(forceUpload = !skip) } },
             )

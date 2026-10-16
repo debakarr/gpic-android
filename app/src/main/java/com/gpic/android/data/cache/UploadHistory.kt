@@ -20,10 +20,24 @@ class UploadHistory(context: Context) {
     @Synchronized
     fun find(name: String, size: Long): String? = entries[id(name, size)]
 
+    private var unsaved = 0
+
+    /** Rewriting the whole file per upload was quadratic over big batches; it's written every 50 and on [flush]. */
     @Synchronized
     fun record(name: String, size: Long, mediaKey: String) {
         entries[id(name, size)] = mediaKey
-        runCatching { file.writeText(JSONObject(entries as Map<*, *>).toString()) }
+        if (++unsaved >= 50) flush()
+    }
+
+    @Synchronized
+    fun flush() {
+        if (unsaved == 0) return
+        unsaved = 0
+        runCatching {
+            val tmp = File(file.path + ".tmp")
+            tmp.writeText(JSONObject(entries as Map<*, *>).toString())
+            tmp.renameTo(file)
+        }
     }
 
     private fun load(): MutableMap<String, String> = runCatching {

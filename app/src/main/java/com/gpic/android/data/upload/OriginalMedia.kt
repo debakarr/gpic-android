@@ -31,23 +31,28 @@ object OriginalMedia {
             context.checkSelfPermission(Manifest.permission.ACCESS_MEDIA_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     /**
-     * An unredacted Uri for [uri] that this app can actually open, or null when there isn't one
-     * (no permission, not shared storage, or the item isn't indexed by MediaStore).
+     * [uri] is an unredacted Uri this app can open, or null when there isn't one (no permission, not shared
+     * storage, not indexed yet). [hidden]: Android won't hand the original over at all — the file is indexed
+     * only as a plain file (its folder has a .nomedia file, like WhatsApp's Sent folders) and apps may not
+     * open those with requireOriginal. Retrying doesn't help there.
      */
-    fun originalUri(context: Context, uri: Uri, mimeHint: String?): Uri? {
-        if (!mayRedactLocation(uri) || !hasLocationPermission(context)) return null
+    class Original(val uri: Uri?, val hidden: Boolean = false)
+
+    fun resolve(context: Context, uri: Uri, mimeHint: String?): Original {
+        if (!mayRedactLocation(uri) || !hasLocationPermission(context)) return Original(null)
         val media = mediaUriFor(context, uri, mimeHint) ?: run {
             Log.w(TAG, "no MediaStore entry for $uri")
-            return null
+            return Original(null)
         }
         val original = MediaStore.setRequireOriginal(media)
         return try {
-            context.contentResolver.openInputStream(original)?.close() ?: return null
+            context.contentResolver.openInputStream(original)?.close() ?: return Original(null)
             Log.i(TAG, "reading original via $media")
-            original
+            Original(original)
         } catch (e: Exception) {
             Log.w(TAG, "original unavailable for $uri: ${e.javaClass.simpleName} ${e.message}")
-            null
+            val plainFileEntry = media.pathSegments.getOrNull(media.pathSegments.size - 2) == "file"
+            Original(null, hidden = plainFileEntry && e is SecurityException)
         }
     }
 
@@ -69,20 +74,29 @@ object OriginalMedia {
         }
         val dir = path.substringBeforeLast('/', "")
         val relativePath = if (dir.isEmpty()) "" else "$dir/"
-        fun lookup() = runCatching {
+        fun lookup(c: Uri) = runCatching {
             context.contentResolver.query(
-                collection, arrayOf(MediaStore.MediaColumns._ID),
+                c, arrayOf(MediaStore.MediaColumns._ID),
                 "${MediaStore.MediaColumns.RELATIVE_PATH}=? AND ${MediaStore.MediaColumns.DISPLAY_NAME}=?",
                 arrayOf(relativePath, path.substringAfterLast('/')), null,
-            )?.use { c -> if (c.moveToFirst()) ContentUris.withAppendedId(collection, c.getLong(0)) else null }
+            )?.use { cur -> if (cur.moveToFirst()) ContentUris.withAppendedId(c, cur.getLong(0)) else null }
         }.getOrNull()
-        lookup()?.let { return it }
+        // Folders with a .nomedia file (WhatsApp's Sent folders) are indexed as plain files, not images/videos.
+        val files = MediaStore.Files.getContentUri(volume)
+        fun lookupAny() = lookup(collection) ?: if (collection != files) lookup(files) else null
+        lookupAny()?.let { return it }
         // Not indexed yet (e.g. copied in by a file manager or adb): ask the media scanner, then look again.
         // Seen on a Redmi 3S: freshly copied files read stripped even with the permission until scanned.
+        // Once a scan didn't help in a folder, don't make every other file there wait for one too.
+        val folderKey = "$volumeId:$relativePath"
+        if (unscannable[folderKey]?.let { System.currentTimeMillis() - it < SCAN_RETRY_MS } == true) return null
         val root = if (volumeId == "primary") "/storage/emulated/0" else "/storage/$volumeId"
         scanAndWait(context, "$root/$path")
-        return lookup()
+        return lookupAny() ?: run { unscannable[folderKey] = System.currentTimeMillis(); null }
     }
+
+    private val unscannable = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private const val SCAN_RETRY_MS = 10 * 60_000L
 
     /** Index one file with the media scanner; returns when it's done (or after a few seconds). Off the main thread. */
     private fun scanAndWait(context: Context, path: String) {

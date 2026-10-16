@@ -58,6 +58,7 @@ class CredentialStore(context: Context) {
 
     companion object {
         private const val ENCRYPTED_FILE = "gpic_encrypted_prefs"
+        private const val CLAUDE_KEY = "claude_api_key"
     }
 
     private val _configFlow = MutableStateFlow(loadConfig())
@@ -82,7 +83,8 @@ class CredentialStore(context: Context) {
             AppConfig(
                 selectedEmail = obj.optString("selected_email", ""),
                 credentials = creds,
-                uploadThreads = obj.optInt("upload_threads", 3),
+                // 3 was the old default; configs saved before Auto became the default move to Auto once.
+                uploadThreads = obj.optInt("upload_threads", 0).let { if (it == 3 && !obj.has("threads_v2")) 0 else it },
                 forceUpload = obj.optBoolean("force_upload", false),
                 deleteAfterUpload = obj.optBoolean("delete_after_upload", false),
                 saverMode = obj.optBoolean("saver_mode", false),
@@ -98,6 +100,7 @@ class CredentialStore(context: Context) {
         val obj = JSONObject().apply {
             put("selected_email", config.selectedEmail)
             put("upload_threads", config.uploadThreads)
+            put("threads_v2", true)
             put("force_upload", config.forceUpload)
             put("delete_after_upload", config.deleteAfterUpload)
             put("saver_mode", config.saverMode)
@@ -177,6 +180,13 @@ class CredentialStore(context: Context) {
         val match = current.credentials.firstOrNull { it.email.contains(email, ignoreCase = true) } ?: return false
         saveConfig(current.copy(selectedEmail = match.email))
         return true
+    }
+
+    /** The user's own Anthropic API key for the video editor's "Ask Claude"; same encrypted file as the Photos token. */
+    fun getClaudeApiKey(): String? = prefs.getString(CLAUDE_KEY, null)?.takeIf { it.isNotBlank() }
+
+    fun setClaudeApiKey(key: String?) {
+        prefs.edit().apply { if (key.isNullOrBlank()) remove(CLAUDE_KEY) else putString(CLAUDE_KEY, key.trim()) }.apply()
     }
 
     fun getActiveCredential(): Credential? {

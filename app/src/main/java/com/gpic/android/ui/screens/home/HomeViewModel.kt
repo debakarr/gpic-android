@@ -217,7 +217,7 @@ class HomeViewModel(
             _state.value = _state.value.copy(isScanning = true, scanError = null, djiSource = "files", djiUri = null)
             try {
                 // filesFromUris already returns smallest-first sorted
-                val files = scanner.filesFromUris(uris)
+                val files = com.gpic.android.util.Perf.log("pick ${uris.size} files") { scanner.filesFromUris(uris) }
                 _state.value = _state.value.copy(
                     djiFiles = files,
                     progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null,
@@ -235,14 +235,16 @@ class HomeViewModel(
     fun clearSelection() {
         context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
             .remove("last_dji_uri").remove("last_dji_files").apply()
-        _state.value = _state.value.copy(djiUri = null, djiSource = "none", djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap())
+        // Also the last run's counters, or the progress card keeps showing "601 / 0".
+        _state.value = _state.value.copy(djiUri = null, djiSource = "none", djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap(),
+            completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null)
     }
 
     fun scanDji(uri: Uri) {
         viewModelScope.launch {
             _state.value = _state.value.copy(isScanning = true, scanError = null)
             try {
-                val files = scanner.scanViaSaf(uri).sortedBy { it.sizeBytes }
+                val files = com.gpic.android.util.Perf.log("folder scan") { scanner.scanViaSaf(uri).sortedBy { it.sizeBytes } }
                 _state.value = _state.value.copy(
                     djiFiles = files,
                     // A fresh list starts with no statuses (and the Upload button rather than Retry).
@@ -339,7 +341,7 @@ class HomeViewModel(
         cleanupJob = viewModelScope.launch {
             setCleanup { it.copy(progress = "Listing ${it.folderName ?: "folder"}…", error = null) }
             try {
-                cleanupAll = scanner.listTree(folder, recursive)
+                cleanupAll = com.gpic.android.util.Perf.log("cleanup scan") { scanner.listTree(folder, recursive) }
                 setCleanup { it.copy(inFolder = cleanupAll.size) }
                 applyAgeFilter()
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -363,13 +365,22 @@ class HomeViewModel(
         val cutoff = _state.value.cleanup.rule.cutoffMs()
         val all = cleanupAll
         val toRead = all.filter { it.isPhoto && needsExif(it.lastModified, cutoff) && exifCache[it.key] == null }
-        if (toRead.isNotEmpty()) withContext(Dispatchers.IO) {
-            for ((i, f) in toRead.withIndex()) {
-                if (i % 25 == 0) setCleanup { it.copy(progress = "Reading photo dates ${i + 1} of ${toRead.size}…") }
-                kotlinx.coroutines.yield() // cancellable when the age changes mid-read
-                exifCache[f.key] = scanner.exifTakenMs(f) ?: -1L
+        if (toRead.isNotEmpty()) com.gpic.android.util.Perf.log("cleanup EXIF dates for ${toRead.size}") { withContext(Dispatchers.IO) {
+            // A few readers at once: each read is mostly waiting on storage/IPC.
+            val done = java.util.concurrent.atomic.AtomicInteger()
+            coroutineScope {
+                toRead.chunked((toRead.size + EXIF_READERS - 1) / EXIF_READERS).forEach { part ->
+                    launch {
+                        for (f in part) {
+                            val n = done.incrementAndGet()
+                            if (n % 25 == 1) setCleanup { it.copy(progress = "Reading photo dates $n of ${toRead.size}…") }
+                            kotlinx.coroutines.yield() // cancellable when the age changes mid-read
+                            exifCache[f.key] = scanner.exifTakenMs(f) ?: -1L
+                        }
+                    }
+                }
             }
-        }
+        } }
         val old = all.mapNotNull { f ->
             val taken = takenMs(f.lastModified, exifCache[f.key]?.takeIf { it > 0 })
             if (isOlderThan(taken, cutoff)) f.copy(takenMs = taken) else null
@@ -650,3 +661,5 @@ class HomeViewModel(
         private const val FREE_SPACE_MARGIN = 200L * 1024 * 1024
     }
 }
+
+private const val EXIF_READERS = 4

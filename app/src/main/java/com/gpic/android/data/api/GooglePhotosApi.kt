@@ -45,6 +45,16 @@ class GooglePhotosApi(
     fun cancel() { cancelled = true }
 
     companion object {
+        /** Shared by every request in the app: Google's limit is per account, not per connection. */
+        @Volatile private var quotaPauseUntil = 0L
+
+        @Synchronized private fun pauseForQuota(ms: Long) {
+            quotaPauseUntil = maxOf(quotaPauseUntil, System.currentTimeMillis() + ms)
+        }
+
+        private const val QUOTA_RETRIES = 6
+        private val QUOTA_WAITS_MS = longArrayOf(10_000, 20_000, 40_000, 60_000)
+
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             // Per-I/O-operation, not whole-call: a long upload is fine, a stalled one now fails
@@ -82,7 +92,10 @@ class GooglePhotosApi(
         headers.putAll(extraHeaders)
 
         var lastError: Exception? = null
-        for (attempt in 0..retryConfig.maxRetries) {
+        var attempt = 0
+        var quotaHits = 0
+        while (true) {
+            awaitQuota()
             try {
                 val req = Request.Builder()
                     .url(url)
@@ -92,29 +105,42 @@ class GooglePhotosApi(
                 val resp = client.newCall(req).execute()
                 if (resp.isSuccessful) return resp
                 val code = resp.code
+                val retryAfter = resp.header("Retry-After")?.trim()?.toLongOrNull()?.times(1000)
                 val bodyPreview = readPreview(resp)
                 resp.close()
                 if (!shouldRetry(code)) {
                     throw RuntimeException("[$endpoint] Request failed $code: $bodyPreview")
                 }
                 lastError = RuntimeException("[$endpoint] HTTP $code: $bodyPreview")
-                if (attempt < retryConfig.maxRetries) {
-                    val delay = calculateBackoff(attempt, retryConfig)
-                    Log.i("GooglePhotosApi", "Retrying [$endpoint] $url in ${delay}ms attempt ${attempt+2}")
-                    Thread.sleep(delay)
+                if (code == 429) {
+                    // Google limits these calls per minute per account. Pause every worker (not just this one) long
+                    // enough for the window to roll over, instead of failing files after a few seconds of retries.
+                    if (++quotaHits > QUOTA_RETRIES) break
+                    val wait = retryAfter ?: QUOTA_WAITS_MS[minOf(quotaHits - 1, QUOTA_WAITS_MS.lastIndex)]
+                    pauseForQuota(wait)
+                    Log.w("GooglePhotosApi", "[$endpoint] rate-limited by Google (429); all requests pause ${wait / 1000}s (hit $quotaHits)")
+                    continue
                 }
+                if (attempt >= retryConfig.maxRetries) break
+                val delay = calculateBackoff(attempt++, retryConfig)
+                Log.i("GooglePhotosApi", "Retrying [$endpoint] $url in ${delay}ms attempt ${attempt + 1}")
+                Thread.sleep(delay)
             } catch (e: Exception) {
                 lastError = e
                 if (isNonRetryable(e)) throw e
-                // Network errors / 5xx / 429 retry; 4xx already rethrown above
-                if (attempt < retryConfig.maxRetries) {
-                    val delay = calculateBackoff(attempt, retryConfig)
-                    Log.i("GooglePhotosApi", "Retrying [$endpoint] due to ${e.message} in ${delay}ms")
-                    Thread.sleep(delay)
-                }
+                // Network errors / 5xx retry; 4xx already rethrown above
+                if (attempt >= retryConfig.maxRetries) break
+                val delay = calculateBackoff(attempt++, retryConfig)
+                Log.i("GooglePhotosApi", "Retrying [$endpoint] due to ${e.message} in ${delay}ms")
+                Thread.sleep(delay)
             }
         }
-        throw RuntimeException("[$endpoint] Request failed after ${retryConfig.maxRetries+1} attempts: $lastError")
+        throw RuntimeException("[$endpoint] Request failed after ${attempt + quotaHits + 1} attempts: $lastError")
+    }
+
+    private fun awaitQuota() {
+        val wait = quotaPauseUntil - System.currentTimeMillis()
+        if (wait > 0) Thread.sleep(wait)
     }
     private fun gunzipMaybe(bytes: ByteArray): ByteArray {
         if (bytes.size < 2 || bytes[0] != 0x1f.toByte() || bytes[1] != 0x8b.toByte()) return bytes

@@ -3,6 +3,7 @@ package com.gpic.android.data.upload
 import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.util.Log
 import com.gpic.android.data.dji.DjiFile
 import java.io.File
 import java.io.FileInputStream
@@ -51,6 +52,9 @@ interface MediaSource {
 
     /** A photo that has a location, but what [open] returns has it blanked. */
     val knownStrippedGps: Boolean get() = false
+
+    /** Android won't hand over this file's original at all (see [OriginalMedia.Original.hidden]). */
+    val originalHidden: Boolean get() = false
 
     /** Capture time + GPS for the album index (photos: EXIF header only). */
     fun captureInfo(): CaptureInfo = CaptureInfo(lastModifiedMs)
@@ -114,14 +118,20 @@ class UriSource(private val context: Context, private val f: DjiFile, private va
 
     private val mimeHint = when { f.isVideo -> "video/*"; f.isPhoto -> "image/*"; else -> null }
     // Resolved once, off the main thread (first checkReadable/open); null = read the Uri as given.
-    private val original: Uri? by lazy { OriginalMedia.originalUri(context, uri, mimeHint) }
+    // A JPEG without GPS tags reads the same either way, so it skips the MediaStore lookup (and the second
+    // hash below): most WhatsApp photos, which have no EXIF at all.
+    private val resolved: OriginalMedia.Original by lazy {
+        if (plainIsWhole) OriginalMedia.Original(null) else OriginalMedia.resolve(context, uri, mimeHint)
+    }
+    private val original: Uri? get() = resolved.uri
     private val readUri: Uri get() = original ?: uri
 
     /**
-     * GPS tags in the plain read. Stripping zeroes the values but keeps the tags (measured on Android 13:
-     * GPSLatitude read back as 0/1,0/1,0/1), so tags present = the photo had a location; none = it never did.
+     * GPS in the plain read. Stripping zeroes the values but keeps the tags (measured on Android 13:
+     * GPSLatitude read back as 0/1,0/1,0/1), so: real coordinates = nothing was stripped; tags with zeros =
+     * stripped; no tags = the photo never had a location.
      */
-    private enum class Gps { PRESENT, ABSENT, UNKNOWN }
+    private enum class Gps { REAL, ZEROED, ABSENT, UNKNOWN }
 
     /**
      * Only JPEG is trusted to answer "no GPS": the framework ExifInterface may read nothing from other
@@ -130,26 +140,33 @@ class UriSource(private val context: Context, private val f: DjiFile, private va
     private val plainGps: Gps by lazy {
         if (!f.isPhoto) return@lazy Gps.UNKNOWN
         runCatching {
-            val isJpeg = context.contentResolver.openInputStream(uri)?.use { s ->
-                val head = ByteArray(3)
-                s.read(head) == 3 && head[0] == 0xFF.toByte() && head[1] == 0xD8.toByte() && head[2] == 0xFF.toByte()
-            } ?: false
-            if (!isJpeg) return@runCatching Gps.UNKNOWN
-            context.contentResolver.openInputStream(uri)?.use { s ->
-                val exif = android.media.ExifInterface(s)
-                if (exif.hasAttribute(android.media.ExifInterface.TAG_GPS_LATITUDE) || exif.hasAttribute(android.media.ExifInterface.TAG_GPS_LONGITUDE)) Gps.PRESENT
-                else Gps.ABSENT
-            } ?: Gps.UNKNOWN
-        }.getOrDefault(Gps.UNKNOWN)
+            // One bounded read: EXIF lives in the APP1 segment right after the JPEG marker, and APP1 is at most 64 KB.
+            val head = context.contentResolver.openInputStream(uri)?.use { s -> readHead(s, JPEG_HEAD_BYTES) } ?: return@runCatching Gps.UNKNOWN
+            // ExifInterface quietly reads nothing from a cut-off header, and "nothing" must not mean "no GPS".
+            if (!isJpeg(head) || !jpegMetadataComplete(head)) return@runCatching Gps.UNKNOWN
+            val exif = android.media.ExifInterface(java.io.ByteArrayInputStream(head))
+            val ll = FloatArray(2)
+            @Suppress("DEPRECATION")
+            when {
+                !exif.hasAttribute(android.media.ExifInterface.TAG_GPS_LATITUDE) && !exif.hasAttribute(android.media.ExifInterface.TAG_GPS_LONGITUDE) -> Gps.ABSENT
+                exif.getLatLong(ll) && !(ll[0] == 0f && ll[1] == 0f) -> Gps.REAL
+                else -> Gps.ZEROED
+            }
+        }.getOrDefault(Gps.UNKNOWN).also { Log.d("GPicMedia", "${f.displayName}: plain read GPS $it") }
     }
+
+    /** The plain read is the whole photo, location included (or it never had one): no original needed. */
+    private val plainIsWhole: Boolean get() = f.isPhoto && (plainGps == Gps.ABSENT || plainGps == Gps.REAL)
 
     private val readStripped: Boolean get() = OriginalMedia.mayRedactLocation(uri) && original == null
 
-    override val knownStrippedGps: Boolean get() = readStripped && plainGps == Gps.PRESENT
+    override val knownStrippedGps: Boolean get() = readStripped && plainGps == Gps.ZEROED
+
+    override val originalHidden: Boolean get() = readStripped && resolved.hidden
 
     override val mayHaveLostLocation: Boolean
         // Videos and non-JPEG photos can't be checked, so assume the worst: upload, never delete.
-        get() = readStripped && (f.isVideo || plainGps != Gps.ABSENT)
+        get() = readStripped && !plainIsWhole
 
     override val openRedacted: ((Long) -> InputStream)?
         get() = if (original != null && f.isPhoto) { offset -> openUri(uri, offset) } else null
@@ -192,7 +209,44 @@ class UriSource(private val context: Context, private val f: DjiFile, private va
 
     companion object {
         const val MTP_AUTHORITY = "com.android.mtp.documents"
+        private const val JPEG_HEAD_BYTES = 128 * 1024
     }
+}
+
+/** Up to [max] bytes from the start of [s] (fewer only at end of stream). */
+internal fun readHead(s: InputStream, max: Int): ByteArray {
+    val buf = ByteArray(max)
+    var n = 0
+    while (n < max) {
+        val r = s.read(buf, n, max - n)
+        if (r == -1) break
+        n += r
+    }
+    return if (n == max) buf else buf.copyOf(n)
+}
+
+internal fun isJpeg(b: ByteArray) =
+    b.size >= 3 && b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte() && b[2] == 0xFF.toByte()
+
+/**
+ * True when every metadata segment of the JPEG starting [b] fits in [b]: the segment walk reaches the
+ * start-of-scan marker inside the buffer. Then an EXIF read of [b] sees everything the file has.
+ */
+internal fun jpegMetadataComplete(b: ByteArray): Boolean {
+    var i = 2
+    while (i + 4 <= b.size) {
+        if (b[i] != 0xFF.toByte()) return false
+        val marker = b[i + 1].toInt() and 0xFF
+        when (marker) {
+            0xFF -> { i++; continue } // fill byte
+            0xDA -> return true // start of scan: image data follows
+            0x01, in 0xD0..0xD7 -> { i += 2; continue } // markers without a length
+        }
+        val len = ((b[i + 2].toInt() and 0xFF) shl 8) or (b[i + 3].toInt() and 0xFF)
+        if (len < 2) return false
+        i += 2 + len
+    }
+    return false
 }
 
 /** Advance [s] by exactly [n] bytes. ContentResolver streams may skip short or not at all. */

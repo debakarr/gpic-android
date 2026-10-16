@@ -1,0 +1,132 @@
+package com.gpic.android.editor
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.os.Build
+import android.provider.OpenableColumns
+import java.io.ByteArrayOutputStream
+
+data class VideoInfo(
+    val uri: Uri,
+    val name: String,
+    val sizeBytes: Long,
+    val durationMs: Long,
+    val width: Int,
+    val height: Int,
+    val rotation: Int,
+    val frameRate: Float?,
+    val mime: String?,
+    val hasAudio: Boolean,
+    val bitrate: Long?,
+    /** HDR / log transfer from the container, when the platform reports it (API 30+). */
+    val colorTransfer: Int?,
+    /** The middle frame looks flat (low contrast and saturation), like D-Log M before grading. Null = unknown. */
+    val looksFlat: Boolean?,
+) {
+    /** Display size after the container's rotation. */
+    val displayWidth: Int get() = if (rotation % 180 == 0) width else height
+    val displayHeight: Int get() = if (rotation % 180 == 0) height else width
+    val fromDji: Boolean get() = name.startsWith("DJI_", ignoreCase = true)
+}
+
+/** A sampled frame for Claude: when in the source it was taken, and a small JPEG. */
+class Frame(val timeMs: Long, val jpeg: ByteArray)
+
+object VideoProbe {
+    fun probe(context: Context, uri: Uri): VideoInfo {
+        val (name, size) = nameAndSize(context, uri)
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(context, uri)
+            fun int(key: Int) = r.extractMetadata(key)?.toIntOrNull()
+            val duration = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+                ?: throw IllegalArgumentException("Not a video Android can read")
+            val transfer = if (Build.VERSION.SDK_INT >= 30) int(MediaMetadataRetriever.METADATA_KEY_COLOR_TRANSFER) else null
+            val middle = runCatching { frameAt(r, duration * 500, 96) }.getOrNull()
+            return VideoInfo(
+                uri = uri, name = name, sizeBytes = size, durationMs = duration,
+                width = int(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH) ?: 0,
+                height = int(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT) ?: 0,
+                rotation = int(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION) ?: 0,
+                frameRate = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull(),
+                mime = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE),
+                hasAudio = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes",
+                bitrate = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull(),
+                colorTransfer = transfer,
+                looksFlat = middle?.let { looksFlat(it) },
+            )
+        } finally {
+            r.release()
+        }
+    }
+
+    /** [count] frames spread over the video (never the very first/last), longest side [maxSide] px. */
+    fun frames(context: Context, uri: Uri, durationMs: Long, count: Int, maxSide: Int = 512): List<Frame> {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(context, uri)
+            return (0 until count).mapNotNull { i ->
+                val t = durationMs * (2 * i + 1) / (2 * count)
+                val bmp = runCatching { frameAt(r, t * 1000, maxSide) }.getOrNull() ?: return@mapNotNull null
+                val out = ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                bmp.recycle()
+                Frame(t, out.toByteArray())
+            }
+        } finally {
+            r.release()
+        }
+    }
+
+    private fun frameAt(r: MediaMetadataRetriever, timeUs: Long, maxSide: Int): Bitmap? {
+        val opt = MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+        if (Build.VERSION.SDK_INT >= 27) {
+            val w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: maxSide
+            val h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: maxSide
+            val scale = maxSide.toFloat() / maxOf(w, h, 1)
+            return r.getScaledFrameAtTime(timeUs, opt, (w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1))
+        }
+        val full = r.getFrameAtTime(timeUs, opt) ?: return null
+        val scale = maxSide.toFloat() / maxOf(full.width, full.height)
+        return Bitmap.createScaledBitmap(full, (full.width * scale).toInt().coerceAtLeast(1), (full.height * scale).toInt().coerceAtLeast(1), true)
+            .also { if (it !== full) full.recycle() }
+    }
+
+    /**
+     * Log footage before grading has its tones squeezed into the middle and little colour. A rough test
+     * (it can't tell D-Log M from a foggy day), used only to suggest a LUT, never to apply one.
+     */
+    internal fun looksFlat(bmp: Bitmap): Boolean {
+        val px = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        return looksFlat(px)
+    }
+
+    internal fun looksFlat(argb: IntArray): Boolean {
+        if (argb.isEmpty()) return false
+        val luma = FloatArray(argb.size)
+        var satSum = 0f
+        for ((i, c) in argb.withIndex()) {
+            val r = (c shr 16 and 0xFF) / 255f
+            val g = (c shr 8 and 0xFF) / 255f
+            val b = (c and 0xFF) / 255f
+            luma[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b
+            val mx = maxOf(r, g, b)
+            val mn = minOf(r, g, b)
+            satSum += if (mx > 0f) (mx - mn) / mx else 0f
+        }
+        luma.sort()
+        val p2 = luma[(luma.size * 0.02f).toInt()]
+        val p98 = luma[((luma.size - 1) * 0.98f).toInt()]
+        val meanSat = satSum / argb.size
+        return p2 > 0.05f && p98 < 0.9f && (p98 - p2) < 0.75f && meanSat < 0.25f
+    }
+
+    private fun nameAndSize(context: Context, uri: Uri): Pair<String, Long> = runCatching {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst()) (c.getString(0) ?: "video") to (if (c.isNull(1)) 0L else c.getLong(1)) else null
+        }
+    }.getOrNull() ?: ((uri.lastPathSegment ?: "video") to 0L)
+}

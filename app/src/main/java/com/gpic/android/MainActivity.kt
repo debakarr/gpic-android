@@ -2,6 +2,9 @@ package com.gpic.android
 
 import com.gpic.android.ui.screens.albums.AlbumsScreen
 import com.gpic.android.ui.screens.albums.AlbumsViewModel
+import com.gpic.android.ui.screens.editor.EditorScreen
+import com.gpic.android.ui.screens.editor.EditorViewModel
+import com.gpic.android.ui.screens.home.Source
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.collectAsState
 
@@ -33,6 +36,7 @@ class MainActivity : ComponentActivity() {
                 // survives recreation (theme/locale change) instead of spawning a second uploader.
                 val homeVm = viewModel { HomeViewModel(app, app.credentialStore, app.djiScanner) }
                 val albumsVm = viewModel { AlbumsViewModel(app, app.credentialStore) }
+                val editorVm = viewModel { EditorViewModel(app, app.credentialStore) }
                 val albumState by albumsVm.state.collectAsState()
 
                 // Refresh auth when returning from Auth screen
@@ -47,6 +51,7 @@ class MainActivity : ComponentActivity() {
                             onNavigateAuth = { nav.navigate("auth") },
                             onNavigateSettings = { nav.navigate("settings") },
                             onNavigateAlbums = { nav.navigate("albums") },
+                            onNavigateEditor = { nav.navigate("editor") },
                             albumSuggestions = albumState.suggestions.size,
                         )
                     }
@@ -55,6 +60,18 @@ class MainActivity : ComponentActivity() {
                     }
                     composable("albums") {
                         AlbumsScreen(vm = albumsVm, onBack = { nav.popBackStack() })
+                    }
+                    composable("editor") {
+                        EditorScreen(
+                            vm = editorVm,
+                            onBack = { nav.popBackStack() },
+                            // The edit goes to the Phone list like a picked file; Upload sends it.
+                            onBackUp = { uri ->
+                                homeVm.selectSource(Source.DEVICE)
+                                homeVm.setDjiFileUris(listOf(uri), persist = false)
+                                nav.popBackStack("home", inclusive = false)
+                            },
+                        )
                     }
                     composable("settings") {
                         SettingsScreen(store = app.credentialStore, onBack = { nav.popBackStack() })

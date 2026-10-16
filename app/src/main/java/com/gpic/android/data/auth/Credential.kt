@@ -16,7 +16,8 @@ data class Credential(
 data class AppConfig(
     val selectedEmail: String = "",
     val credentials: List<Credential> = emptyList(),
-    val uploadThreads: Int = 3,
+    /** 0 = Auto (picked from the batch's file sizes and count). */
+    val uploadThreads: Int = 0,
     val forceUpload: Boolean = false,
     val deleteAfterUpload: Boolean = false,
     val saverMode: Boolean = false,
