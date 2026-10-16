@@ -8,7 +8,7 @@
 
 - **Package:** `com.gpic.android`
 - **App entry:** `MainActivity` → Compose NavHost (home/auth/settings)
-- **Current version:** `1.4.1 (13)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
+- **Current version:** `1.4.2 (14)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
 - **Repo:** `github.com/debakarr/gpic-android` (private), branch `main`
 
 ## Tech Stack
