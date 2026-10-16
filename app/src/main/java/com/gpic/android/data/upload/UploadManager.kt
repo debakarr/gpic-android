@@ -274,9 +274,11 @@ class UploadManager(
         fp.totalBytes = size
         // Confirmed in the library on an earlier run and unchanged since: skip without reading it. Not when
         // originals get deleted (Free up space): that needs today's exact-hash answer.
-        if (!force && !deleteAfter && !source.singlePass) {
-            checked.find(source.key, size, source.lastModifiedMs)?.let { return skipped(source, fp, it, CHECKED_BEFORE) }
+        val remembered = if (force || source.singlePass) null else checked.find(source.key, size, source.lastModifiedMs)
+        if (remembered == CheckedCache.REJECTED) {
+            return rejected(source, fp, "Google Photos didn't accept this file on an earlier run, so it isn't sent again")
         }
+        if (remembered != null && !deleteAfter) return skipped(source, fp, remembered, CHECKED_BEFORE)
         enter(UploadStatus.PREPARING, "Opening file…")
         // With the permission granted, a missing original is Android not handing it over (seen once right after
         // 40 files were copied in). Uploading the stripped read would leave a GPS-less duplicate; fail so Retry can
@@ -291,6 +293,14 @@ class UploadManager(
             progress.incFailed()
             emitProgress()
             return UploadResult(source.key, source.displayName, false, error = err)
+        }
+        // A file named like media but holding something else would become a broken item in Google Photos.
+        if (!source.singlePass) {
+            val notMedia = runCatching { source.open(0).use { MediaSniff.mismatch(source.displayName, readHead(it, MediaSniff.HEAD_BYTES)) } }.getOrNull()
+            if (notMedia != null) {
+                checked.recordRejected(source.key, size, source.lastModifiedMs)
+                return rejected(source, fp, notMedia)
+            }
         }
 
         try {
@@ -407,6 +417,10 @@ class UploadManager(
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (e: com.gpic.android.data.api.RejectedByPhotosException) {
+            cache.remove(source.key)
+            checked.recordRejected(source.key, size, source.lastModifiedMs)
+            return rejected(source, fp, "Google Photos didn't accept this file (it doesn't take WhatsApp stickers, for example). It won't be sent again")
         } catch (e: Exception) {
             if (cancelled) return cancelledResult(source, fp)
             fp.status = UploadStatus.ERROR
@@ -417,6 +431,16 @@ class UploadManager(
             Log.e("UploadManager", "Upload failed ${source.displayName} at $phase: ${e.message}", e)
             return UploadResult(source.key, source.displayName, false, error = e.message ?: "Failed")
         }
+    }
+
+    /** Final, not an error: Retry would only be refused again. The original is never deleted. */
+    private fun rejected(source: MediaSource, fp: FileProgress, why: String): UploadResult {
+        fp.status = UploadStatus.REJECTED
+        fp.message = why
+        progress.incRejected()
+        emitProgress()
+        Log.i("UploadManager", "${source.displayName}: not accepted by Google Photos")
+        return UploadResult(source.key, source.displayName, false, error = why)
     }
 
     private fun cancelledResult(source: MediaSource, fp: FileProgress): UploadResult {

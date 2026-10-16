@@ -42,7 +42,8 @@ class DjiScanner(private val context: Context) {
     }
 
     /** Every supported file in the folder and its subfolders, smallest first (quick wins, no GB-video head-of-line blocking). */
-    suspend fun scanViaSaf(treeUri: Uri): List<DjiFile> = listTree(treeUri, recursive = true).sortedBy { it.sizeBytes }
+    suspend fun scanViaSaf(treeUri: Uri, skipped: MutableList<String>? = null): List<DjiFile> =
+        listTree(treeUri, recursive = true, skipped).sortedBy { it.sizeBytes }
 
     /**
      * Build DjiFile list from user-picked individual files (OpenMultipleDocuments).
@@ -77,9 +78,11 @@ class DjiScanner(private val context: Context) {
 
     /**
      * Every supported file under [treeUri], one DocumentsContract query per folder (DocumentFile costs
-     * several queries per file). Hidden entries (".thumbnails", ".trashed-…") are skipped.
+     * several queries per file). Hidden entries (".thumbnails", ".trashed-…") are skipped, and so are sticker
+     * subfolders ("WhatsApp Stickers"): Google Photos refuses those .webp files. Their names go to [skipped].
+     * A sticker folder picked as the root itself is scanned: that's an explicit choice.
      */
-    suspend fun listTree(treeUri: Uri, recursive: Boolean): List<DjiFile> = withContext(Dispatchers.IO) {
+    suspend fun listTree(treeUri: Uri, recursive: Boolean, skipped: MutableList<String>? = null): List<DjiFile> = withContext(Dispatchers.IO) {
         val out = mutableListOf<DjiFile>()
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
@@ -95,7 +98,8 @@ class DjiScanner(private val context: Context) {
                     val name = c.getString(1) ?: continue
                     if (name.startsWith(".")) continue
                     if (c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR) {
-                        if (recursive) dirs.addLast(id)
+                        if (isStickerFolder(name)) skipped?.add(name)
+                        else if (recursive) dirs.addLast(id)
                         continue
                     }
                     if (name.substringAfterLast('.', "").lowercase() !in DjiFile.supported) continue
@@ -110,6 +114,8 @@ class DjiScanner(private val context: Context) {
         }
         out
     }
+
+    private fun isStickerFolder(name: String) = name.contains("sticker", ignoreCase = true)
 
     /** A photo's EXIF capture time (header only), or null for videos / no date / unreadable. */
     fun exifTakenMs(f: DjiFile): Long? {

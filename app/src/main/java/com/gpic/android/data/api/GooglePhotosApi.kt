@@ -431,7 +431,8 @@ class GooglePhotosApi(
                 throw RuntimeException("[commitUpload] bad reply (" + bytes.size + "B): " + previewBytes(bytes))
             }
             val mediaKey = parsed.field1.field3.mediaKey
-            if (mediaKey.isNullOrEmpty()) throw RuntimeException("Upload rejected: no media key")
+            // The bytes arrived but Photos won't make an item of them (seen with WhatsApp sticker .webp files).
+            if (mediaKey.isNullOrEmpty()) throw RejectedByPhotosException()
             return mediaKey
         }
     }
@@ -530,3 +531,6 @@ internal fun nextByteFromRange(range: String?): Long {
     val last = range?.substringAfter('=', "")?.substringAfter('-', "")?.trim()?.toLongOrNull()
     return if (last == null) 0L else last + 1
 }
+
+/** Google Photos took the upload but returned no media key: it won't add this file to the library. */
+class RejectedByPhotosException : RuntimeException("Upload rejected: no media key")

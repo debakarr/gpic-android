@@ -174,6 +174,14 @@ open with `setRequireOriginal` (SecurityException), so the zeroed/real check is 
 `CheckedCache` skips files confirmed on an earlier run (same key, size, mtime; ≤ 30 days) — never when deleting
 originals (Free up space needs today's exact-hash answer) and never for reads that may have lost GPS.
 
+### Not media / refused by Google
+Folder scans skip subfolders named like "WhatsApp Stickers" (`DjiScanner.listTree`, shown as `scanNote`). Before
+hashing, `MediaSniff` checks the first 16 bytes against the extension for jpg/png/gif/webp/bmp/heic/avif/mp4/mov/3gp
+(RAW and rarer video containers aren't checked); a mismatch is `UploadStatus.REJECTED`, not sent. Google itself
+accepted random bytes named .webp (so the sniff matters) and a 1×1 animated WebP; a user saw real WhatsApp stickers
+refused at commit (no media key) → `RejectedByPhotosException` → REJECTED too. REJECTED is final (not in Retry, never
+deleted) and remembered in `CheckedCache` (`REJECTED` marker) so re-runs don't resend it.
+
 ### Video editor (film icon on Home)
 `EditPlan` is the single model: the controls edit it and Claude returns one (strict JSON schema, `explanation` +
 every field; `sanitized()` clamps it). Export = Media3 `Composition`: one clipped `EditedMediaItem` per kept segment

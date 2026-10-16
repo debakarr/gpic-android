@@ -4,7 +4,9 @@ package com.gpic.android.data.progress
  * Port of gphotos/progress.py FileProgress
  */
 enum class UploadStatus {
-    PENDING, PREPARING, HASHING, CHECKING, UPLOADING, RESUMING, COMMITTING, COMPLETED, ERROR, SKIPPED, QUEUED, CANCELLED, DOWNLOADING
+    PENDING, PREPARING, HASHING, CHECKING, UPLOADING, RESUMING, COMMITTING, COMPLETED, ERROR, SKIPPED, QUEUED, CANCELLED, DOWNLOADING,
+    /** Sent, but Google Photos refused to add it (e.g. WhatsApp stickers). Final: Retry doesn't include it. */
+    REJECTED
 }
 
 data class FileProgress(
@@ -33,7 +35,7 @@ data class FileProgress(
     /** Bytes to count toward batch progress: finished files (incl. skipped/failed) count in full. */
     val settledBytes: Long
         get() = when (status) {
-            UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.ERROR, UploadStatus.CANCELLED -> totalBytes
+            UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.ERROR, UploadStatus.CANCELLED, UploadStatus.REJECTED -> totalBytes
             else -> bytesUploaded.coerceAtMost(totalBytes)
         }
 
@@ -104,7 +106,7 @@ data class FileProgress(
             // A finished upload's message only matters when it adds something (deleted, kept, stale copy).
             UploadStatus.COMPLETED -> if (message.isEmpty() || message == "Uploaded") statusLabel else message
             // "Already in library", "Uploaded before from this phone", … already say it; don't prefix "Already backed up".
-            UploadStatus.SKIPPED -> message.ifEmpty { statusLabel }
+            UploadStatus.SKIPPED, UploadStatus.REJECTED -> message.ifEmpty { statusLabel }
             else -> if (message.isNotEmpty()) "$statusLabel • $message" else statusLabel
         }
 
@@ -120,6 +122,7 @@ data class FileProgress(
             UploadStatus.COMMITTING -> "Finalizing"
             UploadStatus.COMPLETED -> "Done"
             UploadStatus.SKIPPED -> "Already backed up"
+            UploadStatus.REJECTED -> "Not accepted by Google Photos"
             UploadStatus.ERROR -> "Failed"
             UploadStatus.CANCELLED -> "Cancelled"
             UploadStatus.DOWNLOADING -> "Downloading from camera"
@@ -145,8 +148,11 @@ class ProgressTracker {
         private set
     @Volatile var deleted: Int = 0
         private set
+    /** Google Photos refused the file (see [UploadStatus.REJECTED]). */
+    @Volatile var rejected: Int = 0
+        private set
 
-    val doneCount: Int get() = completed + failed + skipped
+    val doneCount: Int get() = completed + failed + skipped + rejected
 
     val overallPercentage: Float
         get() = if (totalFiles == 0) 0f else (doneCount.toFloat() / totalFiles.toFloat()) * 100f
@@ -173,10 +179,11 @@ class ProgressTracker {
     @Synchronized fun incSkipped() { skipped++ }
     @Synchronized fun incRelocated() { relocated++ }
     @Synchronized fun incDeleted() { deleted++ }
+    @Synchronized fun incRejected() { rejected++ }
 
     @Synchronized
     fun reset() {
         _files.clear()
-        totalFiles = 0; totalBytes = 0; completed = 0; failed = 0; skipped = 0; relocated = 0; deleted = 0
+        totalFiles = 0; totalBytes = 0; completed = 0; failed = 0; skipped = 0; relocated = 0; deleted = 0; rejected = 0
     }
 }

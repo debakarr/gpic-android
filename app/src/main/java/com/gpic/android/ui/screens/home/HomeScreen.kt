@@ -159,7 +159,7 @@ fun HomeScreen(
                     // While uploading the subtitle is a live status line; tapping it jumps back to the progress card.
                     Column(if (busy) Modifier.clickable(onClick = toTop) else Modifier) {
                         Text("GPic")
-                        val done = state.completed + state.failed + state.skipped
+                        val done = state.completed + state.failed + state.skipped + state.rejected
                         Text(
                             if (busy) "${if (state.cancelling) "Cancelling" else "Uploading"} $done of ${state.totalFiles}" +
                                 (if (state.failed > 0) " • ${state.failed} failed" else "")
@@ -241,7 +241,7 @@ fun HomeScreen(
             }
 
             // 1b. Batch progress, near the top so it stays one tap (or the go-to-top button) away
-            if (busy || state.completed > 0 || state.failed > 0 || state.skipped > 0) {
+            if (busy || state.completed > 0 || state.failed > 0 || state.skipped > 0 || state.rejected > 0) {
                 item(key = "progress") {
                     ProgressSection(
                         state = state,
@@ -332,7 +332,7 @@ fun HomeScreen(
                 item(key = "stats") {
                     SystemStatsCard(
                         stats = state.systemStats,
-                        doneCount = state.completed + state.failed + state.skipped,
+                        doneCount = state.completed + state.failed + state.skipped + state.rejected,
                         totalFiles = state.totalFiles,
                         isUploading = busy,
                         expanded = statsExpanded,
@@ -575,6 +575,7 @@ private fun SourceSection(
         if (state.djiFiles.isNotEmpty()) {
             TextButton(onClick = onClear, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text("Clear selection") }
         }
+        state.scanNote?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         if (state.scanError != null) {
             Text("Scan error: ${state.scanError}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
         }
@@ -587,7 +588,7 @@ private enum class ListFilter(val label: String) {
 
     fun matches(status: UploadStatus?): Boolean = when (this) {
         ALL -> true
-        ACTIVE -> status !in setOf(UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.ERROR, UploadStatus.CANCELLED)
+        ACTIVE -> status !in setOf(UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.REJECTED, UploadStatus.ERROR, UploadStatus.CANCELLED)
         FAILED -> status == UploadStatus.ERROR || status == UploadStatus.CANCELLED
     }
 }
@@ -644,7 +645,7 @@ private fun SettingsSummary(config: AppConfig, deletes: Boolean, enabled: Boolea
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ProgressSection(state: HomeUiState, onCancel: () -> Unit, onCopyErrors: () -> Unit) {
-    val done = state.completed + state.failed + state.skipped
+    val done = state.completed + state.failed + state.skipped + state.rejected
     // Byte-weighted: with smallest-first ordering a file count races ahead of the real transfer.
     val sentBytes = state.progressMap.values.sumOf { it.settledBytes }
     val totalBytes = state.progressMap.values.sumOf { it.totalBytes }.takeIf { it > 0 } ?: state.filesBytes
@@ -672,6 +673,7 @@ private fun ProgressSection(state: HomeUiState, onCancel: () -> Unit, onCopyErro
                 if (state.skipped > 0) CountChip(Icons.Default.Verified, "${state.skipped} already there", MaterialTheme.colorScheme.secondary)
                 if (state.relocated > 0) CountChip(Icons.Default.LocationOn, "${state.relocated} re-uploaded with location", MaterialTheme.colorScheme.tertiary)
                 if (state.deleted > 0) CountChip(Icons.Default.DeleteSweep, "${state.deleted} deleted from phone", MaterialTheme.colorScheme.secondary)
+                if (state.rejected > 0) CountChip(Icons.Default.Block, "${state.rejected} not accepted by Google Photos", MaterialTheme.colorScheme.onSurfaceVariant)
                 if (state.failed > 0) CountChip(Icons.Default.Error, "${state.failed} failed", MaterialTheme.colorScheme.error)
             }
             if (state.uploadRunning) {
@@ -715,7 +717,7 @@ private fun FileRow(name: String, size: Long, prog: com.gpic.android.data.progre
                         prog.status == UploadStatus.COMPLETED -> Icons.Default.CheckCircle
                         prog.status == UploadStatus.SKIPPED -> Icons.Default.Verified
                         prog.status == UploadStatus.ERROR -> Icons.Default.Error
-                        prog.status == UploadStatus.CANCELLED -> Icons.Default.Block
+                        prog.status == UploadStatus.CANCELLED || prog.status == UploadStatus.REJECTED -> Icons.Default.Block
                         prog.status == UploadStatus.UPLOADING || prog.status == UploadStatus.RESUMING -> Icons.Default.CloudUpload
                         else -> Icons.Default.HourglassTop
                     },

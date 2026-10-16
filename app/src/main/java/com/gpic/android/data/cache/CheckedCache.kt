@@ -5,6 +5,8 @@ import org.json.JSONObject
 import java.io.File
 
 /**
+ * Also files Google Photos refused ([REJECTED]), so a re-run doesn't send them again.
+ *
  * Files Google Photos has confirmed it has (uploaded now, or an exact hash match), keyed by the list key
  * (Uri / path) and remembered with their size and modified time. A re-run of the same folder (a WhatsApp
  * folder checked every week) skips those without reading or asking again. An entry only counts while the
@@ -24,6 +26,9 @@ class CheckedCache(context: Context) {
         if (modified <= 0 || e.size != size || e.modified != modified || now - e.checkedAt > MAX_AGE_MS) return null
         return e.mediaKey
     }
+
+    /** Google Photos refused this exact file before; [find] then returns [REJECTED]. */
+    fun recordRejected(key: String, size: Long, modified: Long) = record(key, size, modified, REJECTED)
 
     @Synchronized
     fun record(key: String, size: Long, modified: Long, mediaKey: String) {
@@ -59,5 +64,7 @@ class CheckedCache(context: Context) {
 
     companion object {
         const val MAX_AGE_MS = 30L * 24 * 60 * 60 * 1000
+        /** Stored in place of a media key for files Google Photos refused. */
+        const val REJECTED = "!rejected"
     }
 }

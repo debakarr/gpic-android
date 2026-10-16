@@ -15,7 +15,7 @@ Android app that uploads photos and videos to Google Photos — from a DJI Actio
 - **Free up space**: back up a folder's photos and videos older than N days / weeks / months / years, then delete them from the phone (only once Google Photos has them)
 - File-type filter (Photos / RAW / Videos) for every source
 - **Album suggestions**: groups the photos GPic backed up by when they were taken, on the phone, and creates the album in Google Photos when you tap Create (one at a time, or tick several and create them all)
-- Fast re-runs over big folders (a WhatsApp folder with thousands of images): one query per folder to scan, up to 8 "already backed up?" checks at once, and files confirmed on an earlier run are skipped without asking Google again
+- Fast re-runs over big folders (a WhatsApp folder with thousands of images): one query per folder to scan, up to 8 "already backed up?" checks at once, and files confirmed on an earlier run are skipped without asking Google again; sticker folders are left out and files that aren't really media are never sent
 - **Video editor**: trim (or keep several parts), speed, colour LUT (DJI D-Log M → Rec.709 for Osmo Action 4 clips, or any `.cube`), brightness / contrast / saturation, camera-sound volume, background music, crop to 16:9 / 9:16 / 1:1, resize, rotate; exports H.264 to `Movies/GPic` on the phone. Optional **Ask Claude**: describe the edit and Claude sets the controls, using your own Anthropic API key
 
 ## Privacy & Data
@@ -143,6 +143,7 @@ Film icon at the top of the home screen. Choose a video, then:
 | Finalizing | Server is committing the file to the library |
 | Done | Uploaded and committed |
 | Already backed up | Hash matched, skipped (or confirmed on an earlier run and unchanged since) |
+| Not accepted by Google Photos | Google refused the file (WhatsApp stickers), or it isn't really a photo/video (contents don't match the extension). Not retried or sent again |
 | Failed | Copy icon on the row copies the full error for debugging |
 
 ## How uploading works

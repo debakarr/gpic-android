@@ -70,6 +70,10 @@ data class HomeUiState(
     val completed: Int = 0,
     val failed: Int = 0,
     val skipped: Int = 0,
+    /** Refused by Google Photos (stickers and the like). */
+    val rejected: Int = 0,
+    /** Subfolders the last folder scan left out on purpose (sticker folders). */
+    val scanNote: String? = null,
     val totalFiles: Int = 0,
     val totalBytes: Long = 0L,
     val systemStats: LiveStats? = null,
@@ -143,7 +147,7 @@ class HomeViewModel(
                         if (listed != null && !st.uploadRunning && st.source == Source.CAMERA) st.copy(
                             camera = cs, djiFiles = listed, djiSource = "camera",
                             totalFiles = listed.size, totalBytes = listed.sumOf { it.sizeBytes },
-                            progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0,
+                            progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, rejected = 0,
                         ) else st.copy(camera = cs)
                     }
                 }
@@ -214,13 +218,13 @@ class HomeViewModel(
                 .apply()
         }
         viewModelScope.launch {
-            _state.value = _state.value.copy(isScanning = true, scanError = null, djiSource = "files", djiUri = null)
+            _state.value = _state.value.copy(isScanning = true, scanError = null, djiSource = "files", djiUri = null, scanNote = null)
             try {
                 // filesFromUris already returns smallest-first sorted
                 val files = com.gpic.android.util.Perf.log("pick ${uris.size} files") { scanner.filesFromUris(uris) }
                 _state.value = _state.value.copy(
                     djiFiles = files,
-                    progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null,
+                    progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null,
                     totalFiles = files.size,
                     totalBytes = files.sumOf { it.sizeBytes },
                     isScanning = false,
@@ -236,22 +240,26 @@ class HomeViewModel(
         context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
             .remove("last_dji_uri").remove("last_dji_files").apply()
         // Also the last run's counters, or the progress card keeps showing "601 / 0".
-        _state.value = _state.value.copy(djiUri = null, djiSource = "none", djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap(),
-            completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null)
+        _state.value = _state.value.copy(djiUri = null, djiSource = "none", djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap(), scanNote = null,
+            completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null)
     }
 
     fun scanDji(uri: Uri) {
         viewModelScope.launch {
             _state.value = _state.value.copy(isScanning = true, scanError = null)
             try {
-                val files = com.gpic.android.util.Perf.log("folder scan") { scanner.scanViaSaf(uri).sortedBy { it.sizeBytes } }
+                val left = mutableListOf<String>()
+                val files = com.gpic.android.util.Perf.log("folder scan") { scanner.scanViaSaf(uri, left).sortedBy { it.sizeBytes } }
                 _state.value = _state.value.copy(
                     djiFiles = files,
                     // A fresh list starts with no statuses (and the Upload button rather than Retry).
-                    progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null,
+                    progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null,
                     totalFiles = files.size,
                     totalBytes = files.sumOf { it.sizeBytes },
-                    isScanning = false
+                    isScanning = false,
+                    scanNote = left.takeIf { it.isNotEmpty() }?.let { names ->
+                        "Left out ${names.distinct().joinToString { "“$it”" }}: Google Photos doesn't accept stickers."
+                    },
                 )
             } catch (e: Exception) {
                 _state.value = _state.value.copy(isScanning = false, scanError = e.message)
@@ -269,7 +277,7 @@ class HomeViewModel(
         cleanupJob?.cancel()
         _state.update {
             it.copy(source = source, djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap(),
-                completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null, djiSource = "none",
+                completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null, djiSource = "none",
                 isScanning = false, scanError = null, cleanup = it.cleanup.copy(progress = null, error = null))
         }
         when (source) {
@@ -290,7 +298,7 @@ class HomeViewModel(
         val now = _state.value.typeFilter.let { if (kind in it) it - kind else it + kind }
         if (now.isEmpty()) return
         prefs.edit().putStringSet("type_filter", now.mapTo(HashSet()) { it.name }).apply()
-        _state.update { it.copy(typeFilter = now, progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null) }
+        _state.update { it.copy(typeFilter = now, progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null) }
     }
 
     // ---- free up space ---------------------------------------------------------------------------
@@ -400,7 +408,7 @@ class HomeViewModel(
 
     private fun setList(files: List<DjiFile>) = _state.update {
         it.copy(djiFiles = files, totalFiles = files.size, totalBytes = files.sumOf { f -> f.sizeBytes }, djiSource = "cleanup",
-            progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null)
+            progressMap = emptyMap(), completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null)
     }
 
     /** After a free-up-space run: drop deleted files so the list (and a retry) only has what's left. */
@@ -440,7 +448,7 @@ class HomeViewModel(
             batchCancelled = false
             _state.value = _state.value.copy(uploadRunning = true, cancelling = false, wasCancelled = false, progressMap = emptyMap(),
                 totalFiles = files.size, totalBytes = files.sumOf { it.sizeBytes },
-                completed = 0, failed = 0, skipped = 0, relocated = 0, deleted = 0, notice = null)
+                completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null)
             UploadService.start(context)
             try {
                 when {
@@ -491,6 +499,7 @@ class HomeViewModel(
                     completed = tracker.completed,
                     failed = tracker.failed,
                     skipped = tracker.skipped,
+                    rejected = tracker.rejected,
                     relocated = tracker.relocated,
                     deleted = tracker.deleted,
                 )
@@ -563,7 +572,8 @@ class HomeViewModel(
         notice(null)
         val result = runUploads(staged, cfg, cred, deleteAfter = false)
         // Free phone storage for everything that made it; keep failures for a retry.
-        val done = staged.filter { result[it.key]?.status in setOf(UploadStatus.COMPLETED, UploadStatus.SKIPPED) }
+        // Refused files would only be refused again, so their downloads go too.
+        val done = staged.filter { result[it.key]?.status in setOf(UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.REJECTED) }
         stager(link).clean(done)
         val left = _state.value.djiFiles.filter { f -> done.none { it.key == f.key } }
         _state.update { it.copy(djiFiles = left, totalBytes = left.sumOf { f -> f.sizeBytes }) }
