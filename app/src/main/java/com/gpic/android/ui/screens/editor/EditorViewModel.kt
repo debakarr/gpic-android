@@ -31,6 +31,7 @@ import com.gpic.android.editor.ProjectStore
 import com.gpic.android.editor.ProjectSummary
 import com.gpic.android.editor.Segment
 import com.gpic.android.editor.TextItem
+import com.gpic.android.editor.Transition
 import com.gpic.android.editor.Timeline
 import com.gpic.android.editor.VideoExporter
 import com.gpic.android.editor.VideoInfo
@@ -49,6 +50,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
+/** A suggested cover frame. */
+data class CoverPick(val clip: Int, val timeMs: Long)
+
 /** What's selected on the timeline. */
 sealed interface Selection {
     data object None : Selection
@@ -58,7 +62,7 @@ sealed interface Selection {
 }
 
 /** The panel open above the toolbar. */
-enum class Panel { SPEED, VOLUME, FILTERS, ADJUST, TRANSITION, MOTION, TEXT, MUSIC_LIBRARY, MUSIC, CANVAS, QUICK_EDIT, CLAUDE, EXPORT }
+enum class Panel { SPEED, VOLUME, FILTERS, ADJUST, TRANSITION, MOTION, TEXT, MUSIC_LIBRARY, MUSIC, CANVAS, QUICK_EDIT, CLAUDE, EXPORT, CARDS }
 
 data class EditorUiState(
     val projects: List<ProjectSummary> = emptyList(),
@@ -90,6 +94,11 @@ data class EditorUiState(
     val targetSec: Int = 30,
     val autoProgress: String? = null,
     val autoNote: String? = null,
+    val arrange: com.gpic.android.editor.Arrange = com.gpic.android.editor.Arrange.STORY,
+    /** Smart edit adds intro/end title cards. */
+    val addCards: Boolean = false,
+    /** Suggested cover frames (clip, time), best first. */
+    val covers: List<CoverPick> = emptyList(),
     // Music
     val musicQuery: String = "",
     val musicResults: List<OpenTrack> = emptyList(),
@@ -708,49 +717,258 @@ class EditorViewModel(private val context: Context, private val store: Credentia
      * LightCut-style one tap: score every clip for motion and colour on the phone, keep the liveliest moments
      * for the chosen length and style (cut on the music's beat when it has one), and apply the style.
      */
+    fun setArrange(a: com.gpic.android.editor.Arrange) = _state.update { it.copy(arrange = a) }
+    fun setAddCards(on: Boolean) = _state.update { it.copy(addCards = on) }
+
+    /** Generated intro/end cards are photo clips GPic made; they're not footage to pick shots from. */
+    private fun isCard(v: VideoInfo) = v.name.startsWith(CARD_PREFIX)
+
+    /** Measures every clip (once per session; from the edit copy when there is one), reporting progress. */
+    private suspend fun analyzeAll(label: String): List<com.gpic.android.editor.ClipAnalysis> = withContext(Dispatchers.IO) {
+        val clips = _state.value.clips
+        clips.withIndex().filter { !isCard(it.value) }.map { (i, v) ->
+            com.gpic.android.editor.VideoAnalyzer.analyze(context, i, v) { f ->
+                val pct = ((i + f) * 100 / clips.size).toInt()
+                _state.update { it.copy(autoProgress = "$label $pct%") }
+            }
+        }
+    }
+
+    /**
+     * LightCut-style one tap, on the phone: split every clip into shots, score them (sharpness, exposure, colour,
+     * action, faces; shaky/blurry/dark ones last), skip near-duplicates, and fill beat-length slots with the best
+     * windows, slow motion for high-frame-rate shots and transitions that follow the camera's motion.
+     */
     fun quickEdit() {
         val st = _state.value
         if (st.clips.isEmpty() || autoJob?.isActive == true) return
         autoJob = viewModelScope.launch {
-            _state.update { it.copy(autoProgress = "Finding the best moments…", autoNote = null) }
-            val scores = withContext(Dispatchers.IO) {
-                st.clips.mapIndexed { i, v ->
-                    if (v.isImage) return@mapIndexed ClipScores(VideoProbe.IMAGE_DEFAULT_MS, VideoProbe.IMAGE_DEFAULT_MS, FloatArray(1) { 0.6f })
-                    runCatching {
-                        VideoProbe.motionScores(context, v.editUri, v.durationMs) { done, total ->
-                            val pct = ((i + done.toFloat() / total) * 100 / st.clips.size).toInt()
-                            _state.update { it.copy(autoProgress = "Finding the best moments… $pct%") }
-                        }
-                    }.getOrElse { ClipScores(v.durationMs, maxOf(1000L, v.durationMs), FloatArray(1) { 0.5f }) }
-                }
+            _state.update { it.copy(autoProgress = "Finding shots…", autoNote = null) }
+            val analyses = runCatching { analyzeAll("Finding shots…") }.getOrElse { e ->
+                Log.w(TAG, "analysis failed", e)
+                _state.update { it.copy(autoProgress = null, autoNote = "Couldn't read the clips: ${e.message}") }
+                return@launch
             }
+            updateCovers(analyses)
             val music = st.plan.music
             val cut = AutoEdit.beatCutMs(st.style, music?.bpm ?: 0f)
-            val parts = AutoEdit.pick(scores, st.style, st.targetSec * 1000L, cut)
-            if (parts.isEmpty()) {
-                _state.update { it.copy(autoProgress = null, autoNote = "These clips are too short for a Quick edit.") }
+            val result = com.gpic.android.editor.SmartEdit.pick(analyses, st.targetSec * 1000L, cut, st.arrange, st.style)
+            if (result.parts.isEmpty()) {
+                _state.update { it.copy(autoProgress = null, autoNote = "These clips are too short for a smart edit.") }
                 return@launch
             }
             _state.update { it.copy(autoProgress = null) }
             commit { p ->
-                var plan = AutoEdit.plan(p, parts, st.style)
+                var plan = AutoEdit.plan(p, result.parts, st.style)
+                // Keep the shots' own transitions (they follow the camera) and slow motion; still shots get the style's move.
+                plan = plan.copy(segments = result.parts.mapIndexed { i, s ->
+                    plan.segments[i].copy(transition = s.transition, speed = s.speed, motion = if (s.transition in setOf(Transition.SLIDE_LEFT, Transition.SLIDE_RIGHT, Transition.SLIDE_UP, Transition.SLIDE_DOWN)) com.gpic.android.editor.Motion.NONE else st.style.motion)
+                })
                 val m = plan.music
                 if (m != null && m.beatsMs.size > 4) {
                     plan = Timeline.snapToBeats(plan, st.durations, Beats.markers(m.beatsMs, Beats.Pace.FAST, m.startMs, plan.outputMs(st.durations) + 60_000))
                 }
                 plan
             }
+            if (st.addCards) addCards(intro = true, outro = true, oneStep = false)
             val cur = _state.value
             val out = cur.outputMs / 1000
+            val found = buildList {
+                if (result.shaky > 0) add("${result.shaky} shaky")
+                if (result.blurry > 0) add("${result.blurry} blurry")
+                if (result.duplicates > 0) add("${result.duplicates} near-duplicate")
+            }
             _state.update {
-                it.copy(selection = Selection.None, autoNote = "${cur.style.label} edit: ${plural(cur.parts.size, "moment")} from ${plural(cur.clips.size, "clip")}, " +
-                    "${out / 60}:${"%02d".format(out % 60)} long" + when {
+                it.copy(selection = Selection.None, autoNote = "${cur.style.label}: ${plural(result.shots, "shot")} found" +
+                    (if (found.isNotEmpty()) " (${found.joinToString()})" else "") + ", used ${result.used}" +
+                    (if (result.slowMo > 0) ", ${result.slowMo} in slow motion" else "") + ". ${out / 60}:${"%02d".format(out % 60)} long" + when {
                         music == null -> ". Add music under Audio, then run it again to cut on the beat."
                         music.beatsMs.isEmpty() -> "."
                         else -> ", cut on the beat (${music.bpm.toInt()} BPM)."
                     })
             }
         }
+    }
+
+    // ---- generated frames: covers and cards ------------------------------------------------------------------
+
+    /** Best-looking frames (sharp, well exposed, colourful, faces), one per near-duplicate group. */
+    private fun updateCovers(analyses: List<com.gpic.android.editor.ClipAnalysis>) {
+        val picks = analyses.flatMap { a ->
+            val ref = a.frames.map { it.sharpness }.sorted().let { if (it.isEmpty()) 1f else it[(it.size * 0.9).toInt().coerceAtMost(it.size - 1)] }.coerceAtLeast(1e-6f)
+            a.frames.map { f ->
+                val score = 0.4f * minOf(1f, f.sharpness / ref) + 0.25f * (1f - minOf(1f, kotlin.math.abs(f.luma - 0.5f) * 2.2f)) +
+                    0.2f * f.colorful + (if (f.faces > 0) 0.25f + minOf(0.2f, f.faceSize) else 0f) - 0.3f * minOf(1f, kotlin.math.hypot(f.dx, f.dy) * 10)
+                Triple(a.clip, f, score)
+            }
+        }.sortedByDescending { it.third }
+        val chosen = mutableListOf<Triple<Int, com.gpic.android.editor.FrameStat, Float>>()
+        for (p in picks) {
+            if (chosen.size >= 6) break
+            if (chosen.none { c -> com.gpic.android.editor.SmartEdit.cosine(c.second.embed, p.second.embed) > 0.97f }) chosen += p
+        }
+        _state.update { it.copy(covers = chosen.map { (c, f, _) -> CoverPick(c, f.tMs) }) }
+    }
+
+    /** Finds cover suggestions (runs the shot analysis if Smart edit hasn't yet). */
+    fun findCovers() {
+        if (autoJob?.isActive == true || _state.value.clips.isEmpty()) return
+        autoJob = viewModelScope.launch {
+            val analyses = runCatching { analyzeAll("Looking for the best frames…") }.getOrNull()
+            _state.update { it.copy(autoProgress = null) }
+            if (analyses != null) updateCovers(analyses)
+        }
+    }
+
+    suspend fun coverThumb(p: CoverPick): Bitmap? = withContext(Dispatchers.IO) {
+        _state.value.clips.getOrNull(p.clip)?.let { VideoProbe.thumbnail(context, it, p.timeMs, 240) }
+    }
+
+    /** Saves [p] at the original's full resolution to Pictures/GPic and makes it the project's cover. */
+    fun saveCover(p: CoverPick) {
+        val clip = _state.value.clips.getOrNull(p.clip) ?: return
+        val id = _state.value.projectId ?: return
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) {
+                runCatching {
+                    val bmp = if (clip.isImage) VideoProbe.thumbnail(context, clip.copy(proxy = null), 0, 4096)
+                    else android.media.MediaMetadataRetriever().let { mr ->
+                        try { mr.setDataSource(context, clip.uri); mr.getFrameAtTime(p.timeMs * 1000, android.media.MediaMetadataRetriever.OPTION_CLOSEST) } finally { mr.release() }
+                    }
+                    bmp ?: throw IllegalStateException("couldn't read that frame")
+                    projects.saveCover(id, Bitmap.createScaledBitmap(bmp, 480, 480 * bmp.height / bmp.width.coerceAtLeast(1), true))
+                    savePhoto(bmp, clip.name.substringBeforeLast('.') + "_cover")
+                }
+            }
+            r.onSuccess { toast("Saved to Pictures/GPic and set as the project's cover") }.onFailure { e -> toast("Couldn't save the cover: ${e.message}") }
+        }
+    }
+
+    private fun savePhoto(bmp: Bitmap, base: String): Uri {
+        val name = base + "_" + java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date()) + ".jpg"
+        val values = android.content.ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, android.os.Environment.DIRECTORY_PICTURES + "/GPic")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+        val collection = if (android.os.Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val uri = context.contentResolver.insert(collection, values) ?: throw IllegalStateException("couldn't create the photo")
+        context.contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+        if (android.os.Build.VERSION.SDK_INT >= 29) context.contentResolver.update(uri, android.content.ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }, null, null)
+        return uri
+    }
+
+    /**
+     * Adds generated title cards: a 2.5 s still made from the best frame (blurred and darkened), with editable
+     * title text on top. The intro shifts everything else (including texts) later.
+     */
+    fun addCards(intro: Boolean, outro: Boolean, oneStep: Boolean = true) {
+        val id = _state.value.projectId ?: return
+        viewModelScope.launch {
+            val st = _state.value
+            val parts = st.parts.ifEmpty { return@launch }
+            val (w, h) = CompositionBuilder.outputFrame(st.plan, st.clips, parts, 1080)
+            val cover = st.covers.firstOrNull() ?: CoverPick(parts.first().clip, (parts.first().startMs + parts.first().endMs) / 2)
+            val made = withContext(Dispatchers.IO) {
+                runCatching {
+                    val src = st.clips.getOrNull(cover.clip)?.let { VideoProbe.thumbnail(context, it, cover.timeMs, 720) } ?: throw IllegalStateException("no frame")
+                    val bg = com.gpic.android.editor.Cards.background(src, w, h)
+                    val file = File(projects.mediaDir(id), "$CARD_PREFIX${System.nanoTime()}.jpg")
+                    com.gpic.android.editor.Cards.saveJpeg(bg, file)
+                    VideoProbe.probe(context, Uri.fromFile(file)).copy(name = file.name)
+                }
+            }
+            val card = made.getOrElse { e -> return@launch toast("Couldn't make the card: ${e.message}") }
+            val date = java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault()).format(java.util.Date(captureDate(st.clips)))
+            val title = st.projectName.takeIf { n -> n.isNotBlank() && !n.first().isDigit() } ?: "Highlights"
+            val change: (EditPlan) -> EditPlan = { p0 ->
+                var p = Timeline.materialize(p0, st.durations)
+                val cardIndex = st.clips.size // the card clip is appended below
+                val len = CARD_MS
+                if (intro) {
+                    p = p.copy(
+                        segments = listOf(Segment(0, len, cardIndex, motion = com.gpic.android.editor.Motion.ZOOM_IN, transition = Transition.FADE_BLACK)) + p.segments,
+                        texts = p.texts.map { t -> t.copy(startMs = t.startMs + len, endMs = t.endMs + len) } + listOf(
+                            TextItem(title, 150, len - 100, y = 0.44f, size = 0.11f, style = com.gpic.android.editor.TextStyle.SHADOW,
+                                font = com.gpic.android.editor.TextFont.CONDENSED, animIn = com.gpic.android.editor.TextAnim.TYPEWRITER),
+                            TextItem(date, 600, len - 100, y = 0.58f, size = 0.045f, style = com.gpic.android.editor.TextStyle.PLAIN,
+                                font = com.gpic.android.editor.TextFont.SANS, animIn = com.gpic.android.editor.TextAnim.FADE),
+                        ),
+                    )
+                }
+                if (outro) {
+                    val total = p.outputMs(st.durations + card.durationMs)
+                    p = p.copy(
+                        segments = p.segments.dropLast(1) + p.segments.last().copy(transition = Transition.FADE_BLACK) +
+                            Segment(0, len, cardIndex, motion = com.gpic.android.editor.Motion.ZOOM_OUT),
+                        texts = p.texts + TextItem("The End", total + 200, total + len - 100, y = 0.48f, size = 0.09f,
+                            style = com.gpic.android.editor.TextStyle.SHADOW, font = com.gpic.android.editor.TextFont.SERIF,
+                            animIn = com.gpic.android.editor.TextAnim.FADE),
+                    )
+                }
+                p
+            }
+            _state.update { s ->
+                val clips = s.clips + card
+                val next = change(s.plan).sanitized(clips.map { it.durationMs }, s.luts.mapTo(HashSet()) { it.id })
+                if (oneStep) { undo.addLast(s.plan); redo.clear() }
+                s.copy(clips = clips, plan = next, canUndo = undo.isNotEmpty(), canRedo = false, exported = null)
+            }
+            scheduleSave()
+            loadThumbs()
+        }
+    }
+
+    /** Earliest capture date of the clips (their metadata), else today. */
+    private fun captureDate(clips: List<VideoInfo>): Long = clips.filter { !it.isImage }.mapNotNull { v ->
+        runCatching {
+            android.media.MediaMetadataRetriever().let { mr ->
+                try {
+                    mr.setDataSource(context, v.uri)
+                    mr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DATE)?.let { d ->
+                        java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss", java.util.Locale.US).apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }.parse(d.take(15))?.time
+                    }
+                } finally { mr.release() }
+            }
+        }.getOrNull()
+    }.filter { it > 946684800000L }.minOrNull() ?: System.currentTimeMillis()
+
+    // ---- Claude app (Pro plan: no API key) -------------------------------------------------------------------
+
+    /** The prompt and (optionally) a storyboard image to share with the Claude app. */
+    suspend fun prepareClaudeShare(withStoryboard: Boolean): Pair<String, Uri?> = withContext(Dispatchers.IO) {
+        val st = _state.value
+        val plan = Timeline.materialize(st.plan, st.durations)
+        val image = if (!withStoryboard) null else runCatching {
+            val per = ClaudeEditPlanner.framesPerClip(st.durations).map { minOf(it, 6) }
+            val frames = st.clips.flatMapIndexed { i, v ->
+                if (v.isImage) listOfNotNull(VideoProbe.thumbnail(context, v, 0, 256)?.let { "C$i photo" to it })
+                else (0 until per[i]).mapNotNull { k ->
+                    val t = v.durationMs * (2 * k + 1) / (2 * per[i])
+                    VideoProbe.thumbnail(context, v, t, 256)?.let { b -> "C$i ${t / 60000}:${"%02d".format(t / 1000 % 60)}" to b }
+                }
+            }.take(24)
+            val sheet = com.gpic.android.editor.Cards.storyboard(frames)
+            val f = File(context.cacheDir, "share/gpic-storyboard.jpg")
+            com.gpic.android.editor.Cards.saveJpeg(sheet, f, 85)
+            androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".fileprovider", f)
+        }.onFailure { Log.w(TAG, "storyboard failed", it) }.getOrNull()
+        ClaudeEditPlanner.chatPrompt(st.request.ifBlank { "Make a lively short edit of these clips." }, st.clips, plan, st.luts, image != null) to image
+    }
+
+    /** Applies a reply pasted from the Claude app as one undoable step. */
+    fun applyClaudeReply(text: String?) {
+        val st = _state.value
+        if (text.isNullOrBlank()) return toast("Copy Claude's reply first (the copy button under its answer)")
+        val r = runCatching { ClaudeEditPlanner.parseReply(text, Timeline.materialize(st.plan, st.durations), st.durations, st.luts.mapTo(HashSet()) { it.id }) }
+        r.onSuccess { planned ->
+            commit { planned.plan }
+            _state.update { it.copy(claudeNote = planned.explanation, selection = Selection.None) }
+        }.onFailure { e -> toast(e.message ?: "Couldn't read Claude's reply") }
     }
 
     // ---- Claude ---------------------------------------------------------------------------------------------
@@ -839,5 +1057,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         const val MAX_THUMBS = 120
         const val THUMB_PX = 96
         private const val MAX_UNDO = 60
+        const val CARD_PREFIX = "gpic-card-"
+        const val CARD_MS = 2_500L
     }
 }

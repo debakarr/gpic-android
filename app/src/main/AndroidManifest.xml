@@ -39,6 +39,8 @@
         <package android:name="com.google.android.apps.photos" />
         <package android:name="app.morphe.android.apps.photos" />
         <package android:name="app.revanced.android.apps.photos" />
+        <!-- "Ask in Claude app": share the prompt to Claude when it is installed. -->
+        <package android:name="com.anthropic.claude" />
     </queries>
 
     <application

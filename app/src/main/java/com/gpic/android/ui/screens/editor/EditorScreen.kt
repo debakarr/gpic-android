@@ -63,6 +63,7 @@ import com.gpic.android.editor.TextItem
 import com.gpic.android.editor.TextRender
 import com.gpic.android.editor.Timeline
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 @Composable
@@ -228,6 +229,8 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
     var keyDialog by remember { mutableStateOf(false) }
     var renameDialog by remember { mutableStateOf(false) }
     var stickers by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
     val thumbs by vm.thumbs.collectAsState()
     val built by vm.preview.collectAsState()
 
@@ -314,7 +317,11 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
                 val boxW = minOf(maxWidth, maxHeight * ratio)
                 // The player keeps its last frame at the old size when the preview resizes (a panel opened or
                 // closed): draw it again at the new size.
-                LaunchedEffect(boxW) { delay(150); runCatching { player.experimentalRedrawLastFrame() } }
+                LaunchedEffect(boxW) {
+                    delay(250)
+                    // Re-seeking renders a fresh frame at the new size (redrawing the last one isn't always enough).
+                    if (built != null && !playing) runCatching { player.seekTo(posMs) } else runCatching { player.experimentalRedrawLastFrame() }
+                }
                 Box(Modifier.size(boxW, boxW / ratio)) {
                     AndroidView(
                         factory = {
@@ -397,7 +404,10 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
                 Panel.MUSIC -> MusicPanel(state, vm, vm.beatMarkers(state).size)
                 Panel.CANVAS -> CanvasPanel(state, vm)
                 Panel.QUICK_EDIT -> QuickEditPanel(state, vm)
-                Panel.CLAUDE -> ClaudePanel(state, vm, onAddKey = { keyDialog = true })
+                Panel.CLAUDE -> ClaudePanel(state, vm, onAddKey = { keyDialog = true },
+                    onShareToApp = { withBoard -> scope.launch { shareToClaude(context, vm, withBoard) } },
+                    onPasteReply = { vm.applyClaudeReply(clipboard.getText()?.text) })
+                Panel.CARDS -> CardsPanel(state, vm)
                 Panel.EXPORT -> ExportPanel(state, vm)
                 null -> Toolbar(state, vm, posMs, onStickers = { stickers = true })
             }
@@ -511,7 +521,8 @@ private fun Toolbar(state: EditorUiState, vm: EditorViewModel, posMs: Long, onSt
             Tool("Filters", Icons.Default.AutoAwesomeMosaic) { vm.openPanel(Panel.FILTERS) },
             Tool("Adjust", Icons.Default.Tune) { vm.openPanel(Panel.ADJUST) },
             Tool("Format", Icons.Default.AspectRatio) { vm.openPanel(Panel.CANVAS) },
-            Tool("Quick edit", Icons.Default.AutoFixHigh) { vm.openPanel(Panel.QUICK_EDIT) },
+            Tool("Smart edit", Icons.Default.AutoFixHigh) { vm.openPanel(Panel.QUICK_EDIT) },
+            Tool("Cards", Icons.Default.Title) { vm.openPanel(Panel.CARDS) },
             Tool("Claude", Icons.Default.AutoAwesome) { vm.openPanel(Panel.CLAUDE) },
         )
     }
@@ -597,6 +608,29 @@ private fun TextLayer(state: EditorUiState, posMs: Long, vm: EditorViewModel) {
                 style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx()))
         }
     }
+}
+
+/** The Claude app's package (Play Store build). */
+private const val CLAUDE_APP = "com.anthropic.claude"
+
+/** Opens the Claude app (or the share menu) with the prompt and storyboard, and copies the prompt as a fallback. */
+private suspend fun shareToClaude(context: android.content.Context, vm: EditorViewModel, withStoryboard: Boolean) {
+    val (prompt, image) = vm.prepareClaudeShare(withStoryboard)
+    val cm = context.getSystemService(android.content.ClipboardManager::class.java)
+    cm?.setPrimaryClip(android.content.ClipData.newPlainText("GPic prompt", prompt))
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = if (image != null) "image/jpeg" else "text/plain"
+        putExtra(Intent.EXTRA_TEXT, prompt)
+        if (image != null) {
+            putExtra(Intent.EXTRA_STREAM, image)
+            clipData = android.content.ClipData.newRawUri("storyboard", image)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+    val direct = Intent(send).setPackage(CLAUDE_APP)
+    val intent = if (direct.resolveActivity(context.packageManager) != null) direct else Intent.createChooser(send, "Send to Claude")
+    runCatching { context.startActivity(intent) }.onFailure { vm.toast("Couldn't open Claude; the prompt is copied, paste it into Claude yourself.") }
+    vm.toast("Prompt copied too, in case Claude opens without it.")
 }
 
 @Composable

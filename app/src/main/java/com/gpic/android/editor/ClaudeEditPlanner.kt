@@ -163,16 +163,19 @@ class ClaudeEditPlanner(apiKey: String) {
                 .put("aspect", p.aspect.name).put("canvas", p.canvas.name)
         }
 
-        /** Claude's answer → a plan: per-part extras it can't see (rotation, own looks) are kept by position. */
-        private fun fromClaude(o: JSONObject, current: EditPlan): EditPlan {
+        /**
+         * Claude's answer → a plan: per-part extras it can't see (rotation, own looks) are kept by position, and
+         * anything it left out stays as it was (a chat reply may give only the fields it changed).
+         */
+        internal fun fromClaude(o: JSONObject, current: EditPlan): EditPlan {
             val plan = EditPlan.fromJson(JSONObject()
-                .put("segments", o.getJSONArray("segments"))
-                .put("look", o.getJSONObject("look"))
-                .put("texts", o.getJSONArray("texts"))
+                .apply { o.optJSONArray("segments")?.let { put("segments", it) } }
+                .apply { o.optJSONObject("look")?.let { put("look", it) } }
+                .apply { o.optJSONArray("texts")?.let { put("texts", it) } }
                 .put("keep_original_audio", o.optBoolean("keep_original_audio", current.keepOriginalAudio))
                 .put("original_volume", o.optDouble("original_volume", current.originalVolume.toDouble()))
-                .put("aspect", o.optString("aspect"))
-                .put("canvas", o.optString("canvas")), base = current.copy(texts = emptyList()))
+                .put("aspect", o.optString("aspect", current.aspect.name))
+                .put("canvas", o.optString("canvas", current.canvas.name)), base = if (o.has("texts")) current.copy(texts = emptyList()) else current)
             return plan.copy(
                 segments = plan.segments.mapIndexed { i, s ->
                     current.segments.getOrNull(i)?.let { old -> s.copy(rotation = old.rotation, mirror = old.mirror, look = old.look) } ?: s
@@ -238,6 +241,79 @@ class ClaudeEditPlanner(apiKey: String) {
                 .put("music_fade_out_s", num("Music fade-out at the end, seconds"))
                 .put("aspect", enumOf(Aspect.entries.map { it.name }, "Output shape"))
                 .put("canvas", enumOf(Canvas.entries.map { it.name }, "When a clip's shape differs from the output: CROP fills, BLACK letterboxes, BLUR puts it on a blurred copy")))
+        }
+
+        /**
+         * The same job as an API request, as one message for the Claude app (works on a Pro/Max plan, no API key):
+         * the instructions, a plain-language field list instead of the JSON schema, the clips and the current edit,
+         * and the request. The reply is pasted back and read by [parseReply].
+         */
+        fun chatPrompt(request: String, clips: List<VideoInfo>, current: EditPlan, luts: List<LutInfo>, withStoryboard: Boolean): String {
+            val clipsText = clips.mapIndexed { i, v ->
+                "clip $i: ${if (v.isImage) "photo (can show up to 10 s)" else "video ${"%.1f".format(v.durationMs / 1000.0)} s"}, " +
+                    "${v.displayWidth}x${v.displayHeight}" + (if (v.hasAudio) ", has sound" else "") + (if (v.fromDji) ", DJI camera" else "") +
+                    (if (v.looksFlat == true) ", looks flat/log" else "")
+            }.joinToString("\n")
+            val m = current.music
+            return buildString {
+                appendLine("I'm editing a video in GPic (an Android video editor). Plan the edit and reply with ONE JSON object in a ```json code block, then one or two sentences for me.")
+                appendLine()
+                appendLine(SYSTEM.substringBefore("Segment times").trim())
+                appendLine()
+                appendLine("JSON fields (leave out any you don't change):")
+                appendLine("- explanation: string")
+                appendLine("- segments: [{clip, start_s, end_s, speed (0.25-4), curve (${SpeedCurve.entries.joinToString("|") { it.name }}), volume (0-2), transition (${Transition.entries.joinToString("|") { it.name }}), motion (${Motion.entries.joinToString("|") { it.name }})}] in playback order; times are seconds within that clip")
+                appendLine("- look: {lut (${(luts.map { it.id } + EditPlan.NO_LUT).joinToString("|")}), filter (NONE|${Filter.entries.joinToString("|") { it.name }}), filter_amount 0-1, ${Look.ADJUSTMENTS.joinToString(", ") { "${it.key} ${if (it.min == 0f) "0..1" else "-1..1"}" }}}")
+                appendLine("- texts: [{text, start_s, end_s (seconds of the OUTPUT video), x 0-1, y 0-1 (titles ~0.45, captions ~0.85), size 0.03-0.2, color \"#RRGGBB\", style (${TextStyle.entries.joinToString("|") { it.name }}), font (${TextFont.entries.joinToString("|") { it.name }}), anim_in, anim_out (${TextAnim.entries.joinToString("|") { it.name }}), sticker true/false}]")
+                appendLine("- keep_original_audio, original_volume 0-2, music_volume 0-2, music_start_s, music_fade_in_s, music_fade_out_s")
+                appendLine("- aspect (${Aspect.entries.joinToString("|") { it.name }}), canvas (${Canvas.entries.joinToString("|") { it.name }})")
+                appendLine()
+                appendLine("Clips:")
+                appendLine(clipsText)
+                if (withStoryboard) appendLine("The attached image shows frames from the clips, labelled with the clip number and time (C1 0:03 = clip 1 at 3 s).")
+                if (m != null) {
+                    appendLine("Music: ${m.title}" + (if (m.bpm > 0) ", ${m.bpm.toInt()} BPM" else "") +
+                        (if (m.beatsMs.isNotEmpty()) ", beats at output seconds: " + m.beatsMs.map { (it - m.startMs) / 1000.0 }.filter { it >= 0 }.take(60).joinToString { "%.2f".format(it) } else ""))
+                }
+                appendLine("Current edit (output ${"%.1f".format(current.outputMs(clips.map { it.durationMs }) / 1000.0)} s):")
+                appendLine(forClaude(current).toString())
+                appendLine()
+                append("My request: ").append(request.trim())
+            }
+        }
+
+        /**
+         * Reads a pasted chat reply: the ```json block, or else the first balanced {...}. Throws [ClaudeException]
+         * with a readable reason when there's no usable JSON.
+         */
+        fun parseReply(text: String, current: EditPlan, durations: List<Long>, lutIds: Set<String>): PlannedEdit {
+            val json = extractJson(text) ?: throw ClaudeException("Couldn't find a JSON plan in what was pasted. Copy Claude's whole reply.")
+            val o = runCatching { JSONObject(json) }.getOrElse { throw ClaudeException("Claude's plan isn't valid JSON (${it.message?.take(80)}). Ask it to send the JSON again.") }
+            val plan = fromClaude(o, current).sanitized(durations, lutIds)
+            val note = o.optString("explanation").ifBlank { text.substringAfterLast("```").trim().take(300) }.ifBlank { "Applied Claude's plan." }
+            return PlannedEdit(plan, note)
+        }
+
+        internal fun extractJson(text: String): String? {
+            Regex("```(?:json)?\\s*([\\s\\S]*?)```").findAll(text).map { it.groupValues[1].trim() }.firstOrNull { it.startsWith("{") }?.let { return it }
+            val start = text.indexOf('{')
+            if (start < 0) return null
+            var depth = 0
+            var inString = false
+            var escape = false
+            for (i in start until text.length) {
+                val ch = text[i]
+                if (inString) {
+                    if (escape) escape = false else if (ch == '\\') escape = true else if (ch == '"') inString = false
+                    continue
+                }
+                when (ch) {
+                    '"' -> inString = true
+                    '{' -> depth++
+                    '}' -> { depth--; if (depth == 0) return text.substring(start, i + 1) }
+                }
+            }
+            return null
         }
 
         private val SYSTEM = """

@@ -8,7 +8,7 @@
 
 - **Package:** `com.gpic.android`
 - **App entry:** `MainActivity` → Compose NavHost (home/auth/settings)
-- **Current version:** `1.5.0 (17)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
+- **Current version:** `1.6.0 (18)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
 - **Repo:** `github.com/debakarr/gpic-android` (private), branch `main`
 
 ## Tech Stack
@@ -91,7 +91,9 @@ app/src/main/
                 CubeLut.kt (.cube parser; pure), LutStore.kt, VideoProbe.kt (metadata, frames, thumbnails, photos),
                 VideoExporter.kt (CompositionBuilder shared by preview + export, effects, Transformer, Encoders),
                 TextRender.kt (text/sticker bitmaps + animation maths), AudioFx.kt (fades/gain), Openverse.kt (CC music),
-                ProjectStore.kt (drafts), ClaudeEditPlanner.kt (Anthropic SDK, strict schema → EditPlan)
+                ProjectStore.kt (drafts), ClaudeEditPlanner.kt (Anthropic SDK + Claude-app prompt/reply parser),
+                Proxies.kt (540p edit copies), VideoAnalyzer.kt (on-phone frame measurements), SmartEdit.kt (shots,
+                scoring, duplicates, beat slots; pure), Cards.kt (title-card backgrounds, storyboard sheet)
     camera/     CameraLink.kt (BLE pair → camera WiFi → DUML list), CameraTransfer.kt (self-resuming HTTP stream, stager)
       osmosis/  vendored KonradIT/osmosis protocol code (MIT, see NOTICE.md); only change: CameraNet socket binding
     ui/
@@ -253,6 +255,38 @@ schema in `ClaudeEditPlanner.schema` (strict, tested); it sees clip metadata, th
 time, and up to 24 frames only when ticked. Key in the encrypted prefs.
 Not done: reverse, keyframes, chroma key, voice-over, auto captions, stabilisation, true cross-dissolve (two
 overlapping sequences; too heavy for old phones).
+
+Edit copies (1.6): clips over 720p, over 60 fps or HEVC get a 540p ≤ 30 fps H.264 copy (keyframe every 0.5 s) in
+the project's media/proxies, made one at a time behind a skippable screen with no preview decoding meanwhile (the
+Redmi's decoder failed when both ran). `VideoInfo.uri` stays the original; `editUri` (proxy or original) feeds the
+preview (`build(useProxies = true)`), thumbnails and analysis; export logs "from originals" and never reads a copy.
+Copies can be a few ms longer: clips are clamped to the copy's own length in the preview. Google Photos picks are
+still copied in full (its picker only hands over the original file).
+
+Smart edit (1.6, LightCut's one-tap edit without its models): LightCut's native `libmlace_calculator.so` shows its
+pipeline — camera-motion shot split (pan/tilt/FPV, "bad jitter"), image aesthetic score, face/person/pet detection
+and shot scale, frame-feature clustering of similar shots, template fill (its Java is packed with AppGuard; not
+read). CapCut's AutoCut has per-media tags/score/face info plus beat fetch/match nodes and runs on its servers.
+GPic: `VideoAnalyzer` samples ~2 fps (≤ 240 a clip; exact frames from originals — nearest-keyframe sampling gave
+identical frames on long-GOP clips — keyframes from edit copies): brightness/contrast, Laplacian sharpness,
+colourfulness, global motion from row/column profile shifts, residual "action", histogram change, and
+`android.media.FaceDetector` about once a second. `SmartEdit` (tested): shots at hard cuts and lasting motion
+changes; quality/interest scores; shaky (motion jitter), blurry (clip-relative, absolute floor, and < ¼ of the
+project's median), dark; near-duplicate groups by cosine of colour histogram + 4×4 grey; slots of the style's
+beat-length cut: good shots one per group first, then other good shots, then second windows, weak ones last;
+story order or best first; ≥ 100 fps shots at half speed; slide transitions follow the camera's pan/tilt.
+Measured on synthetic clips: the shaky clip read motion 0.15 / jitter 0.17, a blur sigma 14 clip 0.0014 sharpness vs
+0.013–0.07; zooms and repeating test patterns can read as shake (needs tuning on real footage; `adb logcat -s GPicSmart`).
+Generated frames: cover suggestions (best frame per group) save at the original's resolution to Pictures/GPic and
+become the project cover; intro/end title cards are photo clips made from the best frame (blurred, darkened;
+`gpic-card-*`, skipped by analysis) with editable text items.
+
+Claude without an API key (1.6): Pro/Max plans don't include API use (that's billed in the Anthropic Console).
+"Ask in Claude app" shares `ClaudeEditPlanner.chatPrompt` (instructions, plain field list, clips, current plan,
+beats, request) plus an optional labelled storyboard (`Cards.storyboard`, via FileProvider) to `com.anthropic.claude`
+(or the share menu), and copies the prompt too. "Paste reply" reads the clipboard: ```json block or first balanced
+{…}; missing fields stay as they were; one undoable step. The share step into the real app is untested (not installed
+on the test phone).
 
 ### Album suggestions (Albums screen, top-bar icon)
 `MediaIndex` (filesDir JSON, singleton) records media key + EXIF capture time/GPS + local Uri for every

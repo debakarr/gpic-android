@@ -409,51 +409,91 @@ fun CanvasPanel(state: EditorUiState, vm: EditorViewModel) {
 
 @Composable
 fun QuickEditPanel(state: EditorUiState, vm: EditorViewModel) {
-    PanelSheet("Quick edit", onClose = { vm.openPanel(null) }) {
-        Text("Picks the liveliest moments of your clips (worked out on this phone), cuts them to a style, and to the beat when there's music.",
-            color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
-        ChipRow { EditStyle.entries.forEach { st -> Pick(st.label, state.style == st, enabled = state.autoProgress == null) { vm.setStyle(st) } } }
-        Text(state.style.blurb, color = Color.White, style = MaterialTheme.typography.bodySmall)
-        ChipRow { listOf(15, 30, 60).forEach { sec -> Pick("$sec s", state.targetSec == sec, enabled = state.autoProgress == null) { vm.setTarget(sec) } } }
-        Button(onClick = vm::quickEdit, enabled = state.autoProgress == null && state.exportProgress == null) {
-            if (state.autoProgress != null) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-            else Icon(Icons.Default.AutoFixHigh, null, Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(state.autoProgress ?: "Make my edit")
+    PanelSheet("Smart edit", onClose = { vm.openPanel(null) }) {
+        Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Finds the shots in your clips, skips shaky, blurry and repeated ones, and cuts the best moments to a style — " +
+                "to the beat when there's music. All worked out on this phone.", color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
+            val busy = state.autoProgress != null
+            ChipRow { EditStyle.entries.forEach { st -> Pick(st.label, state.style == st, enabled = !busy) { vm.setStyle(st) } } }
+            Text(state.style.blurb, color = Color.White, style = MaterialTheme.typography.bodySmall)
+            ChipRow {
+                listOf(15, 30, 60).forEach { sec -> Pick("$sec s", state.targetSec == sec, enabled = !busy) { vm.setTarget(sec) } }
+                com.gpic.android.editor.Arrange.entries.forEach { a -> Pick(a.label, state.arrange == a, enabled = !busy) { vm.setArrange(a) } }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Intro & end title cards", color = Color.White, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                Switch(checked = state.addCards, onCheckedChange = vm::setAddCards, enabled = !busy)
+            }
+            Button(onClick = vm::quickEdit, enabled = !busy && state.exportProgress == null && state.preparing == null) {
+                if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                else Icon(Icons.Default.AutoFixHigh, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(state.autoProgress ?: "Make my edit")
+            }
+            state.autoNote?.let { Text(it, color = Color.White, style = MaterialTheme.typography.bodyMedium) }
         }
-        state.autoNote?.let { Text(it, color = Color.White, style = MaterialTheme.typography.bodyMedium) }
     }
 }
 
 @Composable
-fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit) {
+fun CardsPanel(state: EditorUiState, vm: EditorViewModel) {
+    PanelSheet("Title cards", onClose = { vm.openPanel(null) }) {
+        Text("A still made from your best frame (soft and darkened) with a title on top. Edit the words like any text.",
+            color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { vm.addCards(intro = true, outro = false); vm.openPanel(null) }) { Text("Add intro card") }
+            OutlinedButton(onClick = { vm.addCards(intro = false, outro = true); vm.openPanel(null) }) { Text("Add end card") }
+        }
+    }
+}
+
+@Composable
+fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit, onShareToApp: (Boolean) -> Unit, onPasteReply: () -> Unit) {
+    var storyboard by remember { mutableStateOf(true) }
     PanelSheet("Ask Claude", onClose = { vm.openPanel(null) }) {
-        if (!state.hasClaudeKey) {
-            Text("Describe the edit (\"keep the jumps, slow-mo the landing, add a title, cut to the beat\") and Claude sets it up. " +
-                "Uses your own Anthropic API key, billed to you.", color = Color.White, style = MaterialTheme.typography.bodySmall)
-            Button(onClick = onAddKey) { Text("Add API key") }
-            return@PanelSheet
-        }
-        OutlinedTextField(
-            value = state.request, onValueChange = vm::setRequest, enabled = !state.asking, modifier = Modifier.fillMaxWidth(), minLines = 2,
-            placeholder = { Text("e.g. Hero slow-mo on the jump, title “Goa 2026” at the start, cut on the beat, warm colour") },
-            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
-        )
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(checked = state.sendFrames, onCheckedChange = vm::setSendFrames, enabled = !state.asking)
-            Text("Let Claude see up to ${ClaudeEditPlanner.FRAME_COUNT} small frames (sent to Anthropic). Off: only lengths, sizes and your words.",
-                color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = vm::askClaude, enabled = !state.asking && state.request.isNotBlank()) {
-                if (state.asking) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.AutoMirrored.Filled.Send, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(if (state.asking) "Claude is planning…" else "Ask Claude")
+        Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            OutlinedTextField(
+                value = state.request, onValueChange = vm::setRequest, enabled = !state.asking, modifier = Modifier.fillMaxWidth(), minLines = 2,
+                placeholder = { Text("e.g. Hero slow-mo on the jump, title “Goa 2026” at the start, cut on the beat, warm colour") },
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+            )
+            // Claude app: works with a Pro/Max plan, no API key.
+            Text("With the Claude app (Pro plan)", color = Color.White, style = MaterialTheme.typography.titleSmall)
+            Text("1. Ask in Claude app: GPic opens Claude with your request, the clip details and the current edit" +
+                (if (storyboard) ", plus a storyboard image of frames" else "") + ". Send it.\n" +
+                "2. Copy Claude's whole reply, come back, tap Paste reply.", color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = storyboard, onCheckedChange = { storyboard = it })
+                Text("Include a storyboard image (frames go to Anthropic through your Claude app)", color = EditorColors.Muted,
+                    style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
             }
-            Spacer(Modifier.weight(1f))
-            TextButton(onClick = onAddKey) { Text("API key") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onShareToApp(storyboard) }) { Icon(Icons.AutoMirrored.Filled.Send, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("Ask in Claude app") }
+                OutlinedButton(onClick = onPasteReply) { Icon(Icons.Default.ContentPaste, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("Paste reply") }
+            }
+            state.claudeNote?.let { Text(it, color = Color.White, style = MaterialTheme.typography.bodyMedium) }
+            HorizontalDivider(color = EditorColors.Lane)
+            // API key: billed separately in the Anthropic Console (not part of Pro).
+            Text("With an API key (Anthropic Console, billed separately)", color = Color.White, style = MaterialTheme.typography.titleSmall)
+            if (!state.hasClaudeKey) {
+                TextButton(onClick = onAddKey) { Text("Add API key") }
+            } else {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = state.sendFrames, onCheckedChange = vm::setSendFrames, enabled = !state.asking)
+                    Text("Let Claude see up to ${ClaudeEditPlanner.FRAME_COUNT} small frames", color = EditorColors.Muted,
+                        style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Button(onClick = vm::askClaude, enabled = !state.asking && state.request.isNotBlank()) {
+                        if (state.asking) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.AutoMirrored.Filled.Send, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(if (state.asking) "Claude is planning…" else "Ask with API key")
+                    }
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = onAddKey) { Text("API key") }
+                }
+            }
         }
-        state.claudeNote?.let { Text(it, color = Color.White, style = MaterialTheme.typography.bodyMedium) }
     }
 }
 
@@ -479,7 +519,30 @@ fun ExportPanel(state: EditorUiState, vm: EditorViewModel) {
         val (w, h) = vm.frameFor(state.plan.maxHeight)
         Text("${w}×$h · ${clock(state.outputMs).substringBefore('.')} · about ${formatMb(Encoders.estimateBytes(w, h, state.plan.fps, state.outputMs))}",
             color = Color.White, style = MaterialTheme.typography.bodyMedium)
+        CoverRow(state, vm)
         Button(onClick = vm::export, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Movie, null); Spacer(Modifier.width(8.dp)); Text("Export to Movies/GPic") }
+    }
+}
+
+/** Suggested cover frames: tap one to save it as a full-resolution photo (and the project's cover). */
+@Composable
+private fun CoverRow(state: EditorUiState, vm: EditorViewModel) {
+    if (state.covers.isEmpty()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Cover", color = EditorColors.Muted, style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
+            TextButton(onClick = vm::findCovers, enabled = state.autoProgress == null) { Text(state.autoProgress ?: "Suggest cover frames") }
+        }
+        return
+    }
+    Text("Cover: tap a frame to save it to Pictures/GPic", color = EditorColors.Muted, style = MaterialTheme.typography.labelMedium)
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        state.covers.forEach { c ->
+            var img by remember(c) { mutableStateOf<Bitmap?>(null) }
+            LaunchedEffect(c) { img = vm.coverThumb(c) }
+            Box(Modifier.size(96.dp, 54.dp).clip(RoundedCornerShape(6.dp)).background(EditorColors.Lane).clickable { vm.saveCover(c) }) {
+                img?.let { Image(it.asImageBitmap(), "Cover frame", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
+            }
+        }
     }
 }
 
