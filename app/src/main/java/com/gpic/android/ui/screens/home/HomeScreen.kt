@@ -65,13 +65,13 @@ fun HomeScreen(
     val busy = state.uploadRunning
 
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
-        if (uri != null) vm.setDjiUri(uri)
+        if (uri != null) vm.addDjiFolder(uri)
     }
     val filesPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
         if (uris.isNotEmpty()) vm.setDjiFileUris(uris)
     }
     val cleanupFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
-        if (uri != null) vm.setCleanupFolder(uri)
+        if (uri != null) vm.addCleanupFolder(uri)
     }
 
     // Without media access Android strips GPS from photos it hands GPic, so uploads lose their location.
@@ -282,9 +282,10 @@ fun HomeScreen(
                     mediaAccess = mediaAccess,
                     enabled = !busy,
                     onPickFolder = { pick("cleanup") { cleanupFolderPicker.launch(null) } },
+                    onRemoveFolder = vm::removeCleanupFolder,
                     onRule = vm::setCleanupRule,
                     onRecursive = vm::setCleanupRecursive,
-                    onRescan = vm::scanCleanup,
+                    onRescan = { vm.scanCleanup() },
                     onAllowMedia = {
                         if (promptBlocked()) runCatching {
                             context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)))
@@ -304,10 +305,9 @@ fun HomeScreen(
                 SourceSection(
                     state = state,
                     enabled = !busy,
-                    onPickFolder = {
-                        if (state.djiSource == "folder" && state.djiFiles.isNotEmpty()) vm.rescan()
-                        else pick("folder") { folderPicker.launch(null) }
-                    },
+                    onPickFolder = { pick("folder") { folderPicker.launch(null) } },
+                    onRescan = vm::rescan,
+                    onRemoveFolder = vm::removeDjiFolder,
                     onPickFiles = { pick("files") { filesPicker.launch(arrayOf("image/*", "video/*")) } },
                     onClear = { vm.clearSelection() },
                 )
@@ -396,12 +396,22 @@ fun HomeScreen(
             icon = { Icon(Icons.Default.DeleteSweep, null) },
             title = { Text("Back up, then delete from phone?") },
             text = {
-                Text(
-                    "GPic uploads ${plural(state.files.size, "file")} (${formatSize(state.filesBytes)}) taken before " +
-                        "${formatDate(state.cleanup.cutoffMs)} to ${state.authEmail ?: "Google Photos"}, then deletes each one " +
-                        "from this phone once Google Photos has it. Anything that fails to upload is kept. " +
-                        "Copies in Google Photos are never touched."
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "GPic uploads ${plural(state.files.size, "file")} (${formatSize(state.filesBytes)}) taken before " +
+                            "${formatDate(state.cleanup.cutoffMs)} to ${state.authEmail ?: "Google Photos"}, then deletes each one " +
+                            "from this phone once Google Photos has it. Anything that fails to upload is kept. " +
+                            "Copies in Google Photos are never touched."
+                    )
+                    if (state.cleanup.folders.size > 1) {
+                        // Where the deletions happen, folder by folder.
+                        val byFolder = state.files.groupBy { it.group }
+                        state.cleanup.folders.forEach { f ->
+                            val files = byFolder[f.label].orEmpty()
+                            Text("• ${f.label}: ${plural(files.size, "file")}, ${formatSize(files.sumOf { it.sizeBytes })}", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
             },
             confirmButton = {
                 Button(onClick = { confirmCleanup = false; startUpload() }) { Text("Back up & delete") }
@@ -431,6 +441,7 @@ private fun CleanupSection(
     mediaAccess: Boolean,
     enabled: Boolean,
     onPickFolder: () -> Unit,
+    onRemoveFolder: (Uri) -> Unit,
     onRule: (AgeRule) -> Unit,
     onRecursive: (Boolean) -> Unit,
     onRescan: () -> Unit,
@@ -438,7 +449,7 @@ private fun CleanupSection(
 ) {
     val c = state.cleanup
     val title = when {
-        c.folderUri == null -> "Free up space"
+        c.folders.isEmpty() -> "Free up space"
         c.progress != null -> "Scanning…"
         c.error != null -> "Can't read the folder"
         state.files.isEmpty() && state.djiFiles.isNotEmpty() -> "Nothing older than ${c.rule.description} of the chosen types"
@@ -446,11 +457,11 @@ private fun CleanupSection(
         else -> "${plural(state.files.size, "file")} • ${formatSize(state.filesBytes)} to free"
     }
     val subtitle = when {
-        c.folderUri == null -> "Back up photos and videos older than a set age from one folder, then delete them from this phone. Google Photos keeps its copies."
+        c.folders.isEmpty() -> "Back up photos and videos older than a set age from one or more folders, then delete them from this phone. Google Photos keeps its copies."
         c.progress != null -> c.progress
         c.error != null -> c.error
-        c.inFolder == 0 -> "No photos or videos in ${c.folderName} — it's empty, or was moved or deleted."
-        else -> "Taken before ${formatDate(c.cutoffMs)}, out of ${plural(c.inFolder, "file")} in ${c.folderName}. " +
+        c.inFolder == 0 -> "No photos or videos in ${c.folderNames} — ${if (c.folders.size == 1) "it's" else "they're"} empty, or moved or deleted."
+        else -> "Taken before ${formatDate(c.cutoffMs)}, out of ${plural(c.inFolder, "file")} in ${if (c.folders.size == 1) c.folderNames else "${c.folders.size} folders"}. " +
             "Photo dates come from EXIF when the file has it, otherwise the file date."
     }
     val cardState = when {
@@ -461,16 +472,18 @@ private fun CleanupSection(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         StatusCard(title = title, subtitle = subtitle, icon = Icons.Default.CleaningServices, status = cardState)
         if (c.progress != null) LinearProgressIndicator(Modifier.fillMaxWidth())
+        FolderList(c.folders, counts = state.djiFiles.groupingBy { it.group }.eachCount(), enabled = enabled && c.progress == null, onRemove = onRemoveFolder)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(onClick = onPickFolder, enabled = enabled, modifier = Modifier.weight(1f)) {
-                Icon(Icons.Default.FolderOpen, null, modifier = Modifier.size(18.dp))
+                Icon(if (c.folders.isEmpty()) Icons.Default.FolderOpen else Icons.Default.CreateNewFolder, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text(c.folderName ?: "Choose folder", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(if (c.folders.isEmpty()) "Choose folder" else "Add folder", maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            if (c.folderUri != null) {
-                IconButton(onClick = onRescan, enabled = enabled && c.progress == null) { Icon(Icons.Default.Refresh, "Rescan folder") }
+            if (c.folders.isNotEmpty()) {
+                IconButton(onClick = { onRescan() }, enabled = enabled && c.progress == null) { Icon(Icons.Default.Refresh, "Rescan folders") }
             }
         }
+        c.note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         // Local text so the field can be briefly empty while typing; the rule only takes valid numbers.
         var amountText by rememberSaveable(c.rule.amount) { mutableStateOf(c.rule.amount.toString()) }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -522,6 +535,8 @@ private fun SourceSection(
     state: HomeUiState,
     enabled: Boolean,
     onPickFolder: () -> Unit,
+    onRescan: () -> Unit,
+    onRemoveFolder: (Uri) -> Unit,
     onPickFiles: () -> Unit,
     onClear: () -> Unit,
 ) {
@@ -529,17 +544,18 @@ private fun SourceSection(
         state.isScanning -> "Scanning…"
         state.files.isNotEmpty() -> "${plural(state.files.size, "file")} • ${formatSize(state.filesBytes)}"
         state.djiFiles.isNotEmpty() -> "All ${plural(state.djiFiles.size, "file")} hidden by the type filter"
-        state.djiUri != null || state.djiSource == "files" -> "Selection ready"
+        state.djiFolders.isNotEmpty() || state.djiSource == "files" -> "Selection ready"
         else -> "Choose what to back up"
     }
     val subtitle = when {
-        state.isScanning -> if (state.djiSource == "files") "Reading selected files…" else "Reading DCIM folder over USB-C…"
+        state.isScanning -> if (state.djiSource == "files") "Reading selected files…" else "Reading ${if (state.djiFolders.size == 1) state.djiFolders[0].label else "${state.djiFolders.size} folders"}…"
         state.files.isNotEmpty() -> {
             val photos = state.files.count { it.isPhoto }
             val videos = state.files.count { it.isVideo }
             val src = when {
                 state.djiSource == "files" -> "selected files"
-                state.djiUri?.authority == com.gpic.android.data.upload.UriSource.MTP_AUTHORITY -> "the camera"
+                state.djiFolders.size > 1 -> "${state.djiFolders.size} folders"
+                state.djiFolders.firstOrNull()?.uri?.authority == com.gpic.android.data.upload.UriSource.MTP_AUTHORITY -> "the camera"
                 else -> "the chosen folder"
             }
             "${plural(photos, "photo")} • ${plural(videos, "video")} • from $src"
@@ -559,17 +575,23 @@ private fun SourceSection(
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         StatusCard(title = title, subtitle = subtitle, icon = Icons.Default.Videocam, status = cardState)
         if (state.isScanning) LinearProgressIndicator(Modifier.fillMaxWidth())
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            val rescan = state.djiSource == "folder" && state.djiFiles.isNotEmpty()
+        if (state.djiSource == "folder") {
+            FolderList(state.djiFolders, counts = state.djiFiles.groupingBy { it.group }.eachCount(), enabled = enabled && !state.isScanning, onRemove = onRemoveFolder)
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            val haveFolders = state.djiSource == "folder" && state.djiFolders.isNotEmpty()
             OutlinedButton(onClick = onPickFolder, enabled = enabled && !state.isScanning, modifier = Modifier.weight(1f)) {
-                Icon(if (rescan) Icons.Default.Refresh else Icons.Default.FolderOpen, null, modifier = Modifier.size(18.dp))
+                Icon(if (haveFolders) Icons.Default.CreateNewFolder else Icons.Default.FolderOpen, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text(if (rescan) "Rescan folder" else "Choose folder")
+                Text(if (haveFolders) "Add folder" else "Choose folder")
             }
             OutlinedButton(onClick = onPickFiles, enabled = enabled && !state.isScanning, modifier = Modifier.weight(1f)) {
                 Icon(Icons.Default.FileOpen, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
                 Text("Choose files")
+            }
+            if (haveFolders) {
+                IconButton(onClick = onRescan, enabled = enabled && !state.isScanning) { Icon(Icons.Default.Refresh, "Rescan folders") }
             }
         }
         if (state.djiFiles.isNotEmpty()) {
@@ -578,6 +600,25 @@ private fun SourceSection(
         state.scanNote?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         if (state.scanError != null) {
             Text("Scan error: ${state.scanError}", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+/** The picked folders, each with how many files it holds and a remove button. */
+@Composable
+private fun FolderList(folders: List<PickedFolder>, counts: Map<String?, Int>, enabled: Boolean, onRemove: (Uri) -> Unit) {
+    if (folders.isEmpty()) return
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)) {
+        Column(Modifier.padding(vertical = 4.dp)) {
+            folders.forEach { f ->
+                Row(Modifier.fillMaxWidth().padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Folder, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(8.dp))
+                    Text(f.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    counts[f.label]?.let { Text(plural(it, "file"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    IconButton(onClick = { onRemove(f.uri) }, enabled = enabled) { Icon(Icons.Default.Close, "Remove ${f.label}", Modifier.size(18.dp)) }
+                }
+            }
         }
     }
 }

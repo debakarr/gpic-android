@@ -24,6 +24,8 @@ data class VideoInfo(
     val colorTransfer: Int?,
     /** The middle frame looks flat (low contrast and saturation), like D-Log M before grading. Null = unknown. */
     val looksFlat: Boolean?,
+    /** A photo used as a clip: it can be shown for up to [durationMs] (see [VideoProbe.IMAGE_MAX_MS]). */
+    val isImage: Boolean = false,
 ) {
     /** Display size after the container's rotation. */
     val displayWidth: Int get() = if (rotation % 180 == 0) width else height
@@ -35,8 +37,15 @@ data class VideoInfo(
 class Frame(val timeMs: Long, val jpeg: ByteArray, val clip: Int = 0)
 
 object VideoProbe {
+    /** A photo can be shown for up to this long; it starts at [IMAGE_DEFAULT_MS]. */
+    const val IMAGE_MAX_MS = 10_000L
+    const val IMAGE_DEFAULT_MS = 3_000L
+
     fun probe(context: Context, uri: Uri): VideoInfo {
         val (name, size) = nameAndSize(context, uri)
+        val type = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+            ?: android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase())
+        if (type?.startsWith("image/") == true) return probeImage(context, uri, name, size, type)
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(context, uri)
@@ -61,6 +70,47 @@ object VideoProbe {
             r.release()
         }
     }
+
+    private fun probeImage(context: Context, uri: Uri, name: String, size: Long, type: String): VideoInfo {
+        val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }
+        require(opts.outWidth > 0 && opts.outHeight > 0) { "Not a photo Android can read" }
+        val rotation = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { s ->
+                when (android.media.ExifInterface(s).getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1)) {
+                    6 -> 90; 3 -> 180; 8 -> 270; else -> 0
+                }
+            }
+        }.getOrNull() ?: 0
+        return VideoInfo(
+            uri = uri, name = name, sizeBytes = size, durationMs = IMAGE_MAX_MS, width = opts.outWidth, height = opts.outHeight,
+            rotation = rotation, frameRate = null, mime = type, hasAudio = false, bitrate = null, colorTransfer = null,
+            looksFlat = null, isImage = true,
+        )
+    }
+
+    /** One frame (or the photo) at [timeMs], longest side [maxSide] px; for timeline thumbnails. */
+    fun thumbnail(context: Context, info: VideoInfo, timeMs: Long, maxSide: Int): Bitmap? = runCatching {
+        if (info.isImage) {
+            val opts = android.graphics.BitmapFactory.Options().apply {
+                inSampleSize = Integer.highestOneBit((maxOf(info.width, info.height) / maxSide).coerceAtLeast(1))
+            }
+            context.contentResolver.openInputStream(info.uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }?.let { b ->
+                val m = android.graphics.Matrix().apply { if (info.rotation != 0) postRotate(info.rotation.toFloat()) }
+                val scale = maxSide.toFloat() / maxOf(b.width, b.height)
+                m.postScale(scale, scale)
+                Bitmap.createBitmap(b, 0, 0, b.width, b.height, m, true).also { if (it !== b) b.recycle() }
+            }
+        } else {
+            val r = MediaMetadataRetriever()
+            try {
+                r.setDataSource(context, info.uri)
+                frameAt(r, timeMs * 1000, maxSide)
+            } finally {
+                r.release()
+            }
+        }
+    }.getOrNull()
 
     /** [count] frames spread over the video (never the very first/last), longest side [maxSide] px. */
     fun frames(context: Context, uri: Uri, durationMs: Long, count: Int, maxSide: Int = 512, clip: Int = 0): List<Frame> {

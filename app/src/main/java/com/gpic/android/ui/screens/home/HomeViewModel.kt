@@ -48,8 +48,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
+/** A folder picked on the Phone / USB or Free up space tab. */
+data class PickedFolder(val uri: Uri, val label: String)
+
 data class HomeUiState(
-    val djiUri: Uri? = null,
+    /** Folders scanned together on the Phone / USB tab (djiSource == "folder"). */
+    val djiFolders: List<PickedFolder> = emptyList(),
     val djiSource: String = "none", // none|folder|files
     val djiFiles: List<DjiFile> = emptyList(),
     val isScanning: Boolean = false,
@@ -100,8 +104,7 @@ data class HomeUiState(
 
 /** "Free up space": back up a folder's media older than [rule], then delete it from the phone. */
 data class CleanupState(
-    val folderUri: Uri? = null,
-    val folderName: String? = null,
+    val folders: List<PickedFolder> = emptyList(),
     val rule: AgeRule = AgeRule(),
     val recursive: Boolean = true,
     /** Supported files in the folder, before the age filter. */
@@ -110,7 +113,11 @@ data class CleanupState(
     /** Non-null while listing the folder or reading photo dates. */
     val progress: String? = null,
     val error: String? = null,
-)
+    /** What the last folder change did ("DCIM/Camera is already inside DCIM"), or folders GPic can't read. */
+    val note: String? = null,
+) {
+    val folderNames: String get() = folders.joinToString { it.label }
+}
 
 enum class Source(val label: String) { DEVICE("Phone / USB"), CLEANUP("Free up space"), CAMERA("Camera WiFi") }
 
@@ -163,7 +170,6 @@ class HomeViewModel(
 
     /** Last folder / files picked on the Phone / USB tab (re-resolved; permissions may have lapsed). */
     private fun restoreDeviceSelection() {
-        val saved = prefs.getString("last_dji_uri", null)
         val savedFiles = prefs.getStringSet("last_dji_files", null)?.toList()
         if (!savedFiles.isNullOrEmpty()) {
             try {
@@ -172,13 +178,49 @@ class HomeViewModel(
                 viewModelScope.launch { setDjiFileUris(uris, persist = false) }
             } catch (_: Exception) {}
         } else {
-            saved?.let {
-                val uri = runCatching { Uri.parse(it) }.getOrNull() ?: return@let
-                _state.update { st -> st.copy(djiUri = uri, djiSource = "folder") }
-                // Phone storage is always there; a USB camera may not be plugged in, so it waits for Rescan.
-                if (uri.authority != com.gpic.android.data.upload.UriSource.MTP_AUTHORITY) scanDji(uri)
-            }
+            val folders = loadFolders(DJI_FOLDERS, legacy = "last_dji_uri")
+            if (folders.isEmpty()) return
+            _state.update { st -> st.copy(djiFolders = folders, djiSource = "folder") }
+            // Phone storage is always there; a USB camera may not be plugged in, so it waits for Rescan.
+            if (folders.none { it.uri.authority == com.gpic.android.data.upload.UriSource.MTP_AUTHORITY }) scanDjiFolders()
         }
+    }
+
+    /**
+     * Saved folder list: one "uri<TAB>label" per line, so launching never asks a camera's provider for names on the
+     * main thread. [legacy] is the single-folder key older versions wrote (its label is worked out without IPC).
+     */
+    private fun loadFolders(key: String, legacy: String): List<PickedFolder> {
+        val saved = prefs.getString(key, null)?.lines()?.filter { it.isNotBlank() }
+            ?: listOfNotNull(prefs.getString(legacy, null))
+        return saved.mapNotNull { line ->
+            val uri = runCatching { Uri.parse(line.substringBefore('\t')) }.getOrNull() ?: return@mapNotNull null
+            PickedFolder(uri, line.substringAfter('\t', "").ifEmpty { scanner.folderLabel(uri, query = false) })
+        }.distinctBy { it.uri }
+    }
+
+    private fun saveFolders(key: String, legacy: String, folders: List<PickedFolder>) {
+        prefs.edit().apply { if (folders.isEmpty()) remove(key) else putString(key, folders.joinToString("\n") { "${it.uri}\t${it.label}" }) }
+            .remove(legacy).apply()
+    }
+
+    /** Drops a folder's permission once neither tab lists it. */
+    private fun releaseUnused(uris: Collection<Uri>) {
+        val inUse = (_state.value.djiFolders + _state.value.cleanup.folders).mapTo(HashSet()) { it.uri }
+        uris.filter { it !in inUse }.forEach(scanner::releasePermission)
+    }
+
+    /** Adds a folder to [current] (subfolders count as covered when [recursive]); returns the list and a note. */
+    private fun addFolder(current: List<PickedFolder>, uri: Uri, recursive: Boolean, label: String): Pair<List<PickedFolder>, String?> {
+        val picked = PickedFolder(uri, label)
+        val r = com.gpic.android.data.dji.FolderSet.add(current, picked, recursive) { scanner.folderId(it.uri) }
+        val note = when {
+            r.coveredBy != null && r.coveredBy.uri == uri -> "${picked.label} is already in the list."
+            r.coveredBy != null -> "${picked.label} is inside ${r.coveredBy.label}, which is already in the list."
+            r.replaced.isNotEmpty() -> "Added ${picked.label}. It includes ${r.replaced.joinToString { it.label }}, so ${if (r.replaced.size == 1) "that was" else "those were"} taken off the list."
+            else -> null
+        }
+        return r.folders to note
     }
 
     fun refreshAuth() {
@@ -196,14 +238,29 @@ class HomeViewModel(
         _state.value = _state.value.copy(usbConnected = connected, usbStatus = summary)
     }
 
-    fun setDjiUri(uri: Uri) {
+    /** Adds a folder to the Phone / USB list (switching from picked files to folders) and rescans them all. */
+    fun addDjiFolder(uri: Uri) = viewModelScope.launch {
         scanner.takePersistablePermission(uri)
-        context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
-            .putString("last_dji_uri", uri.toString())
-            .remove("last_dji_files")
-            .apply()
-        _state.value = _state.value.copy(djiUri = uri, djiSource = "folder")
-        scanDji(uri)
+        // A camera folder's name is an IPC to its provider: not on the main thread.
+        val label = withContext(Dispatchers.IO) { scanner.folderLabel(uri) }
+        val current = if (_state.value.djiSource == "folder") _state.value.djiFolders else emptyList()
+        val (folders, note) = addFolder(current, uri, recursive = true, label = label)
+        prefs.edit().remove("last_dji_files").apply()
+        saveFolders(DJI_FOLDERS, "last_dji_uri", folders)
+        // Folders taken off the list, or the new one when it was already covered, give their permission back.
+        val dropped = (_state.value.djiFolders.map { it.uri } + uri) - folders.mapTo(HashSet()) { it.uri }
+        _state.update { it.copy(djiFolders = folders, djiSource = "folder") }
+        releaseUnused(dropped)
+        scanDjiFolders(note)
+    }
+
+    fun removeDjiFolder(uri: Uri) {
+        if (_state.value.uploadRunning) return
+        val folders = _state.value.djiFolders.filter { it.uri != uri }
+        saveFolders(DJI_FOLDERS, "last_dji_uri", folders)
+        _state.update { it.copy(djiFolders = folders) }
+        releaseUnused(listOf(uri))
+        if (folders.isEmpty()) clearSelection() else scanDjiFolders()
     }
 
     fun setDjiFileUris(picked: List<Uri>, persist: Boolean = true) {
@@ -212,13 +269,15 @@ class HomeViewModel(
         if (uris.isEmpty()) return
         uris.forEach { scanner.takePersistableFilePermission(it) }
         if (persist) {
-            context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
-                .putStringSet("last_dji_files", uris.map { it.toString() }.toSet())
-                .remove("last_dji_uri")
-                .apply()
+            prefs.edit().putStringSet("last_dji_files", uris.map { it.toString() }.toSet()).apply()
+            // Picked files replace the folder list.
+            val old = _state.value.djiFolders.map { it.uri }
+            saveFolders(DJI_FOLDERS, "last_dji_uri", emptyList())
+            _state.update { it.copy(djiFolders = emptyList()) }
+            releaseUnused(old)
         }
         viewModelScope.launch {
-            _state.value = _state.value.copy(isScanning = true, scanError = null, djiSource = "files", djiUri = null, scanNote = null)
+            _state.value = _state.value.copy(isScanning = true, scanError = null, djiSource = "files", scanNote = null)
             try {
                 // filesFromUris already returns smallest-first sorted
                 val files = com.gpic.android.util.Perf.log("pick ${uris.size} files") { scanner.filesFromUris(uris) }
@@ -237,19 +296,26 @@ class HomeViewModel(
     }
 
     fun clearSelection() {
-        context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit()
-            .remove("last_dji_uri").remove("last_dji_files").apply()
+        prefs.edit().remove("last_dji_files").apply()
+        saveFolders(DJI_FOLDERS, "last_dji_uri", emptyList())
+        val old = _state.value.djiFolders.map { it.uri }
         // Also the last run's counters, or the progress card keeps showing "601 / 0".
-        _state.value = _state.value.copy(djiUri = null, djiSource = "none", djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap(), scanNote = null,
+        _state.value = _state.value.copy(djiFolders = emptyList(), djiSource = "none", djiFiles = emptyList(), totalFiles = 0, totalBytes = 0, progressMap = emptyMap(), scanNote = null,
             completed = 0, failed = 0, skipped = 0, rejected = 0, relocated = 0, deleted = 0, notice = null)
+        releaseUnused(old)
     }
 
-    fun scanDji(uri: Uri) {
+    /** Scans every Phone / USB folder; [note] is what the last folder change did. */
+    private fun scanDjiFolders(note: String? = null) {
+        val folders = _state.value.djiFolders.map { it.uri }
+        if (folders.isEmpty()) return
         viewModelScope.launch {
             _state.value = _state.value.copy(isScanning = true, scanError = null)
             try {
                 val left = mutableListOf<String>()
-                val files = com.gpic.android.util.Perf.log("folder scan") { scanner.scanViaSaf(uri, left).sortedBy { it.sizeBytes } }
+                val unreadable = mutableListOf<Uri>()
+                val files = com.gpic.android.util.Perf.log("folder scan") { scanner.listTrees(folders, recursive = true, left, unreadable).sortedBy { it.sizeBytes } }
+                val lost = _state.value.djiFolders.filter { it.uri in unreadable }
                 _state.value = _state.value.copy(
                     djiFiles = files,
                     // A fresh list starts with no statuses (and the Upload button rather than Retry).
@@ -257,8 +323,17 @@ class HomeViewModel(
                     totalFiles = files.size,
                     totalBytes = files.sumOf { it.sizeBytes },
                     isScanning = false,
-                    scanNote = left.takeIf { it.isNotEmpty() }?.let { names ->
-                        "Left out ${names.distinct().joinToString { "“$it”" }}: Google Photos doesn't accept stickers."
+                    scanNote = listOfNotNull(
+                        note,
+                        lost.takeIf { it.isNotEmpty() }?.let { l -> "Can't read ${l.joinToString { it.label }} any more (removed, or access was revoked). Remove it and add it again." },
+                        left.takeIf { it.isNotEmpty() }?.let { names ->
+                            "Left out ${names.distinct().joinToString { "“$it”" }}: Google Photos doesn't accept stickers."
+                        },
+                    ).joinToString("\n").ifEmpty { null },
+                    scanError = when {
+                        lost.size == folders.size -> "Couldn't read the chosen folders"
+                        files.isEmpty() -> "No photos or videos in ${if (folders.size == 1) "this folder" else "these folders"}"
+                        else -> null
                     },
                 )
             } catch (e: Exception) {
@@ -268,7 +343,7 @@ class HomeViewModel(
     }
 
     fun rescan() {
-        if (_state.value.djiSource == "folder") _state.value.djiUri?.let { scanDji(it) }
+        if (_state.value.djiSource == "folder") scanDjiFolders()
     }
 
     fun selectSource(source: Source) {
@@ -304,26 +379,35 @@ class HomeViewModel(
     // ---- free up space ---------------------------------------------------------------------------
 
     private fun loadCleanupPrefs(): CleanupState {
-        val uri = prefs.getString("cleanup_uri", null)?.let(Uri::parse)
         val unit = runCatching { AgeUnit.valueOf(prefs.getString("cleanup_unit", null) ?: "") }.getOrDefault(AgeUnit.MONTHS)
         return CleanupState(
-            folderUri = uri,
-            folderName = uri?.let(::folderLabel),
+            folders = loadFolders(CLEANUP_FOLDERS, legacy = "cleanup_uri"),
             rule = AgeRule(prefs.getInt("cleanup_amount", 6).coerceIn(1, AgeRule.MAX_AMOUNT), unit),
             recursive = prefs.getBoolean("cleanup_recursive", true),
         )
     }
 
-    private fun folderLabel(tree: Uri): String =
-        runCatching { DocumentsContract.getTreeDocumentId(tree).substringAfter(':').ifEmpty { "Internal storage" } }
-            .getOrDefault(tree.lastPathSegment ?: "folder")
-
-    fun setCleanupFolder(uri: Uri) {
+    fun addCleanupFolder(uri: Uri) = viewModelScope.launch {
+        if (_state.value.uploadRunning) return@launch
         scanner.takePersistablePermission(uri)
-        prefs.edit().putString("cleanup_uri", uri.toString()).apply()
+        val label = withContext(Dispatchers.IO) { scanner.folderLabel(uri) }
+        val (folders, note) = addFolder(_state.value.cleanup.folders, uri, _state.value.cleanup.recursive, label)
+        val dropped = (_state.value.cleanup.folders.map { it.uri } + uri) - folders.mapTo(HashSet()) { it.uri }
+        saveFolders(CLEANUP_FOLDERS, "cleanup_uri", folders)
         cleanupAll = emptyList()
-        _state.update { it.copy(cleanup = it.cleanup.copy(folderUri = uri, folderName = folderLabel(uri))) }
-        scanCleanup()
+        setCleanup { it.copy(folders = folders) }
+        releaseUnused(dropped)
+        scanCleanup(note)
+    }
+
+    fun removeCleanupFolder(uri: Uri) {
+        if (_state.value.uploadRunning) return
+        val folders = _state.value.cleanup.folders.filter { it.uri != uri }
+        saveFolders(CLEANUP_FOLDERS, "cleanup_uri", folders)
+        cleanupAll = emptyList()
+        setCleanup { it.copy(folders = folders, note = null, error = null, inFolder = 0) }
+        releaseUnused(listOf(uri))
+        if (folders.isEmpty()) { cleanupJob?.cancel(); setCleanup { it.copy(progress = null) }; setList(emptyList()) } else scanCleanup()
     }
 
     fun setCleanupRule(rule: AgeRule) {
@@ -340,31 +424,37 @@ class HomeViewModel(
         scanCleanup()
     }
 
-    /** List the folder, then apply the age filter. */
-    fun scanCleanup() {
+    /** List the folders, then apply the age filter. [note] is what the last folder change did. */
+    fun scanCleanup(note: String? = null) {
         if (_state.value.uploadRunning) return
-        val folder = _state.value.cleanup.folderUri ?: return
+        val picked = _state.value.cleanup.folders
+        if (picked.isEmpty()) return
         val recursive = _state.value.cleanup.recursive
         cleanupJob?.cancel()
         cleanupJob = viewModelScope.launch {
-            setCleanup { it.copy(progress = "Listing ${it.folderName ?: "folder"}…", error = null) }
+            setCleanup { it.copy(progress = "Listing ${it.folderNames}…", error = null, note = note) }
             try {
-                cleanupAll = com.gpic.android.util.Perf.log("cleanup scan") { scanner.listTree(folder, recursive) }
-                setCleanup { it.copy(inFolder = cleanupAll.size) }
+                val unreadable = mutableListOf<Uri>()
+                cleanupAll = com.gpic.android.util.Perf.log("cleanup scan") { scanner.listTrees(picked.map { it.uri }, recursive, unreadable = unreadable) }
+                val lost = picked.filter { it.uri in unreadable }
+                if (lost.size == picked.size) throw SecurityException("no folder readable")
+                setCleanup { it.copy(inFolder = cleanupAll.size, note = listOfNotNull(note, lost.takeIf { l -> l.isNotEmpty() }?.let { l ->
+                    "Can't read ${l.joinToString { f -> f.label }} any more (removed, or access was revoked). Remove it and add it again."
+                }).joinToString("\n").ifEmpty { null }) }
                 applyAgeFilter()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.w("HomeViewModel", "cleanup scan failed", e)
                 cleanupAll = emptyList()
-                setCleanup { it.copy(progress = null, inFolder = 0, error = if (e is SecurityException) "Lost access to the folder. Choose it again." else "Couldn't read the folder: ${e.message}") }
+                setCleanup { it.copy(progress = null, inFolder = 0, error = if (e is SecurityException) "Lost access to ${if (picked.size == 1) "the folder" else "the folders"}. Remove and add ${if (picked.size == 1) "it" else "them"} again." else "Couldn't read the folder: ${e.message}") }
                 setList(emptyList())
             }
         }
     }
 
     private fun filterCleanup() {
-        if (_state.value.uploadRunning || _state.value.cleanup.folderUri == null) return
+        if (_state.value.uploadRunning || _state.value.cleanup.folders.isEmpty()) return
         cleanupJob?.cancel()
         cleanupJob = viewModelScope.launch { applyAgeFilter() }
     }
@@ -669,6 +759,8 @@ class HomeViewModel(
 
     companion object {
         private const val FREE_SPACE_MARGIN = 200L * 1024 * 1024
+        private const val DJI_FOLDERS = "dji_folders"
+        private const val CLEANUP_FOLDERS = "cleanup_folders"
     }
 }
 

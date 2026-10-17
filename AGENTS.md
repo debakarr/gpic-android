@@ -78,16 +78,20 @@ app/src/main/
     data/
       api/      GooglePhotosApi.kt (internal Photos API port), Retry.kt
       auth/     AuthManager.kt (master-token exchange), CredentialStore.kt, GoogleAccountLinker.kt (stub)
-      dji/      DjiScanner.kt (SAF tree + multi-file pick), DjiFile.kt, UsbReceiver.kt
+      dji/      DjiScanner.kt (SAF trees + multi-file pick), FolderSet.kt (several folders: nesting, dedupe; pure), DjiFile.kt, UsbReceiver.kt
       progress/ FileProgress.kt (UploadStatus + ProgressTracker.snapshot())
       stats/    SystemStatsCollector.kt (/proc/stat + TrafficStats), SystemStats.kt
       upload/   UploadManager.kt (one pipeline over MediaSource: hash→dedup→resume→stream→commit), MediaSource.kt, OriginalMedia.kt (unredacted GPS)
       cache/    UploadCache.kt (resume ids) + UploadHistory.kt (name+size → media key, for single-pass sources)
                 + CheckedCache.kt (files confirmed in the library: key+size+mtime → media key, 30 days)
       cleanup/  AgeRule.kt (free-up-space age cutoff, EXIF date parsing; pure, unit-tested)
-    editor/     EditPlan.kt (the edit model + Claude JSON schema; pure), CubeLut.kt (.cube parser, built-in look; pure),
-                LutStore.kt, VideoProbe.kt (metadata, frames, flat-footage guess), VideoExporter.kt (Media3 Transformer),
-                ClaudeEditPlanner.kt (Anthropic SDK, structured output → EditPlan)
+    editor/     EditPlan.kt (parts/texts/music/canvas model + JSON; pure), Timeline.kt (output time ↔ part/clip time,
+                split/trim/move/snap-to-beats; pure), Look.kt (filters + Adjust baked into one 3D LUT; pure),
+                Beats.kt (on-phone beat tracking; detect() pure), AutoEdit.kt (Quick edit styles; pure),
+                CubeLut.kt (.cube parser; pure), LutStore.kt, VideoProbe.kt (metadata, frames, thumbnails, photos),
+                VideoExporter.kt (CompositionBuilder shared by preview + export, effects, Transformer, Encoders),
+                TextRender.kt (text/sticker bitmaps + animation maths), AudioFx.kt (fades/gain), Openverse.kt (CC music),
+                ProjectStore.kt (drafts), ClaudeEditPlanner.kt (Anthropic SDK, strict schema → EditPlan)
     camera/     CameraLink.kt (BLE pair → camera WiFi → DUML list), CameraTransfer.kt (self-resuming HTTP stream, stager)
       osmosis/  vendored KonradIT/osmosis protocol code (MIT, see NOTICE.md); only change: CameraNet socket binding
     ui/
@@ -98,7 +102,8 @@ app/src/main/
         auth/     AuthScreen.kt (paste master-token string, service validation)
         settings/ SettingsScreen.kt (threads, force, saver/quota, delete-after)
         albums/   AlbumsScreen.kt + AlbumsViewModel (suggestions, multi-select "Create N albums")
-        editor/   EditorScreen.kt + EditorViewModel (preview via ExoPlayer.setVideoEffects, export, Ask Claude)
+        editor/   EditorScreen.kt (projects, workspace, toolbar, text layer), EditorTimeline.kt, EditorPanels.kt,
+                  EditorViewModel (undo/redo, selection, music, Quick edit, Claude, export)
     upload/ UploadService.kt (foreground service)
     util/   Format.kt, Constants.kt
   proto/ AddMediaToAlbum|CommitToken|CommitUpload|CommitUploadResponse|CreateAlbum|CreateAlbumResponse|GetUploadToken|HashCheck|RemoteMatches.proto
@@ -144,8 +149,17 @@ the permission granted a known-stripped photo fails ("Retry") instead of uploadi
 Videos and non-JPEG photos (stream EXIF may read nothing) can't be checked: never deleted without the original. Google Photos does show EXIF GPS for GPic
 uploads (checked on a cloud-only test item).
 
+### Several folders (Phone / USB and Free up space)
+Both tabs keep a list of SAF trees (`dji_folders` / `cleanup_folders` in `gpic_prefs`, one Uri per line; the old
+single-folder keys migrate once). `FolderSet` (pure, tested): a folder inside one already listed adds nothing
+(when subfolders are scanned) and adding a parent drops its listed subfolders, with a note; phone-storage tree ids
+are paths so this is seen up front, MTP ids are opaque so `DjiScanner.listTrees` also dedupes files by
+authority + document id (no double upload or double delete). A folder that lost its permission is skipped with a
+note. Removing a folder releases its persisted permission unless the other tab still lists it. `DjiFile.group` is
+the folder label: per-folder counts on the list and in the delete confirmation.
+
 ### Free up space (Home tab)
-SAF tree folder (`DjiScanner.listTree`, one query per folder, hidden entries skipped) → files whose
+SAF tree folders (`DjiScanner.listTrees`, one query per folder, hidden entries skipped) → files whose
 taken time (earlier of EXIF DateTimeOriginal and mtime; `data/cleanup/AgeRule.kt`, EXIF read only when
 mtime alone isn't old enough) is before `AgeRule` (days/weeks/months/years, calendar maths, min 1) →
 confirm dialog → upload with delete-after forced on (exact-hash skips delete too). Folder/age/subfolder
@@ -195,26 +209,50 @@ accepted random bytes named .webp (so the sniff matters) and a 1×1 animated Web
 refused at commit (no media key) → `RejectedByPhotosException` → REJECTED too. REJECTED is final (not in Retry, never
 deleted) and remembered in `CheckedCache` (`REJECTED` marker) so re-runs don't resend it.
 
-### Video editor (film icon on Home)
-`EditPlan` is the single model: the controls edit it and Claude returns one (strict JSON schema, `explanation` +
-every field; `sanitized()` clamps it). Export = Media3 `Composition`: one clipped `EditedMediaItem` per kept segment
-(speed via `setSpeed`, camera volume via `ChannelMixingAudioProcessor`, video effects LUT → brightness/contrast/HSL →
-rotate → `Presentation` crop/resize), plus a looping music sequence; HDR is tone-mapped to SDR; H.264/AAC into
-`Movies/GPic` via MediaStore. `SingleColorLut.createFromCube` indexes `[r][g][b]` (checked in the shader:
-row = r·N + g, column = b). DJI's D-Log M → Rec.709 LUT isn't bundled (DJI's download); importing it into the
-`dji_dlogm_rec709` slot makes it the default, and a flat-looking `DJI_*` clip opens with it on. Ask Claude:
-`claude-opus-5-5`, effort medium, `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`), refusal and
-max_tokens handled; metadata + plan + request, frames (12 × 512 px) only when ticked. Key in the encrypted prefs.
+### Video editor (film icon on Home) — CapCut/LightCut-style
+Layout taken from LightCut 4.107 / CapCut 19.8 resources (strings + layout trees via aapt2; no code or assets
+copied): projects list → workspace = preview, transport (time, play, undo/redo), timeline (ruler, filmstrip main
+track with "Sound on" toggle, text/sticker rows, music lane with waveform + beat dots, fixed centre playhead; drag
+to scrub with fling, pinch to zoom), bottom tool row that switches with the selection, panels with ✕ / Apply to
+all / ✓. Always dark (`EditorColors`).
 
-Multi-clip (1.5.0): `Segment.clip` indexes the editor's clip list; `EditPlan.parts()` spells out "every clip in
-full"; `sanitized(durations)` keeps montage order across clips. Export fits every part to one frame
-(`EditEffects.outputFrame`: first clip's shape or the chosen aspect, short side ≤ 1080); Media3 may encode sideways
-with a 90° rotation flag (checked: portrait output plays portrait). `FadeThroughBlack` is a time-varying `RgbMatrix`
-that counts from the first frame it sees (export only; the preview has no fades). Quick edit = `VideoProbe.motionScores`
-(≤ 120 tiny frames a clip: frame difference + colourfulness) → `AutoEdit.pick` (pure, tested) → `EditStyle` look.
-"From Google Photos" = `ACTION_GET_CONTENT video/*` aimed at the installed Photos package (needs `<queries>`; on the
-Redmi it opens Morphe Photos' `ExternalPickerActivity`); non-local picks are copied to cache/editor-clips.
-Claude gets every clip's metadata and up to 24 frames shared across clips.
+Model: `EditPlan.segments` are the main-track parts, each with clip range, speed or `SpeedCurve` (24 constant steps;
+`Timeline` maths matches Media3: a curved part ended at exactly the computed output time), volume, own `Look` or the
+video's, `Motion` (Ken Burns), rotation/mirror and the `Transition` into the next part (effects on both sides of
+the cut, inside the parts, so length never changes). Plus `texts` (titles + emoji stickers, output time, animated),
+`music` (`MusicTrack`: file, credit, length, volume, start, fades, beats), aspect, `Canvas` (crop / black / blur),
+export size + fps. Projects autosave to filesDir/projects/<id> (Google Photos picks and extracted audio copied into
+the project; SAF picks keep a persisted grant). Undo/redo = stacks of plans (`commit()` is one step).
+
+Rendering: `CompositionBuilder` builds one `Composition` for the preview (`CompositionPlayer`, short side 480,
+text drawn by Compose from the same `TextRender` bitmaps so it can be dragged) and the export (text as a
+composition-level `OverlayEffect`). Per-part chain: baked look LUT → rotate/mirror → fit (crop / letterbox /
+blur: fit to the picture's size, then `GaussianBlurWithFrameOverlaid`, which GROWS the output by 1/scale, then pin
+w×h) → `PartMotion` matrix (motion + moving transitions) → blur transition → `EdgeShade` RgbMatrix → vignette
+overlay. Measured on the Redmi: effects get composition time (part i starts at `Timeline.starts()[i]`) in both
+`CompositionPlayer` and Transformer, with speed applied (`PartClock`). Gotchas: every `EditedMediaItem` needs
+`setDurationUs` (whole media length) or `CompositionPlayer` throws; the music sequence must be declared audio-only
+(`EditedMediaItemSequence.Builder(setOf(TRACK_TYPE_AUDIO))`, and then no `experimentalSetForceAudioTrack`) or the
+preview zooms; `PlayerView` must use RESIZE_MODE_FILL inside a box of the output's shape; after the preview resizes,
+`experimentalRedrawLastFrame()`. Camera sound is upmixed to stereo so music stays stereo. Music repeats to cover
+the video (no looping sequence) with fades on the first/last piece. Export: H.264 at ~0.1 bit/px/frame
+(`Encoders`), sizes limited to what the AVC encoder supports. 22 s at 720p ≈ 30 s on the Redmi; blurred canvas
+≈ 5× real time.
+
+Colour: `Look` = camera LUT (DJI D-Log M slot or imported .cube; DJI's isn't bundled) → `Filter` preset (GPic's own
+functions, strength) → Adjust sliders, baked by `LookMath.bake` into one 33³ cube per distinct look
+(`SingleColorLut.createFromCube` indexes `[r][g][b]`). Filter thumbnails run the same maths on a 96 px frame.
+Music: `Openverse` (anonymous: 20/min, 200/day per phone → search only on submit, 24 h cache; license
+commercial+modification, ND/NC dropped again; download sniffed by bytes; credit kept beside the file), phone audio,
+or a clip's own sound. Beats: `Beats.decodeMono` (11 kHz mono) → spectral flux → autocorrelation tempo (60–180,
+weighted to 120) → fractional period/phase comb → snap to onsets (tested on click tracks: < 40 ms). Pace
+Fast/Normal/Chillout = every 1/2/4 beats; "Cut on beats" = `Timeline.snapToBeats`. Quick edit cuts are a whole
+number of beats (`AutoEdit.beatCutMs`) and the song starts on a beat.
+Ask Claude: `claude-opus-5-5`, effort medium, `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`);
+schema in `ClaudeEditPlanner.schema` (strict, tested); it sees clip metadata, the plan, the song's beats in output
+time, and up to 24 frames only when ticked. Key in the encrypted prefs.
+Not done: reverse, keyframes, chroma key, voice-over, auto captions, stabilisation, true cross-dissolve (two
+overlapping sequences; too heavy for old phones).
 
 ### Album suggestions (Albums screen, top-bar icon)
 `MediaIndex` (filesDir JSON, singleton) records media key + EXIF capture time/GPS + local Uri for every

@@ -28,15 +28,30 @@ class AutoEditTest {
 
     @Test fun shortClipsAreUsedWholeAndTinyTargetsKeepTheBestClip() {
         val whole = AutoEdit.pick(listOf(clip(1)), EditStyle.CINEMATIC, 15_000)
-        assertEquals(listOf(Segment(0, 1_000, 0)), whole)
+        assertEquals(listOf(Triple(0, 0L, 1_000L)), whole.map { Triple(it.clip, it.startMs, it.endMs) })
         val one = AutoEdit.pick(listOf(clip(30), clip(30, peakAt = 10)), EditStyle.CINEMATIC, 4_000)
         assertEquals(listOf(1), one.map { it.clip })
     }
 
-    @Test fun styleSetsTheLook() {
-        val p = AutoEdit.plan(EditPlan(), listOf(Segment(0, 2_000, 0)), EditStyle.REEL, hasMusic = true)
+    @Test fun beatCutsAreWholeBeats() {
+        // 120 BPM = 500 ms a beat: Action's 1.5 s becomes 3 beats; Travel's 3 s becomes 6.
+        assertEquals(1_500, AutoEdit.beatCutMs(EditStyle.ACTION, 120f))
+        assertEquals(3_000, AutoEdit.beatCutMs(EditStyle.TRAVEL, 120f))
+        // 100 BPM = 600 ms: 1.5 s rounds to 2 or 3 beats, either way a multiple of 600.
+        assertEquals(0, AutoEdit.beatCutMs(EditStyle.ACTION, 100f) % 600)
+        assertEquals(EditStyle.REEL.cutMs, AutoEdit.beatCutMs(EditStyle.REEL, 0f))
+    }
+
+    @Test fun styleSetsLookTransitionsAndMix() {
+        val music = MusicTrack("u", "song", beatsMs = listOf(300, 800, 1300), startMs = 0)
+        val parts = listOf(Segment(0, 2_000, 0), Segment(0, 2_000, 1))
+        val p = AutoEdit.plan(EditPlan(music = music), parts, EditStyle.REEL)
         assertEquals(Aspect.VERTICAL, p.aspect)
+        assertEquals(Canvas.BLUR, p.canvas)
+        assertEquals(Filter.VIVID, p.look.filter)
+        assertEquals(listOf(EditStyle.REEL.transition, Transition.NONE), p.segments.map { it.transition })
         assertEquals(EditStyle.REEL.cameraVolume, p.originalVolume)
-        assertEquals(1f, AutoEdit.plan(EditPlan(), emptyList(), EditStyle.REEL, hasMusic = false).originalVolume)
+        assertEquals(300L, p.music!!.startMs) // starts on the first beat
+        assertEquals(1f, AutoEdit.plan(EditPlan(), parts, EditStyle.REEL).originalVolume)
     }
 }

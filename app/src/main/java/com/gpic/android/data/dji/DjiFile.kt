@@ -16,6 +16,8 @@ data class DjiFile(
     val cameraStorage: Int = 0,
     /** Capture time when known (EXIF or modified time, whichever is earlier); 0 = not computed. */
     val takenMs: Long = 0,
+    /** The picked folder it was found in (several folders can be scanned together); null for single picks. */
+    val group: String? = null,
     val extension: String = displayName.substringAfterLast('.', "").lowercase(),
     val isVideo: Boolean = extension in videoExtensions,
     val isPhoto: Boolean = extension in photoExtensions,

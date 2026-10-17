@@ -115,6 +115,63 @@ class DjiScanner(private val context: Context) {
         out
     }
 
+    /**
+     * Every supported file in several picked folders. A file reached through two overlapping folders (a folder
+     * and its subfolder, which a USB camera's opaque ids can't reveal up front) is listed once. A folder GPic
+     * lost access to is skipped and reported in [unreadable] instead of failing the rest.
+     */
+    suspend fun listTrees(
+        trees: List<Uri>,
+        recursive: Boolean,
+        skipped: MutableList<String>? = null,
+        unreadable: MutableList<Uri>? = null,
+    ): List<DjiFile> {
+        val all = mutableListOf<DjiFile>()
+        for (tree in trees) {
+            val label = folderLabel(tree)
+            try {
+                listTree(tree, recursive, skipped).mapTo(all) { it.copy(group = label) }
+            } catch (e: SecurityException) {
+                android.util.Log.w("DjiScanner", "no access to $label: ${e.message}")
+                unreadable?.add(tree)
+            } catch (e: IllegalArgumentException) {
+                // A folder that was deleted or renamed: its tree id no longer resolves.
+                android.util.Log.w("DjiScanner", "can't list $label: ${e.message}")
+                unreadable?.add(tree)
+            }
+        }
+        return FolderSet.dedupe(all) { f -> f.uri?.let { "${it.authority}|${runCatching { DocumentsContract.getDocumentId(it) }.getOrDefault(it.toString())}" } ?: f.key }
+    }
+
+    fun folderId(tree: Uri): FolderSet.Folder =
+        FolderSet.Folder(tree.authority ?: "", runCatching { DocumentsContract.getTreeDocumentId(tree) }.getOrDefault(tree.toString()))
+
+    /**
+     * "DCIM/Camera", "Internal storage", or the camera folder's own name (MTP ids aren't paths, so that one asks
+     * the provider: call it off the main thread, or pass [query] = false for a placeholder).
+     */
+    fun folderLabel(tree: Uri, query: Boolean = true): String {
+        val id = runCatching { DocumentsContract.getTreeDocumentId(tree) }.getOrNull() ?: return tree.lastPathSegment ?: "folder"
+        if (':' in id) return id.substringAfter(':').ifEmpty { "Internal storage" }
+        if (!query) return "Camera folder"
+        return runCatching {
+            val doc = DocumentsContract.buildDocumentUriUsingTree(tree, id)
+            context.contentResolver.query(doc, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)
+                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        }.getOrNull() ?: id
+    }
+
+    /** Gives up a folder's saved permission (when no tab uses it any more). */
+    fun releasePermission(uri: Uri) {
+        runCatching {
+            context.contentResolver.releasePersistableUriPermission(
+                uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        }.onFailure {
+            runCatching { context.contentResolver.releasePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        }
+    }
+
     private fun isStickerFolder(name: String) = name.contains("sticker", ignoreCase = true)
 
     /** A photo's EXIF capture time (header only), or null for videos / no date / unreadable. */
