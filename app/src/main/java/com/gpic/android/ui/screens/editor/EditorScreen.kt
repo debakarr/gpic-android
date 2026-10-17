@@ -250,7 +250,8 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
         onDispose { player.removeListener(l); player.release() }
     }
     LaunchedEffect(built) {
-        val b = built ?: return@LaunchedEffect
+        // No composition (edit copies being made): release the decoder for them.
+        val b = built ?: return@LaunchedEffect run { runCatching { player.stop() } }
         posMs = posMs.coerceIn(0, (b.durationMs - 1).coerceAtLeast(0))
         runCatching {
             player.setComposition(b.composition, posMs)
@@ -329,6 +330,18 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
                     )
                     TextLayer(state, posMs, vm)
                 }
+                }
+                state.preparing?.let { msg ->
+                    Column(
+                        Modifier.align(Alignment.Center).padding(24.dp).background(Color(0xE617191E), RoundedCornerShape(12.dp)).padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        CircularProgressIndicator(color = EditorColors.Accent)
+                        Text(msg, color = Color.White, style = MaterialTheme.typography.bodyMedium)
+                        Text("A small copy makes the preview smooth on big clips. The export still uses the full-quality original.",
+                            color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = vm::skipProxies) { Text("Skip (edit the originals)") }
+                    }
                 }
                 if (state.loading != null) Text(state.loading, Modifier.align(Alignment.TopCenter).padding(8.dp).background(Color(0xAA000000), RoundedCornerShape(6.dp)).padding(6.dp), color = Color.White)
             }

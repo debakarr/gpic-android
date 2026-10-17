@@ -68,6 +68,8 @@ data class EditorUiState(
     val clips: List<VideoInfo> = emptyList(),
     /** "Copying 2 of 3 from Google Photos…" etc. while clips are being added. */
     val loading: String? = null,
+    /** "Making an edit copy of DJI_0012.MP4 · 40%" while proxies are made. */
+    val preparing: String? = null,
     val plan: EditPlan = EditPlan(),
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
@@ -151,13 +153,14 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         }
         viewModelScope.launch(Dispatchers.Default) { val m = Encoders.maxShortSide(); _state.update { it.copy(maxShortSide = m) } }
         viewModelScope.launch {
-            _state.map { st -> Triple(st.clips, st.plan.copy(texts = emptyList(), maxHeight = 0, fps = 0), st.luts.size) }
+            _state.map { st -> Triple(st.clips, st.plan.copy(texts = emptyList(), maxHeight = 0, fps = 0), st.luts.size to (st.preparing != null)) }
                 .distinctUntilChanged()
                 .debounce(120)
-                .collect { (clips, plan, _) ->
-                    if (clips.isEmpty()) { _preview.value = null; return@collect }
+                .collect { (clips, plan, extra) ->
+                    // No preview while edit copies are made: old phones can't decode twice at once.
+                    if (clips.isEmpty() || extra.second) { _preview.value = null; return@collect }
                     _preview.value = withContext(Dispatchers.Default) {
-                        runCatching { previewBuilder.build(clips, plan, PREVIEW_SHORT_SIDE, withText = false) }
+                        runCatching { previewBuilder.build(clips, plan, PREVIEW_SHORT_SIDE, withText = false, useProxies = true) }
                             .onFailure { Log.w(TAG, "preview build failed", it) }.getOrNull()
                     }
                 }
@@ -177,6 +180,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
 
     /** Back to the project list (the current edit is already saved). */
     fun closeProject() {
+        proxyJob?.cancel()
         saveNow()
         thumbJob?.cancel()
         undo.clear(); redo.clear()
@@ -197,9 +201,10 @@ class EditorViewModel(private val context: Context, private val store: Credentia
             val (clips, missing) = withContext(Dispatchers.IO) {
                 val ok = mutableListOf<VideoInfo>()
                 var bad = 0
-                for ((uri, name) in p.clips) {
-                    runCatching { VideoProbe.probe(context, uri).copy(name = name.ifEmpty { uri.lastPathSegment ?: "clip" }) }
-                        .onSuccess { ok += it }.onFailure { bad++ }
+                for (c in p.clips) {
+                    runCatching {
+                        VideoProbe.probe(context, c.uri).copy(name = c.name.ifEmpty { c.uri.lastPathSegment ?: "clip" }, proxy = c.proxy, proxyDurationMs = c.proxyMs)
+                    }.onSuccess { ok += it }.onFailure { bad++ }
                 }
                 ok to bad
             }
@@ -210,18 +215,64 @@ class EditorViewModel(private val context: Context, private val store: Credentia
             undo.clear(); redo.clear()
             _state.update {
                 it.copy(projectId = id, projectName = p.name, clips = clips, loading = null, selection = Selection.None, panel = null,
+                    preparing = if (clips.any { c -> c.proxy == null && com.gpic.android.editor.Proxies.needed(c) }) "Preparing edit copies…" else null,
                     plan = p.plan.sanitized(clips.map { c -> c.durationMs }, it.luts.mapTo(HashSet()) { l -> l.id }),
                     canUndo = false, canRedo = false, exported = null, exportedCredits = null)
             }
-            loadThumbs()
             _state.value.plan.music?.let { loadWaveform(Uri.parse(it.uri)) }
+            ensureProxies()
         }
+    }
+
+    private var proxyJob: Job? = null
+
+    /**
+     * Makes the missing edit copies, one clip at a time (old phones have few hardware decoders, so nothing else
+     * decodes meanwhile: the workspace waits behind a progress screen that can be skipped). Thumbnails follow.
+     */
+    fun ensureProxies() {
+        val id = _state.value.projectId ?: return
+        if (proxyJob?.isActive == true) return
+        proxyJob = viewModelScope.launch {
+            val todo = _state.value.clips.withIndex().filter { (_, c) -> c.proxy == null && com.gpic.android.editor.Proxies.needed(c) }
+            for ((n, ic) in todo.withIndex()) {
+                val (i, c) = ic
+                _state.update { it.copy(preparing = "Making an edit copy of ${c.name} (${n + 1} of ${todo.size})…") }
+                val dir = File(projects.mediaDir(id), "proxies").apply { mkdirs() }
+                val out = File(dir, "${System.nanoTime()}.mp4")
+                val r = runCatching {
+                    com.gpic.android.editor.Proxies.make(context, c, out) { p ->
+                        _state.update { it.copy(preparing = "Making an edit copy of ${c.name} (${n + 1} of ${todo.size}) · $p%") }
+                    }
+                }
+                if (r.isFailure) {
+                    if (r.exceptionOrNull() is kotlinx.coroutines.CancellationException) break
+                    Log.w(TAG, "edit copy failed for ${c.name}; editing the original", r.exceptionOrNull())
+                    continue
+                }
+                val proxyUri = r.getOrThrow()
+                val ms = withContext(Dispatchers.IO) { probeDuration(proxyUri) }
+                _state.update { st -> st.copy(clips = st.clips.mapIndexed { k, v -> if (k == i && v.uri == c.uri) v.copy(proxy = proxyUri, proxyDurationMs = ms) else v }) }
+                Log.i(TAG, "edit copy of ${c.name}: ${out.length() / 1024} KB, ${ms} ms (original ${c.durationMs} ms)")
+            }
+            _state.update { it.copy(preparing = null) }
+            withContext(Dispatchers.IO) { saveNow() }
+            _thumbs.value = emptyMap()
+            loadThumbs()
+        }
+    }
+
+    /** Skip the edit copies still to be made (the originals are edited directly). */
+    fun skipProxies() {
+        proxyJob?.cancel()
+        _state.update { it.copy(preparing = null) }
+        loadThumbs()
     }
 
     fun deleteProject(id: String) {
         // Give back read grants on picked clips no other project uses (the project's own copies go with it).
-        val mine = projects.load(id)?.clips?.map { it.first }.orEmpty()
-        val others = projects.list().filter { it.id != id }.flatMap { p -> projects.load(p.id)?.clips?.map { it.first }.orEmpty() }.toSet()
+        val mine = projects.load(id)?.clips?.map { it.uri }.orEmpty()
+        val others = projects.list().filter { it.id != id }.flatMap { p -> projects.load(p.id)?.clips?.map { it.uri }.orEmpty() }.toSet()
         mine.filter { it.scheme == "content" && it !in others }.forEach { u ->
             runCatching { context.contentResolver.releasePersistableUriPermission(u, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
         }
@@ -297,6 +348,8 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                     projectId = id,
                     projectName = if (replace || st.projectName.isEmpty()) defaultName(clips) else st.projectName,
                     clips = clips, loading = null, plan = plan, selection = Selection.None, panel = null,
+                    // Set together with the clips, so the preview doesn't start decoding first.
+                    preparing = if (clips.any { it.proxy == null && com.gpic.android.editor.Proxies.needed(it) }) "Preparing edit copies…" else null,
                     canUndo = undo.isNotEmpty(), canRedo = false,
                     message = when {
                         failed > 0 -> "Couldn't use ${plural(failed, "clip")} (unreadable, or shorter than a second)"
@@ -311,7 +364,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 VideoProbe.thumbnail(context, _state.value.clips.first(), 1000, 320)?.let { projects.saveCover(id, it) }
             }
             refreshProjects()
-            loadThumbs()
+            if (_state.value.clips.any { it.proxy == null && com.gpic.android.editor.Proxies.needed(it) }) ensureProxies() else loadThumbs()
         }
     }
 
@@ -378,7 +431,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 }
                 val r = android.media.MediaMetadataRetriever()
                 try {
-                    r.setDataSource(context, c.uri)
+                    r.setDataSource(context, c.editUri)
                     for (k in 0 until n) {
                         val t = (k * thumbStepMs(c) + thumbStepMs(c) / 2).coerceAtMost(c.durationMs - 1)
                         list[k] = runCatching {
@@ -664,7 +717,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 st.clips.mapIndexed { i, v ->
                     if (v.isImage) return@mapIndexed ClipScores(VideoProbe.IMAGE_DEFAULT_MS, VideoProbe.IMAGE_DEFAULT_MS, FloatArray(1) { 0.6f })
                     runCatching {
-                        VideoProbe.motionScores(context, v.uri, v.durationMs) { done, total ->
+                        VideoProbe.motionScores(context, v.editUri, v.durationMs) { done, total ->
                             val pct = ((i + done.toFloat() / total) * 100 / st.clips.size).toInt()
                             _state.update { it.copy(autoProgress = "Finding the best moments… $pct%") }
                         }
@@ -726,7 +779,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                             if (v.isImage) listOfNotNull(VideoProbe.thumbnail(context, v, 0, 512)?.let { b ->
                                 Frame(0, java.io.ByteArrayOutputStream().also { b.compress(Bitmap.CompressFormat.JPEG, 80, it) }.toByteArray(), i)
                             })
-                            else VideoProbe.frames(context, v.uri, v.durationMs, per[i], clip = i)
+                            else VideoProbe.frames(context, v.editUri, v.durationMs, per[i], clip = i)
                         }
                     }
                     ClaudeEditPlanner(key).plan(st.request, st.clips, Timeline.materialize(st.plan, st.durations), st.luts, frames)

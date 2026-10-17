@@ -28,7 +28,10 @@ class ProjectStore(private val context: Context) {
             .put("name", name)
             .put("updated", System.currentTimeMillis())
             .put("duration_ms", durationMs)
-            .put("clips", JSONArray(clips.map { c -> JSONObject().put("uri", c.uri.toString()).put("name", c.name).put("image", c.isImage) }))
+            .put("clips", JSONArray(clips.map { c ->
+                JSONObject().put("uri", c.uri.toString()).put("name", c.name).put("image", c.isImage)
+                    .put("proxy", c.proxy?.toString() ?: JSONObject.NULL).put("proxy_ms", c.proxyDurationMs)
+            }))
             .put("plan", plan.toJson())
         val tmp = File(dir, "project.json.tmp")
         tmp.writeText(o.toString())
@@ -39,11 +42,21 @@ class ProjectStore(private val context: Context) {
         runCatching { File(File(root, id).apply { mkdirs() }, "cover.jpg").outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 80, it) } }
     }
 
-    class Loaded(val id: String, val name: String, val clips: List<Pair<Uri, String>>, val plan: EditPlan)
+    class LoadedClip(val uri: Uri, val name: String, val proxy: Uri?, val proxyMs: Long)
+    class Loaded(val id: String, val name: String, val clips: List<LoadedClip>, val plan: EditPlan)
 
     fun load(id: String): Loaded? = runCatching {
         val o = JSONObject(File(File(root, id), "project.json").readText())
-        val clips = o.getJSONArray("clips").let { a -> (0 until a.length()).map { a.getJSONObject(it).let { c -> Uri.parse(c.getString("uri")) to c.optString("name") } } }
+        val clips = o.getJSONArray("clips").let { a ->
+            (0 until a.length()).map {
+                a.getJSONObject(it).let { c ->
+                    // An edit copy that was deleted (or never finished) is simply remade.
+                    val proxy = c.optString("proxy").takeIf { p -> p.isNotEmpty() && p != "null" }?.let(Uri::parse)
+                        ?.takeIf { p -> p.path?.let { path -> File(path).exists() } == true }
+                    LoadedClip(Uri.parse(c.getString("uri")), c.optString("name"), proxy, c.optLong("proxy_ms"))
+                }
+            }
+        }
         Loaded(id, o.optString("name"), clips, EditPlan.fromJson(o.getJSONObject("plan")))
     }.getOrNull()
 

@@ -74,7 +74,7 @@ class CompositionBuilder(private val luts: LutStore) {
     /**
      * [shortSideCap] limits the frame (the preview uses a small one); [withText] adds the text overlays (export).
      */
-    fun build(clips: List<VideoInfo>, plan: EditPlan, shortSideCap: Int, withText: Boolean): Output {
+    fun build(clips: List<VideoInfo>, plan: EditPlan, shortSideCap: Int, withText: Boolean, useProxies: Boolean = false): Output {
         val parts = plan.parts(clips.map { it.durationMs })
         require(parts.isNotEmpty()) { "Nothing to play" }
         val (w, h) = outputFrame(plan, clips, parts, shortSideCap)
@@ -84,11 +84,16 @@ class CompositionBuilder(private val luts: LutStore) {
         val anyCameraAudio = keepCamera && parts.any { clips[it.clip].hasAudio && it.volume > 0f }
         val items = parts.mapIndexed { i, seg ->
             val clip = clips[seg.clip]
+            // The preview reads the small edit copy when there is one; the export never does.
+            val proxy = clip.proxy?.takeIf { useProxies }
+            val mediaMs = if (proxy != null && clip.proxyDurationMs > 0) clip.proxyDurationMs else clip.durationMs
             val item = if (clip.isImage) {
                 MediaItem.Builder().setUri(clip.uri).setImageDurationMs(seg.durationMs).build()
             } else {
-                MediaItem.Builder().setUri(clip.uri).setClippingConfiguration(
-                    MediaItem.ClippingConfiguration.Builder().setStartPositionMs(seg.startMs).setEndPositionMs(seg.endMs).build()
+                // A copy can be a few ms shorter than its original: clamp so the part stays inside it.
+                val end = minOf(seg.endMs, mediaMs)
+                MediaItem.Builder().setUri(proxy ?: clip.uri).setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder().setStartPositionMs(minOf(seg.startMs, end - 1)).setEndPositionMs(end).build()
                 ).build()
             }
             val gain = plan.originalVolume * seg.volume
@@ -100,7 +105,7 @@ class CompositionBuilder(private val luts: LutStore) {
                 .setRemoveAudio(dropAudio)
                 .setEffects(Effects(audio, video))
                 // The preview player needs every item's whole (unclipped) length up front.
-                .setDurationUs((if (clip.isImage) seg.durationMs else clip.durationMs) * 1000)
+                .setDurationUs((if (clip.isImage) seg.durationMs else mediaMs) * 1000)
                 .apply {
                     if (clip.isImage) setFrameRate(IMAGE_FPS)
                     else if (seg.speed != 1f || seg.curve != SpeedCurve.NONE) setSpeed(speedProvider(seg))
@@ -425,7 +430,8 @@ class VideoExporter(private val context: Context, luts: LutStore) {
     suspend fun export(clips: List<VideoInfo>, plan: EditPlan, onProgress: (Int) -> Unit): Uri {
         val out = File(context.cacheDir, "edit-${System.currentTimeMillis()}.mp4")
         try {
-            val built = builder.build(clips, plan, shortSideCap = Encoders.maxShortSide(), withText = true)
+            val built = builder.build(clips, plan, shortSideCap = Encoders.maxShortSide(), withText = true, useProxies = false)
+            android.util.Log.i("GPicEditor", "export ${built.width}x${built.height} from originals: ${clips.joinToString { it.name }}")
             render(built, plan, out, onProgress)
             return saveToMovies(out, clips.first().name)
         } finally {

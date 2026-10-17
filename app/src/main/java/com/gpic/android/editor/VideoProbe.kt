@@ -26,7 +26,13 @@ data class VideoInfo(
     val looksFlat: Boolean?,
     /** A photo used as a clip: it can be shown for up to [durationMs] (see [VideoProbe.IMAGE_MAX_MS]). */
     val isImage: Boolean = false,
+    /** Small H.264 copy for the preview, thumbnails and analysis ([Proxies]); export always reads [uri]. */
+    val proxy: Uri? = null,
+    val proxyDurationMs: Long = 0,
 ) {
+    /** What the editor reads for anything but the export. */
+    val editUri: Uri get() = proxy ?: uri
+    val isHevc: Boolean get() = mime?.contains("hevc", true) == true || mime?.contains("h265", true) == true
     /** Display size after the container's rotation. */
     val displayWidth: Int get() = if (rotation % 180 == 0) width else height
     val displayHeight: Int get() = if (rotation % 180 == 0) height else width
@@ -59,7 +65,10 @@ object VideoProbe {
                 width = int(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH) ?: 0,
                 height = int(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT) ?: 0,
                 rotation = int(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION) ?: 0,
-                frameRate = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull(),
+                // The capture-rate tag is often missing; frames ÷ duration is what the file really holds.
+                frameRate = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()
+                    ?: if (Build.VERSION.SDK_INT >= 28) r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)?.toLongOrNull()
+                        ?.takeIf { duration > 0 }?.let { it * 1000f / duration } else null,
                 mime = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE),
                 hasAudio = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes",
                 bitrate = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull(),
@@ -104,7 +113,7 @@ object VideoProbe {
         } else {
             val r = MediaMetadataRetriever()
             try {
-                r.setDataSource(context, info.uri)
+                r.setDataSource(context, info.editUri)
                 frameAt(r, timeMs * 1000, maxSide)
             } finally {
                 r.release()
