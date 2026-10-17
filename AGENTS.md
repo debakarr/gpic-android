@@ -8,7 +8,7 @@
 
 - **Package:** `com.gpic.android`
 - **App entry:** `MainActivity` → Compose NavHost (home/auth/settings)
-- **Current version:** `1.6.0 (18)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
+- **Current version:** `1.7.0 (19)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
 - **Repo:** `github.com/debakarr/gpic-android` (private), branch `main`
 
 ## Tech Stack
@@ -92,6 +92,7 @@ app/src/main/
                 VideoExporter.kt (CompositionBuilder shared by preview + export, effects, Transformer, Encoders),
                 TextRender.kt (text/sticker bitmaps + animation maths), AudioFx.kt (fades/gain), Openverse.kt (CC music),
                 ProjectStore.kt (drafts), ClaudeEditPlanner.kt (Anthropic SDK + Claude-app prompt/reply parser),
+                Templates.kt (VideoTemplate rhythms + MusicPicker mood/track choice; pure),
                 Proxies.kt (540p edit copies), VideoAnalyzer.kt (on-phone frame measurements), SmartEdit.kt (shots,
                 scoring, duplicates, beat slots; pure), Cards.kt (title-card backgrounds, storyboard sheet)
     camera/     CameraLink.kt (BLE pair → camera WiFi → DUML list), CameraTransfer.kt (self-resuming HTTP stream, stager)
@@ -285,8 +286,26 @@ Claude without an API key (1.6): Pro/Max plans don't include API use (that's bil
 "Ask in Claude app" shares `ClaudeEditPlanner.chatPrompt` (instructions, plain field list, clips, current plan,
 beats, request) plus an optional labelled storyboard (`Cards.storyboard`, via FileProvider) to `com.anthropic.claude`
 (or the share menu), and copies the prompt too. "Paste reply" reads the clipboard: ```json block or first balanced
-{…}; missing fields stay as they were; one undoable step. The share step into the real app is untested (not installed
-on the test phone).
+{…}; missing fields stay as they were; one undoable step.
+Tested with the real Claude app (1.261015.20) on Haiku 5.5, incognito: the app keeps shared images (one or two
+storyboards via SEND_MULTIPLE) but drops EXTRA_TEXT when images come along, so the prompt is on the clipboard;
+pasting a long prompt becomes a "Pasted content" attachment, which works. Its JSON block's Copy button + Paste
+reply applied the plan. API key requests can choose Opus 5.5 / Sonnet 5.5 / Haiku 5.5 (`claude_model` in gpic_prefs);
+Haiku 5.5 has no server-side fallback, so `fallbacks`/beta header go only to the others.
+Long clips (1.7): Claude gets every shot found (`shotList`: clip, range, camera, quality/action, faces, flags,
+look-alike group) as text, and the frames are the peak of the best shots, one per look-alike group first
+(`claudeFrames`, up to 32 = two 16-frame storyboards; 24 for the API) instead of evenly spaced samples. Checked on a
+2-minute clip: Haiku chose moments from the start, middle and last seconds. Analysis of a 2-min 720p clip took ~100 s
+on the Redmi (once a session). Google Photos' own "key moments" aren't available: they aren't in the upload API.
+
+Templates (1.7): `VideoTemplate` = music mood (Openverse query), a rhythm of beat-length slots (transition, speed
+curve, camera move each), look, shape, canvas, title/end cards, default length. Applying one: analysis → matching
+music if none (`applyAutoMusic`, awaited so beats are known; 120 BPM assumed otherwise) → `slotPlan` →
+`SmartEdit.pickSlots` (photos fill slots up to 10 s with alternating zooms; ramps get `MusicPicker.sourceMs` of clip,
+the harmonic mean of the step speeds) → snap to beats → cards. With few good shots the edit is shorter than the
+template's length. Automatic music elsewhere: Smart edit (switch, on by default) and "Pick for me" / "Another track"
+in Music; `MusicPicker.mood` reads action/brightness/colour/camera motion/faces, photos-only → piano/acoustic;
+`choose` prefers tracks long enough to cover the video, not huge mixes, non-share-alike.
 
 ### Album suggestions (Albums screen, top-bar icon)
 `MediaIndex` (filesDir JSON, singleton) records media key + EXIF capture time/GPS + local Uri for every

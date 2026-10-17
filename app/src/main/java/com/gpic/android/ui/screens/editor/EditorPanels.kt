@@ -322,6 +322,9 @@ fun MusicLibraryPanel(state: EditorUiState, vm: EditorViewModel, onPickPhoneAudi
             Openverse.MOODS.forEach { m -> Pick(m, state.musicQuery.equals(m, true), enabled = !state.musicSearching) { vm.searchMusic(m) } }
         }
         ChipRow {
+            AssistChip(onClick = { player.stop(); playing = null; vm.autoMusic(another = state.plan.music != null) }, enabled = state.autoProgress == null,
+                label = { Text(state.autoProgress ?: if (state.plan.music == null) "Pick for me" else "Another track") },
+                leadingIcon = { Icon(Icons.Default.AutoAwesome, null, Modifier.size(16.dp)) })
             AssistChip(onClick = onPickPhoneAudio, label = { Text("From phone") }, leadingIcon = { Icon(Icons.Default.PhoneAndroid, null, Modifier.size(16.dp)) })
             state.clips.forEachIndexed { i, c ->
                 if (c.hasAudio) AssistChip(onClick = { onClipSound(i) }, label = { Text("Sound of clip ${i + 1}") }, leadingIcon = { Icon(Icons.Default.GraphicEq, null, Modifier.size(16.dp)) })
@@ -424,6 +427,11 @@ fun QuickEditPanel(state: EditorUiState, vm: EditorViewModel) {
                 Text("Intro & end title cards", color = Color.White, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                 Switch(checked = state.addCards, onCheckedChange = vm::setAddCards, enabled = !busy)
             }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (state.plan.music == null) "Add matching music (Openverse)" else "Music: ${state.plan.music.title.substringBefore(" · ")}",
+                    color = Color.White, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (state.plan.music == null) Switch(checked = state.autoMusic, onCheckedChange = vm::setAutoMusic, enabled = !busy)
+            }
             Button(onClick = vm::quickEdit, enabled = !busy && state.exportProgress == null && state.preparing == null) {
                 if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 else Icon(Icons.Default.AutoFixHigh, null, Modifier.size(18.dp))
@@ -431,6 +439,38 @@ fun QuickEditPanel(state: EditorUiState, vm: EditorViewModel) {
                 Text(state.autoProgress ?: "Make my edit")
             }
             state.autoNote?.let { Text(it, color = Color.White, style = MaterialTheme.typography.bodyMedium) }
+        }
+    }
+}
+
+/** LightCut-style template gallery: tap one to fill its rhythm with your best shots and matching music. */
+@Composable
+fun TemplatesPanel(state: EditorUiState, vm: EditorViewModel) {
+    PanelSheet("Templates", onClose = { vm.openPanel(null) }) {
+        val busy = state.autoProgress != null
+        Text(state.autoProgress ?: "Picks your best shots for the template's rhythm, with matching music from Openverse when the edit has none.",
+            color = if (busy) EditorColors.Accent else EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
+        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            com.gpic.android.editor.VideoTemplate.entries.forEach { t ->
+                val selected = state.template == t
+                Column(
+                    Modifier.width(132.dp).clip(RoundedCornerShape(12.dp))
+                        .background(androidx.compose.ui.graphics.Brush.linearGradient(listOf(Color(t.colors.first), Color(t.colors.second))))
+                        .then(if (selected) Modifier.border(2.dp, Color.White, RoundedCornerShape(12.dp)) else Modifier)
+                        .clickable(enabled = !busy) { vm.applyTemplate(t) }.padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(t.label, color = Color.White, style = MaterialTheme.typography.titleSmall, maxLines = 1)
+                    Text(t.blurb, color = Color.White.copy(alpha = 0.9f), fontSize = 11.sp, maxLines = 3, minLines = 3, overflow = TextOverflow.Ellipsis)
+                    Text("${t.defaultSec} s · ${t.aspect.label} · ♪ ${t.musicQuery}", color = Color.White.copy(alpha = 0.8f), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (state.plan.music == null) "Add matching music" else "Keeps your music: ${state.plan.music.title.substringBefore(" · ")}",
+                color = Color.White, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (state.plan.music == null) Switch(checked = state.autoMusic, onCheckedChange = vm::setAutoMusic, enabled = !busy)
         }
     }
 }
@@ -459,9 +499,10 @@ fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit,
             )
             // Claude app: works with a Pro/Max plan, no API key.
             Text("With the Claude app (Pro plan)", color = Color.White, style = MaterialTheme.typography.titleSmall)
-            Text("1. Ask in Claude app: GPic opens Claude with your request, the clip details and the current edit" +
-                (if (storyboard) ", plus a storyboard image of frames" else "") + ". Send it.\n" +
-                "2. Copy Claude's whole reply, come back, tap Paste reply.", color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
+            Text("1. Ask in Claude app: opens Claude" + (if (storyboard) " with storyboard images of your best shots" else "") +
+                " and copies the prompt (your request, every shot found, the current edit). In Claude: long-press the message box, Paste, " +
+                "pick a model (Haiku is fastest), send.\n2. Tap Copy under Claude's JSON, come back, tap Paste reply.",
+                color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = storyboard, onCheckedChange = { storyboard = it })
                 Text("Include a storyboard image (frames go to Anthropic through your Claude app)", color = EditorColors.Muted,
@@ -478,6 +519,7 @@ fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit,
             if (!state.hasClaudeKey) {
                 TextButton(onClick = onAddKey) { Text("Add API key") }
             } else {
+                ChipRow { ClaudeEditPlanner.MODELS.forEach { (id, label) -> Pick(label, state.claudeModel == id, enabled = !state.asking) { vm.setClaudeModel(id) } } }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = state.sendFrames, onCheckedChange = vm::setSendFrames, enabled = !state.asking)
                     Text("Let Claude see up to ${ClaudeEditPlanner.FRAME_COUNT} small frames", color = EditorColors.Muted,

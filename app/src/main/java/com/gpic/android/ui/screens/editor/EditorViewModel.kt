@@ -62,7 +62,7 @@ sealed interface Selection {
 }
 
 /** The panel open above the toolbar. */
-enum class Panel { SPEED, VOLUME, FILTERS, ADJUST, TRANSITION, MOTION, TEXT, MUSIC_LIBRARY, MUSIC, CANVAS, QUICK_EDIT, CLAUDE, EXPORT, CARDS }
+enum class Panel { SPEED, VOLUME, FILTERS, ADJUST, TRANSITION, MOTION, TEXT, MUSIC_LIBRARY, MUSIC, CANVAS, QUICK_EDIT, CLAUDE, EXPORT, CARDS, TEMPLATES }
 
 data class EditorUiState(
     val projects: List<ProjectSummary> = emptyList(),
@@ -95,10 +95,16 @@ data class EditorUiState(
     val autoProgress: String? = null,
     val autoNote: String? = null,
     val arrange: com.gpic.android.editor.Arrange = com.gpic.android.editor.Arrange.STORY,
+    /** Smart edit and templates fetch matching music when the edit has none. */
+    val autoMusic: Boolean = true,
+    /** Model for API-key requests (Haiku is the cheap one for trying things out). */
+    val claudeModel: String = ClaudeEditPlanner.MODEL,
     /** Smart edit adds intro/end title cards. */
     val addCards: Boolean = false,
     /** Suggested cover frames (clip, time), best first. */
     val covers: List<CoverPick> = emptyList(),
+    /** The last template applied (highlighted in the gallery). */
+    val template: com.gpic.android.editor.VideoTemplate? = null,
     // Music
     val musicQuery: String = "",
     val musicResults: List<OpenTrack> = emptyList(),
@@ -158,6 +164,8 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         refreshLuts()
         _state.update {
             it.copy(hasClaudeKey = store.getClaudeApiKey() != null, projects = projects.list(),
+                claudeModel = context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).getString("claude_model", null)
+                    ?.takeIf { m -> m in ClaudeEditPlanner.MODELS.map { it.first } } ?: ClaudeEditPlanner.MODEL,
                 downloaded = runCatching { openverse.downloaded().map { d -> d.first } }.getOrDefault(emptyList()))
         }
         viewModelScope.launch(Dispatchers.Default) { val m = Encoders.maxShortSide(); _state.update { it.copy(maxShortSide = m) } }
@@ -584,6 +592,59 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         }
     }
 
+    private val triedTracks = HashSet<String>()
+
+    /**
+     * Automatic music: searches Openverse for [query] (or a mood worked out from the clips), takes the track that
+     * best covers the video ([com.gpic.android.editor.MusicPicker]), downloads it and finds its beats, so cuts can
+     * follow them. [another] skips tracks already tried. Returns false (with a message) when nothing worked.
+     */
+    suspend fun applyAutoMusic(query: String?, another: Boolean = false): Boolean {
+        val st = _state.value
+        val q = query ?: run {
+            val analyses = runCatching { analyzeAll("Listening to your clips…") }.getOrDefault(emptyList())
+            com.gpic.android.editor.MusicPicker.mood(analyses, st.clips.filter { !isCard(it) }.all { it.isImage })
+        }
+        _state.update { it.copy(autoProgress = "Finding $q music…") }
+        if (!another) triedTracks.clear()
+        st.plan.music?.let { m -> triedTracks += st.downloaded.filter { d -> m.title.startsWith(d.title) }.map { it.id } }
+        val tracks = withContext(Dispatchers.IO) { runCatching { openverse.search(q) } }
+        val track = tracks.getOrNull()?.let { com.gpic.android.editor.MusicPicker.choose(it, maxOf(st.outputMs, 15_000), triedTracks) }
+        if (track == null) {
+            _state.update { it.copy(autoProgress = null) }
+            toast(tracks.exceptionOrNull()?.let { e -> if (e is Openverse.QuotaException) e.message else "No music found (no internet?)" } ?: "No more \"$q\" tracks to try")
+            return false
+        }
+        triedTracks += track.id
+        _state.update { it.copy(autoProgress = "Downloading “${track.title}”…") }
+        val file = withContext(Dispatchers.IO) { runCatching { openverse.download(track) { } } }.getOrElse { e ->
+            _state.update { it.copy(autoProgress = null) }; toast("Couldn't download music: ${e.message}"); return false
+        }
+        _state.update { it.copy(autoProgress = "Finding the beat…", downloaded = openverse.downloaded().map { d -> d.first }) }
+        val uri = Uri.fromFile(file)
+        val info = withContext(Dispatchers.Default) { Beats.decodeMono(context, uri)?.let { Beats.detect(it) } }
+        val dur = withContext(Dispatchers.IO) { probeDuration(uri) }.takeIf { it > 0 } ?: track.durationMs
+        commit { p ->
+            p.copy(music = MusicTrack(uri.toString(), track.title + " · " + track.creator, if (track.needsCredit) track.attribution else null, dur,
+                volume = p.music?.volume ?: 0.8f, fadeOutMs = 1500,
+                beatsMs = info?.beatsMs.orEmpty(), bpm = info?.bpm ?: 0f))
+        }
+        _state.update { it.copy(autoProgress = null, waveform = null) }
+        loadWaveform(uri)
+        return true
+    }
+
+    /** "Pick for me" / "Another track" in the music library. */
+    fun autoMusic(another: Boolean = false) {
+        if (autoJob?.isActive == true) return
+        autoJob = viewModelScope.launch {
+            if (applyAutoMusic(null, another)) _state.update { it.copy(selection = Selection.Music, panel = Panel.MUSIC) }
+            _state.update { it.copy(autoProgress = null) }
+        }
+    }
+
+    fun setAutoMusic(on: Boolean) = _state.update { it.copy(autoMusic = on) }
+
     /** A song from the phone, or a clip's own sound ([fromVideo]): copied into the project so the draft keeps it. */
     fun useLocalAudio(uri: Uri, fromVideo: Boolean = false) {
         val id = _state.value.projectId ?: return
@@ -731,8 +792,11 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 val pct = ((i + f) * 100 / clips.size).toInt()
                 _state.update { it.copy(autoProgress = "$label $pct%") }
             }
-        }
+        }.also { lastAnalyses = it }
     }
+
+    /** The latest analysis of the clips (for Claude's shot list). */
+    @Volatile private var lastAnalyses: List<com.gpic.android.editor.ClipAnalysis>? = null
 
     /**
      * LightCut-style one tap, on the phone: split every clip into shots, score them (sharpness, exposure, colour,
@@ -750,13 +814,17 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 return@launch
             }
             updateCovers(analyses)
-            val music = st.plan.music
+            if (st.autoMusic && st.plan.music == null) {
+                applyAutoMusic(com.gpic.android.editor.MusicPicker.mood(analyses, st.clips.filter { !isCard(it) }.all { it.isImage }))
+            }
+            val music = _state.value.plan.music
             val cut = AutoEdit.beatCutMs(st.style, music?.bpm ?: 0f)
             val result = com.gpic.android.editor.SmartEdit.pick(analyses, st.targetSec * 1000L, cut, st.arrange, st.style)
             if (result.parts.isEmpty()) {
                 _state.update { it.copy(autoProgress = null, autoNote = "These clips are too short for a smart edit.") }
                 return@launch
             }
+            _state.update { it.copy(autoProgress = null) }
             _state.update { it.copy(autoProgress = null) }
             commit { p ->
                 var plan = AutoEdit.plan(p, result.parts, st.style)
@@ -786,6 +854,54 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                         music.beatsMs.isEmpty() -> "."
                         else -> ", cut on the beat (${music.bpm.toInt()} BPM)."
                     })
+            }
+        }
+    }
+
+    // ---- templates ------------------------------------------------------------------------------------------
+
+    /**
+     * LightCut-style template: matching music (unless the edit has some), the template's beat rhythm filled with
+     * the best shots, its look, shape and title cards. One undo step for the edit (music is its own step).
+     */
+    fun applyTemplate(t: com.gpic.android.editor.VideoTemplate) {
+        val st0 = _state.value
+        if (st0.clips.isEmpty() || autoJob?.isActive == true) return
+        autoJob = viewModelScope.launch {
+            _state.update { it.copy(autoProgress = "Finding shots…", autoNote = null, template = t) }
+            val analyses = runCatching { analyzeAll("Finding shots…") }.getOrElse { e ->
+                _state.update { it.copy(autoProgress = null, autoNote = "Couldn't read the clips: ${e.message}") }; return@launch
+            }
+            updateCovers(analyses)
+            if (st0.autoMusic && st0.plan.music == null) applyAutoMusic(t.musicQuery)
+            val music = _state.value.plan.music
+            val beatMs = music?.bpm?.takeIf { it > 0 }?.let { (60_000 / it).toLong() } ?: 500L
+            val slots = t.slotPlan(t.defaultSec * 1000L, beatMs)
+            val result = com.gpic.android.editor.SmartEdit.pickSlots(analyses, slots, com.gpic.android.editor.Arrange.STORY)
+            if (result.parts.isEmpty()) {
+                _state.update { it.copy(autoProgress = null, autoNote = "These clips are too short for this template.") }; return@launch
+            }
+            val st = _state.value
+            commit { p ->
+                var plan = p.copy(
+                    segments = result.parts, aspect = t.aspect, canvas = t.canvas,
+                    look = p.look.copy(filter = t.filter, filterAmount = t.filterAmount),
+                    keepOriginalAudio = true, originalVolume = if (music != null) 0.25f else 1f,
+                    texts = emptyList(),
+                    music = music?.let { m -> m.copy(volume = 0.9f, startMs = m.beatsMs.firstOrNull() ?: m.startMs) },
+                )
+                val m = plan.music
+                if (m != null && m.beatsMs.size > 4) {
+                    plan = Timeline.snapToBeats(plan, st.durations, Beats.markers(m.beatsMs, Beats.Pace.FAST, m.startMs, plan.outputMs(st.durations) + 60_000))
+                }
+                plan
+            }
+            if (t.title != null || t.endCard) addCards(intro = t.title != null, outro = t.endCard, oneStep = false, title = t.title)
+            val out = _state.value.outputMs / 1000
+            _state.update {
+                it.copy(autoProgress = null, selection = Selection.None, panel = null, autoNote = null,
+                    message = "${t.label}: ${plural(result.used, "shot")}, ${out / 60}:${"%02d".format(out % 60)}" +
+                        (music?.let { m -> " · music “${m.title.substringBefore(" · ")}”" + if (m.bpm > 0) " (${m.bpm.toInt()} BPM)" else "" } ?: " · no music found"))
             }
         }
     }
@@ -866,7 +982,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
      * Adds generated title cards: a 2.5 s still made from the best frame (blurred and darkened), with editable
      * title text on top. The intro shifts everything else (including texts) later.
      */
-    fun addCards(intro: Boolean, outro: Boolean, oneStep: Boolean = true) {
+    fun addCards(intro: Boolean, outro: Boolean, oneStep: Boolean = true, title: String? = null) {
         val id = _state.value.projectId ?: return
         viewModelScope.launch {
             val st = _state.value
@@ -884,7 +1000,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
             }
             val card = made.getOrElse { e -> return@launch toast("Couldn't make the card: ${e.message}") }
             val date = java.text.SimpleDateFormat("d MMM yyyy", java.util.Locale.getDefault()).format(java.util.Date(captureDate(st.clips)))
-            val title = st.projectName.takeIf { n -> n.isNotBlank() && !n.first().isDigit() } ?: "Highlights"
+            val title = title ?: st.projectName.takeIf { n -> n.isNotBlank() && !n.first().isDigit() } ?: "Highlights"
             val change: (EditPlan) -> EditPlan = { p0 ->
                 var p = Timeline.materialize(p0, st.durations)
                 val cardIndex = st.clips.size // the card clip is appended below
@@ -939,25 +1055,30 @@ class EditorViewModel(private val context: Context, private val store: Credentia
 
     // ---- Claude app (Pro plan: no API key) -------------------------------------------------------------------
 
-    /** The prompt and (optionally) a storyboard image to share with the Claude app. */
-    suspend fun prepareClaudeShare(withStoryboard: Boolean): Pair<String, Uri?> = withContext(Dispatchers.IO) {
-        val st = _state.value
-        val plan = Timeline.materialize(st.plan, st.durations)
-        val image = if (!withStoryboard) null else runCatching {
-            val per = ClaudeEditPlanner.framesPerClip(st.durations).map { minOf(it, 6) }
-            val frames = st.clips.flatMapIndexed { i, v ->
-                if (v.isImage) listOfNotNull(VideoProbe.thumbnail(context, v, 0, 256)?.let { "C$i photo" to it })
-                else (0 until per[i]).mapNotNull { k ->
-                    val t = v.durationMs * (2 * k + 1) / (2 * per[i])
-                    VideoProbe.thumbnail(context, v, t, 256)?.let { b -> "C$i ${t / 60000}:${"%02d".format(t / 1000 % 60)}" to b }
+    /**
+     * The prompt and (optionally) storyboard images (16 frames each, at most two) to share with the Claude app. The
+     * frames are the best moments of the best shots; the prompt also lists every shot found.
+     */
+    suspend fun prepareClaudeShare(withStoryboard: Boolean): Pair<String, List<Uri>> {
+        val picks = claudeFrames(STORYBOARD_FRAMES)
+        return withContext(Dispatchers.IO) {
+            val st = _state.value
+            val plan = Timeline.materialize(st.plan, st.durations)
+            val images = if (!withStoryboard) emptyList() else runCatching {
+                val frames = picks.mapNotNull { (i, t, label) ->
+                    val v = st.clips.getOrNull(i) ?: return@mapNotNull null
+                    val name = (if (label.isNotEmpty()) "$label " else "") + "C$i " + if (v.isImage) "photo" else "${t / 60000}:${"%02d".format(t / 1000 % 60)}"
+                    VideoProbe.thumbnail(context, v, t, 256)?.let { name to it }
                 }
-            }.take(24)
-            val sheet = com.gpic.android.editor.Cards.storyboard(frames)
-            val f = File(context.cacheDir, "share/gpic-storyboard.jpg")
-            com.gpic.android.editor.Cards.saveJpeg(sheet, f, 85)
-            androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".fileprovider", f)
-        }.onFailure { Log.w(TAG, "storyboard failed", it) }.getOrNull()
-        ClaudeEditPlanner.chatPrompt(st.request.ifBlank { "Make a lively short edit of these clips." }, st.clips, plan, st.luts, image != null) to image
+                File(context.cacheDir, "share").listFiles()?.forEach { it.delete() }
+                frames.chunked(16).mapIndexed { n, chunk ->
+                    val f = File(context.cacheDir, "share/gpic-storyboard-${n + 1}.jpg")
+                    com.gpic.android.editor.Cards.saveJpeg(com.gpic.android.editor.Cards.storyboard(chunk), f, 85)
+                    androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".fileprovider", f)
+                }
+            }.onFailure { Log.w(TAG, "storyboard failed", it) }.getOrDefault(emptyList())
+            ClaudeEditPlanner.chatPrompt(st.request.ifBlank { "Make a lively short edit of these clips." }, st.clips, plan, st.luts, images.isNotEmpty(), shotList(st)) to images
+        }
     }
 
     /** Applies a reply pasted from the Claude app as one undoable step. */
@@ -979,6 +1100,52 @@ class EditorViewModel(private val context: Context, private val store: Credentia
     }
 
     fun setRequest(text: String) = _state.update { it.copy(request = text) }
+
+    fun setClaudeModel(model: String) {
+        context.getSharedPreferences("gpic_prefs", Context.MODE_PRIVATE).edit().putString("claude_model", model).apply()
+        _state.update { it.copy(claudeModel = model) }
+    }
+
+    /** Shots found by the analysis (when it has run), as text for Claude: what's in long clips between the frames. */
+    private fun shotList(st: EditorUiState): String? {
+        val analyses = lastAnalyses ?: return null
+        val shots = analyses.flatMap { com.gpic.android.editor.SmartEdit.shots(it) }
+        if (shots.isEmpty()) return null
+        com.gpic.android.editor.SmartEdit.group(shots)
+        return shots.take(120).mapIndexed { i, s ->
+            "S$i: clip ${s.clip} ${"%.1f".format(s.startMs / 1000.0)}–${"%.1f".format(s.endMs / 1000.0)} s, ${s.move.label.lowercase()}" +
+                ", quality ${"%.2f".format(s.quality)}, action ${"%.2f".format(s.interest)}" + (if (s.faces > 0) ", faces" else "") +
+                (if (s.shaky) ", shaky" else "") + (if (s.blurry) ", blurry" else "") + (if (s.dark) ", dark" else "") +
+                (if (s.slowMo) ", high frame rate" else "") + ", look-alike group ${s.group}"
+        }.joinToString("\n")
+    }
+
+    /**
+     * Frames for Claude: the liveliest moment of the best shots (one per look-alike group first), so a long clip is
+     * shown by its highlights rather than by evenly spaced samples that can miss them. Falls back to even spacing
+     * when the clips haven't been analysed.
+     */
+    private suspend fun claudeFrames(max: Int): List<Triple<Int, Long, String>> {
+        val analyses = runCatching { analyzeAll("Finding the best frames…") }.getOrNull().also { _state.update { s -> s.copy(autoProgress = null) } }
+        val st = _state.value
+        if (analyses.isNullOrEmpty()) {
+            val per = ClaudeEditPlanner.framesPerClip(st.durations)
+            return st.clips.flatMapIndexed { i, v -> (0 until per[i]).map { k -> Triple(i, v.durationMs * (2 * k + 1) / (2 * per[i]), "") } }.take(max)
+        }
+        val shots = analyses.flatMap { com.gpic.android.editor.SmartEdit.shots(it) }
+        com.gpic.android.editor.SmartEdit.group(shots)
+        val ranked = shots.withIndex().sortedByDescending { it.value.score }
+        val picked = mutableListOf<IndexedValue<com.gpic.android.editor.Shot>>()
+        val groups = HashSet<Int>()
+        for (s in ranked) { if (picked.size >= max) break; if (groups.add(s.value.group)) picked += s }
+        for (s in ranked) { if (picked.size >= max) break; if (s !in picked) picked += s }
+        // Every clip gets at least one frame.
+        for ((i, _) in st.clips.withIndex()) if (picked.none { it.value.clip == i }) shots.withIndex().filter { it.value.clip == i }.maxByOrNull { it.value.score }?.let { picked += it }
+        return picked.sortedWith(compareBy({ it.value.clip }, { it.value.startMs })).map { (idx, s) ->
+            val peak = s.curve.maxByOrNull { it.second }?.first ?: ((s.startMs + s.endMs) / 2)
+            Triple(s.clip, peak.coerceIn(s.startMs, s.endMs), "S$idx")
+        }
+    }
     fun setSendFrames(on: Boolean) = _state.update { it.copy(sendFrames = on) }
 
     /** Ask Claude for a new plan. Sends metadata, the current plan and (when ticked) a few small frames per clip. */
@@ -992,15 +1159,13 @@ class EditorViewModel(private val context: Context, private val store: Credentia
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     val frames = if (!st.sendFrames) emptyList() else {
-                        val per = ClaudeEditPlanner.framesPerClip(st.durations)
-                        st.clips.flatMapIndexed { i, v ->
-                            if (v.isImage) listOfNotNull(VideoProbe.thumbnail(context, v, 0, 512)?.let { b ->
-                                Frame(0, java.io.ByteArrayOutputStream().also { b.compress(Bitmap.CompressFormat.JPEG, 80, it) }.toByteArray(), i)
-                            })
-                            else VideoProbe.frames(context, v.editUri, v.durationMs, per[i], clip = i)
+                        kotlinx.coroutines.runBlocking { claudeFrames(ClaudeEditPlanner.FRAME_COUNT) }.mapNotNull { (i, t, _) ->
+                            st.clips.getOrNull(i)?.let { v -> VideoProbe.thumbnail(context, v, t, 512) }?.let { b ->
+                                Frame(t, java.io.ByteArrayOutputStream().also { b.compress(Bitmap.CompressFormat.JPEG, 80, it) }.toByteArray(), i)
+                            }
                         }
                     }
-                    ClaudeEditPlanner(key).plan(st.request, st.clips, Timeline.materialize(st.plan, st.durations), st.luts, frames)
+                    ClaudeEditPlanner(key, st.claudeModel).plan(st.request, st.clips, Timeline.materialize(st.plan, st.durations), st.luts, frames, shotList(st))
                 }
             }
             result.onSuccess { planned ->
@@ -1059,5 +1224,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         private const val MAX_UNDO = 60
         const val CARD_PREFIX = "gpic-card-"
         const val CARD_MS = 2_500L
+        /** Storyboard frames for the Claude app (two sheets of 16). */
+        const val STORYBOARD_FRAMES = 32
     }
 }

@@ -222,12 +222,12 @@ data class EditPlan(
         .put("segments", JSONArray(segments.map { segmentJson(it) }))
         .put("look", lookJson(look))
         .put("keep_original_audio", keepOriginalAudio)
-        .put("original_volume", originalVolume.toDouble())
+        .put("original_volume", r3(originalVolume))
         .put("music", music?.let { m ->
             JSONObject().put("uri", m.uri).put("title", m.title).put("credit", m.credit ?: JSONObject.NULL).put("duration_ms", m.durationMs)
-                .put("volume", m.volume.toDouble()).put("start_s", m.startMs / 1000.0)
+                .put("volume", r3(m.volume)).put("start_s", m.startMs / 1000.0)
                 .put("fade_in_s", m.fadeInMs / 1000.0).put("fade_out_s", m.fadeOutMs / 1000.0)
-                .put("beats_ms", JSONArray(m.beatsMs)).put("bpm", m.bpm.toDouble())
+                .put("beats_ms", JSONArray(m.beatsMs)).put("bpm", r3(m.bpm))
         } ?: JSONObject.NULL)
         .put("texts", JSONArray(texts.map { textJson(it) }))
         .put("aspect", aspect.name)
@@ -248,7 +248,7 @@ data class EditPlan(
 
         fun segmentJson(s: Segment): JSONObject = JSONObject()
             .put("clip", s.clip).put("start_s", s.startMs / 1000.0).put("end_s", s.endMs / 1000.0)
-            .put("speed", s.speed.toDouble()).put("curve", s.curve.name).put("volume", s.volume.toDouble())
+            .put("speed", r3(s.speed)).put("curve", s.curve.name).put("volume", r3(s.volume))
             .put("look", s.look?.let { lookJson(it) } ?: JSONObject.NULL)
             .put("motion", s.motion.name).put("rotation", s.rotation).put("mirror", s.mirror)
             .put("transition", s.transition.name).put("transition_s", s.transitionMs / 1000.0)
@@ -256,12 +256,12 @@ data class EditPlan(
         fun lookJson(l: Look): JSONObject = JSONObject()
             .put("lut", l.lutId ?: NO_LUT)
             .put("filter", l.filter?.name ?: "NONE")
-            .put("filter_amount", l.filterAmount.toDouble())
-            .apply { Look.ADJUSTMENTS.forEach { a -> put(a.key, a.get(l).toDouble()) } }
+            .put("filter_amount", r3(l.filterAmount))
+            .apply { Look.ADJUSTMENTS.forEach { a -> put(a.key, r3(a.get(l))) } }
 
         fun textJson(t: TextItem): JSONObject = JSONObject()
             .put("text", t.text).put("start_s", t.startMs / 1000.0).put("end_s", t.endMs / 1000.0)
-            .put("x", t.x.toDouble()).put("y", t.y.toDouble()).put("size", t.size.toDouble())
+            .put("x", r3(t.x)).put("y", r3(t.y)).put("size", r3(t.size))
             .put("color", "#%06X".format(t.color and 0xFFFFFF)).put("style", t.style.name).put("font", t.font.name)
             .put("anim_in", t.animIn.name).put("anim_out", t.animOut.name).put("sticker", t.sticker)
 
@@ -274,7 +274,7 @@ data class EditPlan(
                 segments = segs,
                 look = o.optJSONObject("look")?.let { lookFrom(it, base.look) } ?: base.look,
                 keepOriginalAudio = o.optBoolean("keep_original_audio", base.keepOriginalAudio),
-                originalVolume = o.optDouble("original_volume", base.originalVolume.toDouble()).toFloat(),
+                originalVolume = o.optDouble("original_volume", r3(base.originalVolume)).toFloat(),
                 music = when {
                     !o.has("music") -> base.music
                     o.isNull("music") -> null
@@ -323,7 +323,7 @@ data class EditPlan(
             var l = base.copy(
                 lutId = if (o.has("lut")) o.optString("lut").takeIf { it.isNotEmpty() && it != NO_LUT } else base.lutId,
                 filter = if (o.has("filter")) Filter.entries.firstOrNull { it.name == o.optString("filter") } else base.filter,
-                filterAmount = o.optDouble("filter_amount", base.filterAmount.toDouble()).toFloat(),
+                filterAmount = o.optDouble("filter_amount", r3(base.filterAmount)).toFloat(),
             )
             Look.ADJUSTMENTS.forEach { a -> if (o.has(a.key)) l = a.set(l, o.optDouble(a.key, 0.0).toFloat()) }
             return l
@@ -335,9 +335,9 @@ data class EditPlan(
                 text = t.optString("text", base.text),
                 startMs = (t.optDouble("start_s", base.startMs / 1000.0) * 1000).toLong(),
                 endMs = (t.optDouble("end_s", base.endMs / 1000.0) * 1000).toLong(),
-                x = t.optDouble("x", base.x.toDouble()).toFloat(),
-                y = t.optDouble("y", base.y.toDouble()).toFloat(),
-                size = t.optDouble("size", base.size.toDouble()).toFloat(),
+                x = t.optDouble("x", r3(base.x)).toFloat(),
+                y = t.optDouble("y", r3(base.y)).toFloat(),
+                size = t.optDouble("size", r3(base.size)).toFloat(),
                 color = t.optString("color").removePrefix("#").toLongOrNull(16)?.let { (it.toInt() and 0xFFFFFF) or (0xFF shl 24) } ?: base.color,
                 style = enumOr(t.optString("style"), base.style),
                 font = enumOr(t.optString("font"), base.font),
@@ -354,3 +354,6 @@ data class EditPlan(
         private fun Float.finiteOr(d: Float) = if (isFinite()) this else d
     }
 }
+
+/** Floats as JSON numbers without float noise (0.8f → 0.8, not 0.800000011920929). */
+internal fun r3(f: Float): Double = Math.round(f * 1000.0) / 1000.0

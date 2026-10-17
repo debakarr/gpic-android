@@ -32,7 +32,7 @@ class FrameStat(
     val embed: FloatArray,
 )
 
-class ClipAnalysis(val clip: Int, val durationMs: Long, val fps: Float, val frames: List<FrameStat>)
+class ClipAnalysis(val clip: Int, val durationMs: Long, val fps: Float, val frames: List<FrameStat>, val isPhoto: Boolean = false)
 
 enum class CameraMove(val label: String) {
     STILL("Still"), PAN_LEFT("Pan left"), PAN_RIGHT("Pan right"), TILT_UP("Tilt up"), TILT_DOWN("Tilt down"), MOVING("Moving");
@@ -58,6 +58,7 @@ class Shot(
     val sharpAbs: Float,
     /** Per-sample interest (for the best window inside the shot) and the sample step. */
     val curve: List<Pair<Long, Float>>,
+    val photo: Boolean = false,
 ) {
     val durationMs: Long get() = endMs - startMs
     val score: Float get() = 0.55f * quality + 0.45f * interest - (if (shaky) 0.25f else 0f) - (if (blurry) 0.3f else 0f) - (if (dark) 0.2f else 0f)
@@ -139,6 +140,7 @@ object SmartEdit {
                 a.clip, start, end, move, quality, interest,
                 shaky = jitter > 0.06f, blurry = sharp < 0.35f || fr.map { it.sharpness }.average() < ABS_BLUR, dark = luma < 0.12f,
                 faces = faces, slowMo = a.fps >= 100f, embed = embed, sharpAbs = fr.map { it.sharpness }.average().toFloat(), curve = curve,
+                photo = a.isPhoto,
             )
         }
         return mergeShort(out)
@@ -154,7 +156,7 @@ object SmartEdit {
             val last = out.lastOrNull()
             if (last != null && s.durationMs < MIN_SHOT_MS && last.clip == s.clip) {
                 out[out.lastIndex] = Shot(last.clip, last.startMs, s.endMs, last.move, (last.quality + s.quality) / 2, max(last.interest, s.interest),
-                    last.shaky, last.blurry, last.dark, max(last.faces, s.faces), last.slowMo, last.embed, last.sharpAbs, last.curve + s.curve)
+                    last.shaky, last.blurry, last.dark, max(last.faces, s.faces), last.slowMo, last.embed, last.sharpAbs, last.curve + s.curve, last.photo)
             } else out += s
         }
         return out
@@ -199,6 +201,17 @@ object SmartEdit {
      * give a second slot. High-frame-rate shots play at half speed (LightCut's slow shots).
      */
     fun pick(analyses: List<ClipAnalysis>, targetMs: Long, cutMs: Long, arrange: Arrange, style: EditStyle): SmartResult {
+        val cut0 = cutMs.coerceAtLeast(EditPlan.MIN_SEGMENT_MS)
+        val n = max(1, ((targetMs + cut0 / 2) / cut0).toInt())
+        return pickSlots(analyses, List(n) { TemplateSlot(0, style.transition) to cut0 }, arrange, followCamera = true)
+    }
+
+    /**
+     * Fills template slots (output length each, with their transition, speed ramp and camera move) with the best
+     * shots, in [arrange] order. A slot's transition NONE follows the camera's motion when [followCamera]. Photos fill
+     * any slot up to 10 s, with a slow zoom when the slot has no move of its own.
+     */
+    fun pickSlots(analyses: List<ClipAnalysis>, slots: List<Pair<TemplateSlot, Long>>, arrange: Arrange, followCamera: Boolean = true): SmartResult {
         val shots = analyses.flatMap { shots(it) }
         // Across clips: a shot far softer than the project's typical one is blurry even if its own clip is all soft.
         if (shots.size >= 3) {
@@ -206,8 +219,8 @@ object SmartEdit {
             shots.forEach { if (it.sharpAbs < 0.25f * median) it.blurry = true }
         }
         val groups = group(shots)
-        val cut = cutMs.coerceAtLeast(EditPlan.MIN_SEGMENT_MS)
-        val slots = max(1, ((targetMs + cut / 2) / cut).toInt())
+        val cut = slots.map { it.second }.average().toLong().coerceAtLeast(EditPlan.MIN_SEGMENT_MS)
+        val wanted = slots.size
         val usable = shots.filter { it.durationMs >= min(cut, 800L) }
         val good = usable.filter { !it.shaky && !it.blurry && !it.dark }
         val goodRanked = good.sortedByDescending { it.score }
@@ -216,25 +229,36 @@ object SmartEdit {
         // only then shaky/blurry/dark ones (best first) when the clips have nothing better.
         val chosen = mutableListOf<Pair<Shot, Int>>() // shot, window index
         val usedGroups = HashSet<Int>()
-        for (s in goodRanked) { if (chosen.size >= slots) break; if (usedGroups.add(s.group)) chosen += s to 0 }
-        for (s in goodRanked) { if (chosen.size >= slots) break; if (chosen.none { it.first === s }) chosen += s to 0 }
-        for (s in goodRanked.filter { it.durationMs >= cut * 2 }) { if (chosen.size >= slots) break; chosen += s to 1 }
-        for (s in weakRanked) { if (chosen.size >= slots) break; chosen += s to 0 }
+        for (s in goodRanked) { if (chosen.size >= wanted) break; if (usedGroups.add(s.group)) chosen += s to 0 }
+        for (s in goodRanked) { if (chosen.size >= wanted) break; if (chosen.none { it.first === s }) chosen += s to 0 }
+        for (s in goodRanked.filter { it.durationMs >= cut * 2 && !it.photo }) { if (chosen.size >= wanted) break; chosen += s to 1 }
+        for (s in weakRanked) { if (chosen.size >= wanted) break; chosen += s to 0 }
         val ordered = when (arrange) {
             Arrange.STORY -> chosen.sortedWith(compareBy({ it.first.clip }, { it.first.startMs }, { it.second }))
             Arrange.BEST_FIRST -> chosen
         }
         val parts = ordered.mapIndexed { i, (shot, win) ->
-            val slow = shot.slowMo && shot.durationMs >= cut / 2 * 1
-            val speed = if (slow) 0.5f else 1f
-            val sourceLen = min(shot.durationMs, (cut * speed).toLong()).coerceAtLeast(EditPlan.MIN_SEGMENT_MS)
+            val (slot, slotMs) = slots[i]
+            // High-frame-rate shots play at half speed (not under a ramp, which has its own slow part).
+            val speed = if (shot.slowMo && slot.curve == SpeedCurve.NONE && !shot.photo) 0.5f else 1f
+            val need = if (shot.photo) slotMs.coerceAtMost(VideoProbe.IMAGE_MAX_MS) else MusicPicker.sourceMs(slotMs, speed, slot.curve)
+            val sourceLen = min(shot.durationMs, need).coerceAtLeast(EditPlan.MIN_SEGMENT_MS)
             val (s, e) = window(shot, sourceLen, win)
-            Segment(s, e, shot.clip, speed = speed,
-                transition = if (i == ordered.lastIndex) Transition.NONE else transitionFor(shot.move, style.transition))
+            val transition = when {
+                i == ordered.lastIndex -> Transition.NONE
+                slot.transition != Transition.NONE && !(followCamera && shot.move in PANS) -> slot.transition
+                followCamera -> transitionFor(shot.move, slot.transition)
+                else -> slot.transition
+            }
+            val motion = if (slot.motion == Motion.NONE && shot.photo) (if (i % 2 == 0) Motion.ZOOM_IN else Motion.ZOOM_OUT) else slot.motion
+            Segment(s, e, shot.clip, speed = speed, curve = if (shot.photo) SpeedCurve.NONE else slot.curve, transition = transition,
+                motion = if (shot.move in PANS && !shot.photo) Motion.NONE else motion)
         }
         return SmartResult(parts, shots.size, shots.count { it.shaky }, shots.count { it.blurry }, shots.size - groups,
             parts.count { it.speed < 1f }, chosen.size)
     }
+
+    private val PANS = setOf(CameraMove.PAN_LEFT, CameraMove.PAN_RIGHT, CameraMove.TILT_UP, CameraMove.TILT_DOWN)
 
     /** The liveliest [len] window of [shot] (the second-best non-overlapping one for [index] 1), in clip time. */
     internal fun window(shot: Shot, len: Long, index: Int): Pair<Long, Long> {

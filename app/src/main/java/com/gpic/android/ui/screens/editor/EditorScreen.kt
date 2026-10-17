@@ -408,6 +408,7 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
                     onShareToApp = { withBoard -> scope.launch { shareToClaude(context, vm, withBoard) } },
                     onPasteReply = { vm.applyClaudeReply(clipboard.getText()?.text) })
                 Panel.CARDS -> CardsPanel(state, vm)
+                Panel.TEMPLATES -> TemplatesPanel(state, vm)
                 Panel.EXPORT -> ExportPanel(state, vm)
                 null -> Toolbar(state, vm, posMs, onStickers = { stickers = true })
             }
@@ -510,6 +511,7 @@ private fun Toolbar(state: EditorUiState, vm: EditorViewModel, posMs: Long, onSt
             Tool("Delete", Icons.Default.Delete) { vm.removeMusic() },
         )
         else -> listOf(
+            Tool("Templates", Icons.Default.Dashboard) { vm.openPanel(Panel.TEMPLATES) },
             Tool("Edit", Icons.Default.ContentCut) {
                 Timeline.locate(state.parts, posMs)?.let { (i, _) -> state.parts.getOrNull(i)?.let { p -> if (p.id > 0) vm.select(Selection.Part(p.id)) } }
             },
@@ -613,24 +615,32 @@ private fun TextLayer(state: EditorUiState, posMs: Long, vm: EditorViewModel) {
 /** The Claude app's package (Play Store build). */
 private const val CLAUDE_APP = "com.anthropic.claude"
 
-/** Opens the Claude app (or the share menu) with the prompt and storyboard, and copies the prompt as a fallback. */
+/**
+ * Opens the Claude app (or the share menu) with the storyboard image(s). The Claude app keeps shared images but
+ * drops shared text when images come along, so the prompt goes on the clipboard to paste into the message box.
+ */
 private suspend fun shareToClaude(context: android.content.Context, vm: EditorViewModel, withStoryboard: Boolean) {
-    val (prompt, image) = vm.prepareClaudeShare(withStoryboard)
+    val (prompt, images) = vm.prepareClaudeShare(withStoryboard)
     val cm = context.getSystemService(android.content.ClipboardManager::class.java)
     cm?.setPrimaryClip(android.content.ClipData.newPlainText("GPic prompt", prompt))
-    val send = Intent(Intent.ACTION_SEND).apply {
-        type = if (image != null) "image/jpeg" else "text/plain"
+    val send = when {
+        images.size > 1 -> Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            type = "image/jpeg"
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(images))
+        }
+        images.size == 1 -> Intent(Intent.ACTION_SEND).apply { type = "image/jpeg"; putExtra(Intent.EXTRA_STREAM, images[0]) }
+        else -> Intent(Intent.ACTION_SEND).apply { type = "text/plain" }
+    }.apply {
         putExtra(Intent.EXTRA_TEXT, prompt)
-        if (image != null) {
-            putExtra(Intent.EXTRA_STREAM, image)
-            clipData = android.content.ClipData.newRawUri("storyboard", image)
+        if (images.isNotEmpty()) {
+            clipData = android.content.ClipData.newRawUri("storyboard", images[0]).apply { images.drop(1).forEach { addItem(android.content.ClipData.Item(it)) } }
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
     }
     val direct = Intent(send).setPackage(CLAUDE_APP)
     val intent = if (direct.resolveActivity(context.packageManager) != null) direct else Intent.createChooser(send, "Send to Claude")
     runCatching { context.startActivity(intent) }.onFailure { vm.toast("Couldn't open Claude; the prompt is copied, paste it into Claude yourself.") }
-    vm.toast("Prompt copied too, in case Claude opens without it.")
+    vm.toast(if (images.isNotEmpty()) "Prompt copied: in Claude, long-press the message box and Paste, then send." else "Prompt copied too, in case Claude opens without it.")
 }
 
 @Composable

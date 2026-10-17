@@ -26,7 +26,7 @@ object VideoAnalyzer {
     private fun key(v: VideoInfo) = "${v.uri}|${v.durationMs}|${v.sizeBytes}"
 
     fun analyze(context: Context, clip: Int, v: VideoInfo, onProgress: (Float) -> Unit = {}): ClipAnalysis {
-        synchronized(cache) { cache[key(v)]?.let { return ClipAnalysis(clip, it.durationMs, it.fps, it.frames) } }
+        synchronized(cache) { cache[key(v)]?.let { return ClipAnalysis(clip, it.durationMs, it.fps, it.frames, it.isPhoto) } }
         val result = if (v.isImage) analyzeImage(context, clip, v) else analyzeVideo(context, clip, v, onProgress)
         synchronized(cache) { cache[key(v)] = result }
         return result
@@ -35,8 +35,8 @@ object VideoAnalyzer {
     private fun analyzeImage(context: Context, clip: Int, v: VideoInfo): ClipAnalysis {
         val bmp = VideoProbe.thumbnail(context, v, 0, 240)
         val stat = bmp?.let { measure(it, null, 0) }
-        // A photo is one still "shot" as long as it's shown by default.
-        return ClipAnalysis(clip, VideoProbe.IMAGE_DEFAULT_MS, 30f, listOfNotNull(stat))
+        // A photo is one still "shot" that can be shown for up to 10 s.
+        return ClipAnalysis(clip, VideoProbe.IMAGE_MAX_MS, 30f, listOfNotNull(stat), isPhoto = true)
     }
 
     private fun analyzeVideo(context: Context, clip: Int, v: VideoInfo, onProgress: (Float) -> Unit): ClipAnalysis {

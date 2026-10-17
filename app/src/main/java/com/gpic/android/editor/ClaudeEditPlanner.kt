@@ -29,7 +29,7 @@ class ClaudeException(message: String) : Exception(message)
  * own API key. Sends the video's metadata, the current plan, the LUT list and the request; frames only when
  * the user ticks "let Claude see frames". The video file itself never leaves the phone.
  */
-class ClaudeEditPlanner(apiKey: String) {
+class ClaudeEditPlanner(apiKey: String, private val model: String = MODEL) {
     private val client = AnthropicOkHttpClient.builder()
         .apiKey(apiKey)
         // Thinking plus a few images can take a while; the default 10 min is more than a phone user waits.
@@ -43,6 +43,7 @@ class ClaudeEditPlanner(apiKey: String) {
         current: EditPlan,
         luts: List<LutInfo>,
         frames: List<Frame>,
+        shots: String? = null,
     ): PlannedEdit {
         val context = JSONObject()
             .put("clips", JSONArray(clips.mapIndexed { i, video ->
@@ -61,12 +62,13 @@ class ClaudeEditPlanner(apiKey: String) {
             .put("output_length_s", current.outputMs(clips.map { it.durationMs }) / 1000.0)
             .put("luts", JSONArray(luts.map { JSONObject().put("id", it.id).put("title", it.title).put("use_for", it.description) }))
             .put("music_track", current.music?.let { m ->
-                JSONObject().put("title", m.title).put("bpm", m.bpm.takeIf { it > 0 }?.toDouble() ?: JSONObject.NULL)
+                JSONObject().put("title", m.title).put("bpm", m.bpm.takeIf { it > 0 }?.let { r3(it) } ?: JSONObject.NULL)
                     .put("song_length_s", m.durationMs / 1000.0)
                     .put("beats_in_output_s", JSONArray(m.beatsMs.map { (it - m.startMs) / 1000.0 }.filter { it >= 0 }.take(200)))
             } ?: JSONObject.NULL)
         val blocks = mutableListOf<ContentBlockParam>()
         blocks += ContentBlockParam.ofText("Video and current edit:\n$context")
+        if (shots != null) blocks += ContentBlockParam.ofText("Shots found on the phone (S<n>: clip, time range in that clip, camera, scores 0-1, flags):\n$shots")
         for (f in frames) {
             blocks += ContentBlockParam.ofText("Clip ${f.clip}, frame at ${"%.1f".format(f.timeMs / 1000.0)} s:")
             blocks += ContentBlockParam.ofImage(
@@ -79,7 +81,7 @@ class ClaudeEditPlanner(apiKey: String) {
         blocks += ContentBlockParam.ofText("Request: ${request.trim()}")
 
         val params = MessageCreateParams.builder()
-            .model(MODEL)
+            .model(model)
             .maxTokens(16000L)
             .system(SYSTEM + if (frames.isEmpty()) NO_FRAMES else WITH_FRAMES)
             .outputConfig(
@@ -95,9 +97,14 @@ class ClaudeEditPlanner(apiKey: String) {
                     )
                     .build()
             )
-            // If a safety classifier declines, retry server-side on Anthropic's recommended model instead of failing.
-            .putAdditionalHeader("anthropic-beta", "server-side-fallback-2026-07-01")
-            .putAdditionalBodyProperty("fallbacks", JsonValue.from("default"))
+            .apply {
+                // If a safety classifier declines, retry server-side on Anthropic's recommended model instead of
+                // failing. Haiku 5.5 has no server-side fallback, so it's asked only of the others.
+                if (!model.startsWith("claude-haiku")) {
+                    putAdditionalHeader("anthropic-beta", "server-side-fallback-2026-07-01")
+                    putAdditionalBodyProperty("fallbacks", JsonValue.from("default"))
+                }
+            }
             .addUserMessageOfBlockParams(blocks)
             .build()
 
@@ -106,7 +113,7 @@ class ClaudeEditPlanner(apiKey: String) {
         } catch (e: UnauthorizedException) {
             throw ClaudeException("Claude didn't accept the API key. Tap “API key” to check or replace it.")
         } catch (e: PermissionDeniedException) {
-            throw ClaudeException("This API key isn't allowed to use $MODEL.")
+            throw ClaudeException("This API key isn't allowed to use $model.")
         } catch (e: RateLimitException) {
             throw ClaudeException("Claude is rate-limiting this key. Try again in a minute.")
         } catch (e: BadRequestException) {
@@ -136,6 +143,12 @@ class ClaudeEditPlanner(apiKey: String) {
 
     companion object {
         const val MODEL = "claude-opus-5-5"
+        /** Models offered for API-key requests: id and label. Haiku is the cheap one for trying things out. */
+        val MODELS = listOf(
+            "claude-opus-5-5" to "Opus 5.5 (best plans)",
+            "claude-sonnet-5-5" to "Sonnet 5.5",
+            "claude-haiku-5-5" to "Haiku 5.5 (cheapest)",
+        )
         /** Frames sent when the user lets Claude look, shared across all clips; each ≤ 512 px on its long side. */
         const val FRAME_COUNT = 24
 
@@ -152,13 +165,13 @@ class ClaudeEditPlanner(apiKey: String) {
             return JSONObject()
                 .put("segments", JSONArray(p.segments.map { s ->
                     JSONObject().put("clip", s.clip).put("start_s", s.startMs / 1000.0).put("end_s", s.endMs / 1000.0)
-                        .put("speed", s.speed.toDouble()).put("curve", s.curve.name).put("volume", s.volume.toDouble())
+                        .put("speed", r3(s.speed)).put("curve", s.curve.name).put("volume", r3(s.volume))
                         .put("transition", s.transition.name).put("motion", s.motion.name)
                 }))
                 .put("look", full.getJSONObject("look"))
                 .put("texts", full.getJSONArray("texts"))
-                .put("keep_original_audio", p.keepOriginalAudio).put("original_volume", p.originalVolume.toDouble())
-                .put("music_volume", (m?.volume ?: 0.8f).toDouble()).put("music_start_s", (m?.startMs ?: 0) / 1000.0)
+                .put("keep_original_audio", p.keepOriginalAudio).put("original_volume", r3(p.originalVolume))
+                .put("music_volume", r3(m?.volume ?: 0.8f)).put("music_start_s", (m?.startMs ?: 0) / 1000.0)
                 .put("music_fade_in_s", (m?.fadeInMs ?: 0) / 1000.0).put("music_fade_out_s", (m?.fadeOutMs ?: 1500) / 1000.0)
                 .put("aspect", p.aspect.name).put("canvas", p.canvas.name)
         }
@@ -173,7 +186,7 @@ class ClaudeEditPlanner(apiKey: String) {
                 .apply { o.optJSONObject("look")?.let { put("look", it) } }
                 .apply { o.optJSONArray("texts")?.let { put("texts", it) } }
                 .put("keep_original_audio", o.optBoolean("keep_original_audio", current.keepOriginalAudio))
-                .put("original_volume", o.optDouble("original_volume", current.originalVolume.toDouble()))
+                .put("original_volume", o.optDouble("original_volume", r3(current.originalVolume)))
                 .put("aspect", o.optString("aspect", current.aspect.name))
                 .put("canvas", o.optString("canvas", current.canvas.name)), base = if (o.has("texts")) current.copy(texts = emptyList()) else current)
             return plan.copy(
@@ -181,7 +194,7 @@ class ClaudeEditPlanner(apiKey: String) {
                     current.segments.getOrNull(i)?.let { old -> s.copy(rotation = old.rotation, mirror = old.mirror, look = old.look) } ?: s
                 },
                 music = current.music?.copy(
-                    volume = o.optDouble("music_volume", current.music.volume.toDouble()).toFloat(),
+                    volume = o.optDouble("music_volume", r3(current.music.volume)).toFloat(),
                     startMs = (o.optDouble("music_start_s", current.music.startMs / 1000.0) * 1000).toLong(),
                     fadeInMs = (o.optDouble("music_fade_in_s", current.music.fadeInMs / 1000.0) * 1000).toLong(),
                     fadeOutMs = (o.optDouble("music_fade_out_s", current.music.fadeOutMs / 1000.0) * 1000).toLong(),
@@ -248,7 +261,7 @@ class ClaudeEditPlanner(apiKey: String) {
          * the instructions, a plain-language field list instead of the JSON schema, the clips and the current edit,
          * and the request. The reply is pasted back and read by [parseReply].
          */
-        fun chatPrompt(request: String, clips: List<VideoInfo>, current: EditPlan, luts: List<LutInfo>, withStoryboard: Boolean): String {
+        fun chatPrompt(request: String, clips: List<VideoInfo>, current: EditPlan, luts: List<LutInfo>, withStoryboard: Boolean, shots: String? = null): String {
             val clipsText = clips.mapIndexed { i, v ->
                 "clip $i: ${if (v.isImage) "photo (can show up to 10 s)" else "video ${"%.1f".format(v.durationMs / 1000.0)} s"}, " +
                     "${v.displayWidth}x${v.displayHeight}" + (if (v.hasAudio) ", has sound" else "") + (if (v.fromDji) ", DJI camera" else "") +
@@ -270,7 +283,11 @@ class ClaudeEditPlanner(apiKey: String) {
                 appendLine()
                 appendLine("Clips:")
                 appendLine(clipsText)
-                if (withStoryboard) appendLine("The attached image shows frames from the clips, labelled with the clip number and time (C1 0:03 = clip 1 at 3 s).")
+                if (shots != null) {
+                    appendLine("Shots found on the phone (S<n>: clip, time range in that clip, camera, scores 0-1, flags; prefer good, steady shots):")
+                    appendLine(shots)
+                }
+                if (withStoryboard) appendLine("The attached image(s) show the best moment of the best shots, labelled with the shot, clip and time (S4 C1 0:03 = shot 4, clip 1 at 3 s).")
                 if (m != null) {
                     appendLine("Music: ${m.title}" + (if (m.bpm > 0) ", ${m.bpm.toInt()} BPM" else "") +
                         (if (m.beatsMs.isNotEmpty()) ", beats at output seconds: " + m.beatsMs.map { (it - m.startMs) / 1000.0 }.filter { it >= 0 }.take(60).joinToString { "%.2f".format(it) } else ""))
