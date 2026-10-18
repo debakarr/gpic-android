@@ -8,7 +8,7 @@
 
 - **Package:** `com.gpic.android`
 - **App entry:** `MainActivity` → Compose NavHost (home/auth/settings)
-- **Current version:** `1.7.0 (19)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
+- **Current version:** `1.7.1 (20)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
 - **Repo:** `github.com/debakarr/gpic-android` (private), branch `main`
 
 ## Tech Stack
@@ -134,6 +134,11 @@ docs/AUTH_LINKING_RESEARCH.md    # why silent Photos linking is impossible; Cred
 (Settings): download-to-phone first (default; works without mobile data) or stream (single-pass hash,
 needs internet alongside the camera AP; falls back to download). `adb logcat -s GPicCamera` traces it.
 On a 2.4 GHz-only phone (Redmi 3S) the Action 4's AP never appeared in scans after a successful BLE pair — likely 5 GHz.
+Sizes: the DUML manifest's size is u32, so videos over 4 GB (an 8-min 4K60 clip is 6.3 GB) list as 0 B (user report:
+0 B, then "Local file missing" from an empty staged copy). `CameraLink.fileSize` asks the HTTP server (Content-Range
+total of a 1-byte Range read, HEAD Content-Length) and `SizeProbe` (pure, tested) checks a candidate with Range reads
+at size−1 / size (a wrapped size fails: the byte after it exists), else finds the end by doubling + bisection. Run for
+0-byte files after listing and for every selected video before a transfer. Not yet tried on a real > 4 GB file.
 
 ### Photo location (GPS) — read originals
 Android 10+ zero-fills GPS in photos it hands to apps without `ACCESS_MEDIA_LOCATION`, so a plain
