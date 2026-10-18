@@ -139,6 +139,8 @@ class CameraStager(private val link: CameraLink, private val dir: File) {
      * @return the complete local file.
      */
     fun download(f: DjiFile, isCancelled: () -> Boolean, onBytes: (Long) -> Unit): File {
+        // Nothing to compare a download against: an empty "copy" would only fail later as a missing file.
+        if (f.sizeBytes <= 0) throw IOException("The camera didn't report the size of ${f.displayName}")
         dir.mkdirs()
         val out = stagedFile(f)
         val have = out.length().let { if (it > f.sizeBytes) { out.delete(); 0L } else it }

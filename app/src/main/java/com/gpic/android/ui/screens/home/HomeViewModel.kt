@@ -15,6 +15,7 @@ import com.gpic.android.camera.CameraHttpSource
 import com.gpic.android.camera.CameraLink
 import com.gpic.android.camera.CameraStager
 import com.gpic.android.camera.CameraState
+import com.gpic.android.camera.osmosis.camera.PathAddressing
 import com.gpic.android.camera.osmosis.core.CameraFile
 import com.gpic.android.data.auth.AppConfig
 import com.gpic.android.data.auth.Credential
@@ -636,6 +637,7 @@ class HomeViewModel(
         val link = cameraLink!!
         // Local copies from an earlier attempt: just upload them.
         if (files.all { it.file != null }) return finishStagedUpload(link, files, cfg, cred)
+        val files = checkCameraSizes(link, files)
         val canStream = link.state.value is CameraState.Ready && link.hasInternet()
         if (cfg.cameraStream && canStream) {
             notice("Streaming from the camera to Google Photos")
@@ -648,6 +650,25 @@ class HomeViewModel(
         val staged = stageFromCamera(link, files) ?: return
         if (batchCancelled || staged.isEmpty()) return
         finishStagedUpload(link, staged, cfg, cred)
+    }
+
+    /**
+     * The manifest's u32 size of a video over 4 GB can wrap (8 GB lists as 4 GB less), which would download
+     * a truncated clip: confirm each video's size with the camera's HTTP server before transferring.
+     */
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private suspend fun checkCameraSizes(link: CameraLink, files: List<DjiFile>): List<DjiFile> = withContext(Dispatchers.IO) {
+        val videos = files.count { it.file == null && it.cameraPath != null && it.isVideo }
+        if (videos == 0) return@withContext files
+        notice("Checking video sizes on the camera…")
+        val out = files.map { f ->
+            if (f.file != null || f.cameraPath == null || !f.isVideo || batchCancelled) f
+            else f.copy(sizeBytes = link.fileSize(PathAddressing.byPath(f.cameraStorage, f.cameraPath), f.sizeBytes))
+        }
+        notice(null)
+        val byKey = out.associateBy { it.key }
+        _state.update { st -> st.copy(djiFiles = st.djiFiles.map { byKey[it.key] ?: it }) }
+        out
     }
 
     @RequiresApi(Build.VERSION_CODES.Q)

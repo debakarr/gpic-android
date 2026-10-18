@@ -386,8 +386,16 @@ class CameraLink(context: Context) {
         }
         // Holds the AP up, keeps playback mode, and stops the camera sleeping mid-transfer.
         s.startKeepAlive()
-        val resolved = all.filter { !it.isIndexed }.map { it.copy(storage = storageFor(it)) }
+        val placed = all.filter { !it.isIndexed }.map { it.copy(storage = storageFor(it)) }
             .distinctBy { "${it.storage}:${it.path}" }
+        // Videos over 4 GB list as 0 bytes (the manifest's size is u32): ask the HTTP server instead.
+        val unsized = placed.count { it.sizeBytes <= 0 }
+        var sized = 0
+        val resolved = placed.map { f ->
+            if (f.sizeBytes > 0 || gen != generation) return@map f
+            step("Checking the size of big videos… ${++sized}/$unsized", 0.97f)
+            f.copy(sizeBytes = fileSize(PathAddressing.byPath(f.storage, f.path), 0))
+        }
         log("datalink: ${resolved.size} files listed")
         main.post {
             if (gen == generation) _state.value = CameraState.Ready(cam, resolved, hasInternet())
@@ -427,6 +435,47 @@ class CameraLink(context: Context) {
     private fun head(path: String): Int = runCatching {
         httpClient()!!.newCall(Request.Builder().url(url(path)).head().build()).execute().use { it.code }
     }.getOrDefault(-1)
+
+    /**
+     * A camera file's real size ([listed] = the manifest's, 0 if none), see [SizeProbe]. Blocking; a few
+     * requests when the server's answers agree, ~40 one-byte reads when they don't. 0 when nothing worked.
+     */
+    fun fileSize(path: String, listed: Long): Long {
+        val client = httpClient() ?: return listed
+        var total = 0L
+        var length = 0L
+        val first = rangeRead(client, path, 0) { r -> total = SizeProbe.rangeTotal(r.header("Content-Range")) ?: 0L }
+        runCatching {
+            client.newCall(Request.Builder().url(url(path)).head().build()).execute().use { r ->
+                if (r.isSuccessful) length = r.header("Content-Length")?.toLongOrNull() ?: 0L
+            }
+        }
+        val size = SizeProbe.resolve(listOf(total, length, listed)) { at ->
+            if (at == 0L && first != null) first else rangeRead(client, path, at)
+        }
+        if (size != listed) log("size of ${path.substringAfterLast('/')}: listed $listed, Content-Range $total, HEAD $length → $size")
+        return size
+    }
+
+    /** One-byte read at [at]: true = there's a byte (206), false = past the end (416), null = no answer. */
+    private fun rangeRead(client: OkHttpClient, path: String, at: Long, onPartial: (okhttp3.Response) -> Unit = {}): Boolean? {
+        repeat(3) { attempt ->
+            val code = runCatching {
+                client.newCall(Request.Builder().url(url(path)).header("Range", "bytes=$at-$at").build()).execute().use { r ->
+                    if (r.code == 206) onPartial(r)
+                    r.code
+                }
+            }.getOrDefault(-1)
+            when (code) {
+                206 -> return true
+                416 -> return false
+                200 -> return null // Range ignored: can't probe this way
+            }
+            // 404/500 mean "busy" on DJI firmware; give it a moment.
+            Thread.sleep(500L * (attempt + 1))
+        }
+        return null
+    }
 
     /**
      * Whether the phone has a validated internet network *other than* the camera right now. Most phones
