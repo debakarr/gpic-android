@@ -405,7 +405,8 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
                 Panel.CANVAS -> CanvasPanel(state, vm)
                 Panel.QUICK_EDIT -> QuickEditPanel(state, vm)
                 Panel.CLAUDE -> ClaudePanel(state, vm, onAddKey = { keyDialog = true },
-                    onShareToApp = { withBoard -> scope.launch { shareToClaude(context, vm, withBoard) } },
+                    onShareToApp = { withBoard -> scope.launch { shareToClaude(context, vm) { vm.prepareClaudeShare(withBoard) } } },
+                    onReview = { scope.launch { shareToClaude(context, vm) { vm.prepareClaudeReview() } } },
                     onPasteReply = { vm.applyClaudeReply(clipboard.getText()?.text) })
                 Panel.CARDS -> CardsPanel(state, vm)
                 Panel.TEMPLATES -> TemplatesPanel(state, vm)
@@ -619,8 +620,8 @@ private const val CLAUDE_APP = "com.anthropic.claude"
  * Opens the Claude app (or the share menu) with the storyboard image(s). The Claude app keeps shared images but
  * drops shared text when images come along, so the prompt goes on the clipboard to paste into the message box.
  */
-private suspend fun shareToClaude(context: android.content.Context, vm: EditorViewModel, withStoryboard: Boolean) {
-    val (prompt, images) = vm.prepareClaudeShare(withStoryboard)
+private suspend fun shareToClaude(context: android.content.Context, vm: EditorViewModel, prepare: suspend () -> Pair<String, List<android.net.Uri>>) {
+    val (prompt, images) = prepare()
     val cm = context.getSystemService(android.content.ClipboardManager::class.java)
     cm?.setPrimaryClip(android.content.ClipData.newPlainText("GPic prompt", prompt))
     val send = when {

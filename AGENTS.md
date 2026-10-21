@@ -91,7 +91,8 @@ app/src/main/
                 CubeLut.kt (.cube parser; pure), LutStore.kt, VideoProbe.kt (metadata, frames, thumbnails, photos),
                 VideoExporter.kt (CompositionBuilder shared by preview + export, effects, Transformer, Encoders),
                 TextRender.kt (text/sticker bitmaps + animation maths), AudioFx.kt (fades/gain), Openverse.kt (CC music),
-                ProjectStore.kt (drafts), ClaudeEditPlanner.kt (Anthropic SDK + Claude-app prompt/reply parser),
+                ProjectStore.kt (drafts), ClaudeEditPlanner.kt (prompts, reply parser, API conversation),
+                ClaudeEdits.kt (Claude's edit list: labels, apply, summary; pure),
                 Templates.kt (VideoTemplate rhythms + MusicPicker mood/track choice; pure),
                 Proxies.kt (540p edit copies), VideoAnalyzer.kt (on-phone frame measurements), SmartEdit.kt (shots,
                 scoring, duplicates, beat slots; pure), Cards.kt (title-card backgrounds, storyboard sheet)
@@ -256,9 +257,28 @@ or a clip's own sound. Beats: `Beats.decodeMono` (11 kHz mono) → spectral flux
 weighted to 120) → fractional period/phase comb → snap to onsets (tested on click tracks: < 40 ms). Pace
 Fast/Normal/Chillout = every 1/2/4 beats; "Cut on beats" = `Timeline.snapToBeats`. Quick edit cuts are a whole
 number of beats (`AutoEdit.beatCutMs`) and the song starts on a beat.
-Ask Claude: `claude-opus-5-5`, effort medium, `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`);
-schema in `ClaudeEditPlanner.schema` (strict, tested); it sees clip metadata, the plan, the song's beats in output
-time, and up to 24 frames only when ticked. Key in the encrypted prefs.
+Ask Claude (1.8, ideas from jub0t/concat's MCP agent: AGPL, so ideas only, no code): Claude edits like a person at the
+timeline instead of rewriting the plan. The prompt (`ClaudeEditPlanner.chatPrompt`, same text for the Claude app and the
+API) has what GPic can do, cutting advice (`ClaudeEdits.CRAFT`), the reply format with one example per edit
+(`ClaudeEdits.guide`), the clips, every shot (S#), beats, and a compact summary of the edit (`ClaudeEdits.summary`: P#/T#
+labels, output times, only non-default settings). The reply is `{"explanation", "edits": [...]}`; `ClaudeEdits.apply`
+(pure, tested) runs montage (shots by label, cut around each shot's peak, kept inside it), set/remove/move_part,
+add/set/remove_text, look, audio, format in order as one undo step; labels resolve through `EditRefs` (ids captured when
+the prompt was built, so an earlier removal or an edit made between share and paste can't retarget them); a bad edit is
+skipped and reported ("edit 3 (set_part P9): there's no P9"). find_music / template / cut_on_beats are `FollowUp`s the
+view model runs after (music first, template rebuilds the track then the non-track edits go on top, beats last). Old
+whole-plan replies still apply. "Check result in Claude app" shares a result board (`Cards.resultFrame`: a frame from the
+middle of each part through `Timeline.clipTime`, rotation, look, canvas fit, vignette, texts as they animate; ≤ 16 frames)
+with a self-contained `reviewPrompt` that includes the skipped edits. With an API key the same prompt goes as a
+conversation (`ClaudeEditPlanner.ask(turns)`, no structured-output schema any more), then one automatic review turn with
+the result board when frames are allowed. API path still untested (no key). The refs are also saved with the project
+(`claude-refs.json`, parts by clip range and texts by start+text, since drafts don't keep ids): Android may kill GPic
+while the user is in the Claude app. Music settings in the same reply as find_music are applied again once the track
+arrives. Tested on the Redmi with Haiku 5.5 (incognito, synthetic clips): it used the edit format as given (montage by
+S#, slow-mo, title, find_music, audio, cut_on_beats); after GPic was killed mid-answer the paste still applied with
+nothing skipped; on "Check result" it noticed the edit was 12 s of a 15 s request and a flat green part, and fixed both.
+Fixed on the way: `Openverse.download` could return a track's `.json` credit (or a `.part`) as the audio when it had been
+downloaded before, so beats failed and the preview errored.
 Not done: reverse, keyframes, chroma key, voice-over, auto captions, stabilisation, true cross-dissolve (two
 overlapping sequences; too heavy for old phones).
 
@@ -297,7 +317,7 @@ storyboards via SEND_MULTIPLE) but drops EXTRA_TEXT when images come along, so t
 pasting a long prompt becomes a "Pasted content" attachment, which works. Its JSON block's Copy button + Paste
 reply applied the plan. API key requests can choose Opus 5.5 / Sonnet 5.5 / Haiku 5.5 (`claude_model` in gpic_prefs);
 Haiku 5.5 has no server-side fallback, so `fallbacks`/beta header go only to the others.
-Long clips (1.7): Claude gets every shot found (`shotList`: clip, range, camera, quality/action, faces, flags,
+Long clips (1.7): Claude gets every shot found (`shotInfo`: clip, range, camera, quality/action, faces, flags,
 look-alike group) as text, and the frames are the peak of the best shots, one per look-alike group first
 (`claudeFrames`, up to 32 = two 16-frame storyboards; 24 for the API) instead of evenly spaced samples. Checked on a
 2-minute clip: Haiku chose moments from the start, middle and last seconds. Analysis of a 2-min 720p clip took ~100 s

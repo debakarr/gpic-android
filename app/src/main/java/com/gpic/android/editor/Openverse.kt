@@ -102,7 +102,8 @@ class Openverse(private val context: Context) {
 
     /** The downloaded file for [t], fetching it first if needed; [onProgress] gets 0..100 (or -1 when unknown). */
     fun download(t: OpenTrack, onProgress: (Int) -> Unit): File {
-        musicDir.listFiles { f -> f.nameWithoutExtension == safe(t.id) }?.firstOrNull()?.let { return it }
+        // Only the audio itself: the credit (.json) and an unfinished download (.part) share the track's name.
+        musicDir.listFiles { f -> f.nameWithoutExtension == safe(t.id) && f.extension !in setOf("json", "part") }?.firstOrNull()?.let { return it }
         val tmp = File(musicDir, "${safe(t.id)}.part")
         val req = Request.Builder().url(t.url).header("User-Agent", USER_AGENT).build()
         http.newCall(req).execute().use { r ->

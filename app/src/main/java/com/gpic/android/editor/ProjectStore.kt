@@ -77,6 +77,10 @@ class ProjectStore(private val context: Context) {
 
     fun delete(id: String) { File(root, id).deleteRecursively() }
 
+    /** What the labels in the project's last Claude prompt meant ([EditRefs.toJson]); survives GPic being closed meanwhile. */
+    fun saveClaudeRefs(id: String, o: JSONObject) { runCatching { File(File(root, id).apply { mkdirs() }, "claude-refs.json").writeText(o.toString()) } }
+    fun loadClaudeRefs(id: String): JSONObject? = runCatching { JSONObject(File(File(root, id), "claude-refs.json").readText()) }.getOrNull()
+
     /** True when [uri] is a file inside a project's media folder (so it's ours to delete). */
     fun isProjectMedia(uri: Uri) = uri.scheme == "file" && uri.path?.startsWith(root.absolutePath) == true
 }

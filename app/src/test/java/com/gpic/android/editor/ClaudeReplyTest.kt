@@ -8,6 +8,7 @@ import org.junit.Test
 class ClaudeReplyTest {
     private val durations = listOf(10_000L, 6_000L)
     private val current = Timeline.materialize(EditPlan(look = Look(filter = Filter.WARM)), durations)
+    private val refs = EditRefs.of(current, emptyList())
 
     @Test fun readsAFencedBlockAmongProse() {
         val reply = """
@@ -21,7 +22,7 @@ class ClaudeReplyTest {
             ```
             Let me know if you want it longer.
         """.trimIndent()
-        val r = ClaudeEditPlanner.parseReply(reply, current, durations, emptySet())
+        val r = ClaudeEditPlanner.parseReply(reply, current, refs, durations, emptySet())
         assertEquals(listOf(1, 0), r.plan.segments.map { it.clip })
         assertEquals(0.5f, r.plan.segments[0].speed)
         assertEquals(SpeedCurve.HERO, r.plan.segments[1].curve)
@@ -32,7 +33,7 @@ class ClaudeReplyTest {
     }
 
     @Test fun readsBareJsonAndKeepsWhatItDidntMention() {
-        val r = ClaudeEditPlanner.parseReply("Here: {\"aspect\": \"VERTICAL\", \"canvas\": \"BLUR\"} done", current, durations, emptySet())
+        val r = ClaudeEditPlanner.parseReply("Here: {\"aspect\": \"VERTICAL\", \"canvas\": \"BLUR\"} done", current, refs, durations, emptySet())
         assertEquals(Aspect.VERTICAL, r.plan.aspect)
         assertEquals(Canvas.BLUR, r.plan.canvas)
         assertEquals(current.segments.map { it.clip to it.endMs }, r.plan.segments.map { it.clip to it.endMs })
@@ -46,7 +47,7 @@ class ClaudeReplyTest {
     @Test fun brokenOrMissingJsonIsAClearError() {
         for (bad in listOf("no json here", "```json\n{\"segments\": [1, 2,],}\n```")) {
             try {
-                ClaudeEditPlanner.parseReply(bad, current, durations, emptySet())
+                ClaudeEditPlanner.parseReply(bad, current, refs, durations, emptySet())
                 if (bad == "no json here") fail("should have failed")
             } catch (e: ClaudeException) {
                 assertTrue(e.message!!.isNotBlank())
@@ -54,12 +55,21 @@ class ClaudeReplyTest {
         }
     }
 
-    @Test fun promptListsTheFieldsAndRequest() {
+    @Test fun promptListsTheEditsAndRequest() {
         // (VideoInfo needs an android.net.Uri, which the JVM stubs can't make; the clip lines are covered on the device.)
         val p = ClaudeEditPlanner.chatPrompt("make it short", emptyList(), current, emptyList(), withStoryboard = true)
         assertTrue(p.contains("```json"))
-        assertTrue(p.contains("transition (NONE|FADE_BLACK"))
+        assertTrue(p.contains("\"op\":\"montage\""))
+        assertTrue(p.contains("transition: NONE|FADE_BLACK"))
+        assertTrue(p.contains("P1: 0.0–10.0 s ← clip 0 0.0–10.0 s"))
         assertTrue(p.contains("My request: make it short"))
         assertTrue(p.contains("attached image"))
+    }
+
+    @Test fun reviewPromptCarriesTheProblems() {
+        val p = ClaudeEditPlanner.reviewPrompt("make it short", emptyList(), current, emptyList(), listOf("edit 2 (remove_part P9): there's no P9"))
+        assertTrue(p.contains("there's no P9"))
+        assertTrue(p.contains("\"edits\": []"))
+        assertTrue(p.contains("My request was: make it short"))
     }
 }

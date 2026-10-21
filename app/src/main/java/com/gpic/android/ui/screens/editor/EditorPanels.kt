@@ -488,7 +488,7 @@ fun CardsPanel(state: EditorUiState, vm: EditorViewModel) {
 }
 
 @Composable
-fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit, onShareToApp: (Boolean) -> Unit, onPasteReply: () -> Unit) {
+fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit, onShareToApp: (Boolean) -> Unit, onReview: () -> Unit, onPasteReply: () -> Unit) {
     var storyboard by remember { mutableStateOf(true) }
     PanelSheet("Ask Claude", onClose = { vm.openPanel(null) }) {
         Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -501,7 +501,8 @@ fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit,
             Text("With the Claude app (Pro plan)", color = Color.White, style = MaterialTheme.typography.titleSmall)
             Text("1. Ask in Claude app: opens Claude" + (if (storyboard) " with storyboard images of your best shots" else "") +
                 " and copies the prompt (your request, every shot found, the current edit). In Claude: long-press the message box, Paste, " +
-                "pick a model (Haiku is fastest), send.\n2. Tap Copy under Claude's JSON, come back, tap Paste reply.",
+                "pick a model (Haiku is fastest), send.\n2. Tap Copy under Claude's JSON, come back, tap Paste reply.\n" +
+                "3. Optional: Check result sends Claude a picture of each part as it exports, so it can fix what it sees. Paste its reply the same way.",
                 color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = storyboard, onCheckedChange = { storyboard = it })
@@ -513,6 +514,15 @@ fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit,
                 OutlinedButton(onClick = onPasteReply) { Icon(Icons.Default.ContentPaste, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("Paste reply") }
             }
             state.claudeNote?.let { Text(it, color = Color.White, style = MaterialTheme.typography.bodyMedium) }
+            if (state.claudeProblems.isNotEmpty()) {
+                Text("Skipped: " + state.claudeProblems.joinToString("\n"), color = Color(0xFFFFB74D), style = MaterialTheme.typography.bodySmall)
+            }
+            if (state.claudeApplied) {
+                OutlinedButton(onClick = onReview, enabled = state.autoProgress == null) {
+                    Icon(Icons.AutoMirrored.Filled.Send, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("Check result in Claude app")
+                }
+            }
+            state.autoProgress?.let { Text(it, color = EditorColors.Muted, style = MaterialTheme.typography.bodySmall) }
             HorizontalDivider(color = EditorColors.Lane)
             // API key: billed separately in the Anthropic Console (not part of Pro).
             Text("With an API key (Anthropic Console, billed separately)", color = Color.White, style = MaterialTheme.typography.titleSmall)
@@ -522,7 +532,7 @@ fun ClaudePanel(state: EditorUiState, vm: EditorViewModel, onAddKey: () -> Unit,
                 ChipRow { ClaudeEditPlanner.MODELS.forEach { (id, label) -> Pick(label, state.claudeModel == id, enabled = !state.asking) { vm.setClaudeModel(id) } } }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = state.sendFrames, onCheckedChange = vm::setSendFrames, enabled = !state.asking)
-                    Text("Let Claude see up to ${ClaudeEditPlanner.FRAME_COUNT} small frames", color = EditorColors.Muted,
+                    Text("Let Claude see storyboards of your best shots, then a picture of the result to check its work", color = EditorColors.Muted,
                         style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {

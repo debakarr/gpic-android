@@ -319,7 +319,7 @@ data class EditPlan(
             transitionMs = (s.optDouble("transition_s", Segment.DEFAULT_TRANSITION_MS / 1000.0) * 1000).toLong(),
         )
 
-        private fun lookFrom(o: JSONObject, base: Look): Look {
+        internal fun lookFrom(o: JSONObject, base: Look): Look {
             var l = base.copy(
                 lutId = if (o.has("lut")) o.optString("lut").takeIf { it.isNotEmpty() && it != NO_LUT } else base.lutId,
                 filter = if (o.has("filter")) Filter.entries.firstOrNull { it.name == o.optString("filter") } else base.filter,
@@ -329,7 +329,7 @@ data class EditPlan(
             return l
         }
 
-        private fun textFrom(t: JSONObject, b: TextItem?): TextItem {
+        internal fun textFrom(t: JSONObject, b: TextItem?): TextItem {
             val base = b ?: TextItem("", 0, 0)
             return base.copy(
                 text = t.optString("text", base.text),
