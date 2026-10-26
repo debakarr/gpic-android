@@ -8,10 +8,14 @@ private val ids = AtomicLong(System.nanoTime())
 /** Ids for parts and texts: stable across edits so the timeline can keep a selection. */
 fun newId(): Long = ids.incrementAndGet()
 
-/** Switching between two parts, at the end of the part that has it. Effects run on both sides of the cut. */
+/**
+ * Switching between two parts, at the end of the part that has it. Dissolves, blur and slides mix the outgoing part's
+ * last frame into the start of the next one; the others run on both sides of the cut ([TransitionMath]).
+ */
 enum class Transition(val label: String) {
-    NONE("None"), FADE_BLACK("Fade"), FADE_WHITE("Flash"), DISSOLVE_BLUR("Blur"), ZOOM_IN("Zoom in"), ZOOM_OUT("Zoom out"),
-    SLIDE_LEFT("Slide left"), SLIDE_RIGHT("Slide right"), SLIDE_UP("Slide up"), SLIDE_DOWN("Slide down"), SPIN("Spin"),
+    NONE("None"), DISSOLVE("Dissolve"), FADE_BLACK("Fade"), FADE_WHITE("Flash"), DISSOLVE_BLUR("Blur"), ZOOM_IN("Zoom in"),
+    ZOOM_OUT("Zoom out"), WHIP_LEFT("Whip left"), WHIP_RIGHT("Whip right"), SLIDE_LEFT("Slide left"), SLIDE_RIGHT("Slide right"),
+    SLIDE_UP("Slide up"), SLIDE_DOWN("Slide down"), SPIN("Spin"), GLITCH("Glitch"),
 }
 
 /** Slow camera move over a whole part (Ken Burns), like LightCut's Zoom. */
@@ -237,7 +241,8 @@ data class EditPlan(
 
     companion object {
         const val MIN_SEGMENT_MS = 300L
-        const val MAX_SEGMENTS = 80
+        /** A long slideshow (one part per photo) still fits. */
+        const val MAX_SEGMENTS = 200
         const val MAX_TEXTS = 30
         const val MAX_TEXT = 200
         const val MIN_SPEED = 0.25f

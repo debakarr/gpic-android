@@ -3,7 +3,6 @@ package com.gpic.android.editor
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.graphics.RadialGradient
 import android.graphics.Shader
 import android.media.MediaCodecList
@@ -28,7 +27,6 @@ import androidx.media3.effect.ConvolutionFunction1D
 import androidx.media3.effect.FrameDropEffect
 import androidx.media3.effect.GaussianBlurWithFrameOverlaid
 import androidx.media3.effect.GaussianFunction
-import androidx.media3.effect.MatrixTransformation
 import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.effect.RgbMatrix
@@ -51,8 +49,6 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.math.PI
-import kotlin.math.cos
 
 /**
  * Builds the Media3 [Composition] for an [EditPlan]. The live preview (CompositionPlayer) and the export use the
@@ -82,6 +78,9 @@ class CompositionBuilder(private val luts: LutStore) {
         val total = starts.last()
         val keepCamera = plan.keepOriginalAudio && plan.originalVolume > 0f
         val anyCameraAudio = keepCamera && parts.any { clips[it.clip].hasAudio && it.volume > 0f }
+        val edges = TransitionMath.edges(parts)
+        val shared = Shared()
+        val carry = CarryOver()
         val items = parts.mapIndexed { i, seg ->
             val clip = clips[seg.clip]
             // The preview reads the small edit copy when there is one; the export never does.
@@ -98,9 +97,14 @@ class CompositionBuilder(private val luts: LutStore) {
             }
             val gain = plan.originalVolume * seg.volume
             val dropAudio = clip.isImage || !keepCamera || !clip.hasAudio || gain <= 0f
-            // Camera sound (often mono) is mixed up to stereo with its volume, so stereo music stays stereo.
-            val audio: List<AudioProcessor> = if (dropAudio) emptyList() else listOf(EditEffects.stereo(gain))
-            val video = partEffects(plan, parts, i, clip, w, h, starts[i])
+            // Camera sound (often mono) is mixed up to stereo with its volume, so stereo music stays stereo; it fades at
+            // the cuts (a few ms against clicks, longer under fades and dissolves).
+            val e = edges[i]
+            val audio: List<AudioProcessor> = if (dropAudio) emptyList() else listOf(
+                EditEffects.stereo(gain),
+                FadeAudioProcessor(1f, audioFadeUs(e.inT, e.inUs, incoming = true), audioFadeUs(e.outT, e.outUs, incoming = false), seg.outputMs * 1000),
+            )
+            val video = partEffects(plan, parts[i], e, i, clip, w, h, starts[i], shared, carry)
             EditedMediaItem.Builder(item)
                 .setRemoveAudio(dropAudio)
                 .setEffects(Effects(audio, video))
@@ -165,14 +169,29 @@ class CompositionBuilder(private val luts: LutStore) {
 
     // ---- per-part picture -------------------------------------------------------------------------------------
 
-    private fun partEffects(plan: EditPlan, parts: List<Segment>, i: Int, clip: VideoInfo, w: Int, h: Int, startMs: Long): List<Effect> = buildList {
-        val seg = parts[i]
+    /**
+     * Effects that don't change over time, one instance per distinct setting for the whole composition. Media3 keeps
+     * a pipeline across a cut only when the next part's effect list is equal (the same instances), so parts with the
+     * same look and shape play on without rebuilding shaders at the cut. Never shared between compositions: a LUT
+     * frees its texture when its program is released.
+     */
+    private class Shared {
+        val luts = HashMap<Look, Effect>()
+        val turns = HashMap<Pair<Int, Boolean>, Effect>()
+        val fits = HashMap<Any, List<Effect>>()
+        val vignettes = HashMap<Float, Effect>()
+    }
+
+    private fun partEffects(plan: EditPlan, seg: Segment, e: PartEdges, i: Int, clip: VideoInfo, w: Int, h: Int, startMs: Long,
+                            shared: Shared, carry: CarryOver): List<Effect> = buildList {
         val look = plan.lookOf(seg)
         val clock = PartClock(startMs * 1000, seg.outputMs * 1000)
         if (DEBUG_TIMES) add(TimeProbe("part$i", clock))
-        if (!look.colourNeutral) add(SingleColorLut.createFromCube(cube(look)))
+        if (!look.colourNeutral) add(shared.luts.getOrPut(look) { SingleColorLut.createFromCube(cube(look)) })
         if (seg.rotation != 0 || seg.mirror) {
-            add(ScaleAndRotateTransformation.Builder().setScale(if (seg.mirror) -1f else 1f, 1f).setRotationDegrees(-seg.rotation.toFloat()).build())
+            add(shared.turns.getOrPut(seg.rotation to seg.mirror) {
+                ScaleAndRotateTransformation.Builder().setScale(if (seg.mirror) -1f else 1f, 1f).setRotationDegrees(-seg.rotation.toFloat()).build()
+            })
         }
         // Fit into the output frame.
         val (cw, ch) = clip.displayWidth.toFloat() to clip.displayHeight.toFloat()
@@ -181,36 +200,42 @@ class CompositionBuilder(private val luts: LutStore) {
         val srcH = if (rotated) cw else ch
         val sameShape = srcW > 0 && srcH > 0 && kotlin.math.abs(srcW / srcH - w.toFloat() / h) < 0.01f
         when {
-            sameShape || plan.canvas == Canvas.CROP -> add(Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP))
-            plan.canvas == Canvas.BLACK -> add(Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_SCALE_TO_FIT))
+            sameShape || plan.canvas == Canvas.CROP -> addAll(shared.fits.getOrPut(Canvas.CROP) {
+                listOf(Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP))
+            })
+            plan.canvas == Canvas.BLACK -> addAll(shared.fits.getOrPut(Canvas.BLACK) {
+                listOf(Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_SCALE_TO_FIT))
+            })
             else -> {
                 // Blurred canvas: size the picture to fit the frame; Media3's blur-with-overlay then grows the output
                 // by 1/scale (to the frame) with a blurred, stretched copy behind the sharp picture.
                 val fit = minOf(w / srcW, h / srcH)
                 val fw = ((srcW * fit).toInt() / 2 * 2).coerceIn(2, w)
                 val fh = ((srcH * fit).toInt() / 2 * 2).coerceIn(2, h)
-                add(Presentation.createForWidthAndHeight(fw, fh, Presentation.LAYOUT_SCALE_TO_FIT))
-                add(GaussianBlurWithFrameOverlaid(BLUR_SIGMA * h / 1080f, 3f, fw.toFloat() / w, fh.toFloat() / h))
-                // Rounding can leave it a pixel off; every part must come out exactly w × h.
-                add(Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_STRETCH_TO_FIT))
+                addAll(shared.fits.getOrPut(fw to fh) {
+                    listOf(
+                        Presentation.createForWidthAndHeight(fw, fh, Presentation.LAYOUT_SCALE_TO_FIT),
+                        GaussianBlurWithFrameOverlaid(BLUR_SIGMA * h / 1080f, 3f, fw.toFloat() / w, fh.toFloat() / h),
+                        // Rounding can leave it a pixel off; every part must come out exactly w × h.
+                        Presentation.createForWidthAndHeight(w, h, Presentation.LAYOUT_STRETCH_TO_FIT),
+                    )
+                })
             }
         }
-        val inT = parts.getOrNull(i - 1)?.let { p -> p.transition to edgeUs(p, seg) } ?: (Transition.NONE to 0L)
-        val outT = parts.getOrNull(i + 1)?.let { n -> seg.transition to edgeUs(seg, n) } ?: (Transition.NONE to 0L)
-        if (seg.motion != Motion.NONE || moves(inT.first) || moves(outT.first)) add(PartMotion(seg.motion, inT, outT, clock))
-        if (inT.first == Transition.DISSOLVE_BLUR || outT.first == Transition.DISSOLVE_BLUR) add(EdgeBlur(inT, outT, clock, h))
-        if (shades(inT.first) || shades(outT.first)) add(EdgeShade(inT, outT, clock))
-        if (look.vignette > 0f) add(OverlayEffect(listOf(vignette(w, h, look.vignette))))
+        // Blur goes before the part's pass, so the frame kept for the next part's blur dissolve is already blurred.
+        if (e.inT == Transition.DISSOLVE_BLUR || e.outT == Transition.DISSOLVE_BLUR) add(EdgeBlur(e, clock, h))
+        if (e.any) add(PartFx(i, e, clock, carry))
+        else if (seg.motion != Motion.NONE) add(KenBurnsMotion(seg.motion, clock))
+        if (look.vignette > 0f) add(shared.vignettes.getOrPut(look.vignette) { OverlayEffect(listOf(vignette(w, h, look.vignette))) })
     }
 
-    /** Half the transition on each side of a cut, never more than a third of either part. */
-    private fun edgeUs(a: Segment, b: Segment): Long =
-        minOf(a.transitionMs / 2, a.outputMs / 3, b.outputMs / 3).coerceAtLeast(0) * 1000
-
-    private fun moves(t: Transition) = t in setOf(Transition.ZOOM_IN, Transition.ZOOM_OUT, Transition.SLIDE_LEFT, Transition.SLIDE_RIGHT,
-        Transition.SLIDE_UP, Transition.SLIDE_DOWN, Transition.SPIN)
-    private fun shades(t: Transition) = t in setOf(Transition.FADE_BLACK, Transition.FADE_WHITE, Transition.ZOOM_IN, Transition.ZOOM_OUT,
-        Transition.SPIN, Transition.DISSOLVE_BLUR)
+    /** Camera sound at a cut: a few ms against clicks; as long as the picture's fade or dissolve under those. */
+    private fun audioFadeUs(t: Transition, edgeUs: Long, incoming: Boolean): Long = when {
+        t == Transition.FADE_BLACK || t == Transition.FADE_WHITE -> edgeUs
+        t.blends -> if (incoming) edgeUs else 80_000L
+        t.moves || t == Transition.GLITCH -> 40_000L
+        else -> CLICK_FADE_US
+    }.coerceIn(CLICK_FADE_US, 1_000_000L)
 
     private fun speedProvider(seg: Segment): SpeedProvider {
         val steps = Timeline.speedSteps(seg)
@@ -248,6 +273,7 @@ class CompositionBuilder(private val luts: LutStore) {
         const val IMAGE_FPS = 30
         /** In the fitted picture's pixels (it's then scaled up ~2–3× behind), so a modest blur looks strong and stays fast. */
         private const val BLUR_SIGMA = 9f
+        private const val CLICK_FADE_US = 12_000L
 
         /**
          * The output size: the chosen shape (or the first part's clip's), short side ≤ [shortSideCap] and the
@@ -297,93 +323,12 @@ private class TimeProbe(val name: String, val clock: PartClock) : RgbMatrix {
     override fun isNoOp(inputWidth: Int, inputHeight: Int) = false
 }
 
-/** 0 → 1 over the incoming edge, 1 → 0 over the outgoing edge; 1 in between. Eased. */
-private fun edgeProgress(local: Long, dur: Long, inUs: Long, outUs: Long): Pair<Float, Float> {
-    val pin = if (inUs > 0) (local.toFloat() / inUs).coerceIn(0f, 1f) else 1f
-    val pout = if (outUs > 0) ((dur - local).toFloat() / outUs).coerceIn(0f, 1f) else 1f
-    fun ease(x: Float) = (0.5f - 0.5f * cos(PI.toFloat() * x))
-    return ease(pin) to ease(pout)
-}
-
-/** Ken Burns motion over the part plus the moving transitions at its edges, as one matrix. */
+/** Blur that peaks at the cut (the Blur transition); the part's own pass then dissolves between the blurred frames. */
 @OptIn(UnstableApi::class)
-private class PartMotion(
-    val motion: Motion,
-    val inT: Pair<Transition, Long>,
-    val outT: Pair<Transition, Long>,
-    val clock: PartClock,
-) : MatrixTransformation {
-    override fun getMatrix(presentationTimeUs: Long): Matrix {
-        val local = clock.toLocal(presentationTimeUs)
-        val f = if (clock.durationUs > 0) local.toFloat() / clock.durationUs else 0f
-        val m = Matrix()
-        // Motion: scale ≥ 1 so no edges show; pans stay inside the zoomed frame (NDC: the frame spans -1..1).
-        when (motion) {
-            Motion.ZOOM_IN -> (1f + 0.15f * f).let { m.postScale(it, it) }
-            Motion.ZOOM_OUT -> (1.15f - 0.15f * f).let { m.postScale(it, it) }
-            Motion.PAN_LEFT -> { m.postScale(1.15f, 1.15f); m.postTranslate(0.13f - 0.26f * f, 0f) }
-            Motion.PAN_RIGHT -> { m.postScale(1.15f, 1.15f); m.postTranslate(-0.13f + 0.26f * f, 0f) }
-            Motion.NONE -> {}
-        }
-        val (pin, pout) = edgeProgress(local, clock.durationUs, inT.second, outT.second)
-        edge(m, inT.first, 1 - pin, incoming = true)
-        edge(m, outT.first, 1 - pout, incoming = false)
-        return m
-    }
-
-    /** [k]: 0 = untouched, 1 = at the cut. */
-    private fun edge(m: Matrix, t: Transition, k: Float, incoming: Boolean) {
-        if (k <= 0f) return
-        val dir = if (incoming) -1f else 1f
-        when (t) {
-            Transition.ZOOM_IN -> (if (incoming) 1f + 0.6f * k else 1f + 0.6f * k).let { m.postScale(it, it) }
-            Transition.ZOOM_OUT -> (1f - 0.45f * k).let { m.postScale(it, it) }
-            Transition.SLIDE_LEFT -> m.postTranslate(-2f * k * dir, 0f)
-            Transition.SLIDE_RIGHT -> m.postTranslate(2f * k * dir, 0f)
-            Transition.SLIDE_UP -> m.postTranslate(0f, 2f * k * dir)
-            Transition.SLIDE_DOWN -> m.postTranslate(0f, -2f * k * dir)
-            Transition.SPIN -> { m.postRotate(180f * k * dir); (1f - 0.6f * k).let { m.postScale(it, it) } }
-            else -> {}
-        }
-    }
-}
-
-/** Fades through black or white at the edges (and a soft fade for zoom/spin/blur, so the cut doesn't snap). */
-@OptIn(UnstableApi::class)
-private class EdgeShade(val inT: Pair<Transition, Long>, val outT: Pair<Transition, Long>, val clock: PartClock) : RgbMatrix {
-    override fun getMatrix(presentationTimeUs: Long, useHdr: Boolean): FloatArray {
-        val local = clock.toLocal(presentationTimeUs)
-        val (pin, pout) = edgeProgress(local, clock.durationUs, inT.second, outT.second)
-        var dark = 1f
-        var white = 0f
-        fun apply(t: Transition, p: Float) {
-            when (t) {
-                Transition.FADE_BLACK -> dark *= p
-                Transition.FADE_WHITE -> white = maxOf(white, 1 - p)
-                Transition.ZOOM_IN, Transition.ZOOM_OUT, Transition.SPIN, Transition.DISSOLVE_BLUR -> dark *= 0.35f + 0.65f * p
-                else -> {}
-            }
-        }
-        apply(inT.first, pin)
-        apply(outT.first, pout)
-        val k = dark * (1 - white)
-        // r' = k·r + white (alpha is 1, so the 4th column adds a constant).
-        return floatArrayOf(k, 0f, 0f, 0f, 0f, k, 0f, 0f, 0f, 0f, k, 0f, white, white, white, 1f)
-    }
-
-    override fun isNoOp(inputWidth: Int, inputHeight: Int) = false
-}
-
-/** Blur that peaks at the cut. */
-@OptIn(UnstableApi::class)
-private class EdgeBlur(val inT: Pair<Transition, Long>, val outT: Pair<Transition, Long>, val clock: PartClock, val frameH: Int) : SeparableConvolution() {
+private class EdgeBlur(val edges: PartEdges, val clock: PartClock, val frameH: Int) : SeparableConvolution() {
     override fun getConvolution(presentationTimeUs: Long): ConvolutionFunction1D {
-        val local = clock.toLocal(presentationTimeUs)
-        val (pin, pout) = edgeProgress(local, clock.durationUs, inT.second, outT.second)
-        val kin = if (inT.first == Transition.DISSOLVE_BLUR) 1 - pin else 0f
-        val kout = if (outT.first == Transition.DISSOLVE_BLUR) 1 - pout else 0f
-        val sigma = (maxOf(kin, kout) * 25f * frameH / 1080f).coerceAtLeast(0.01f)
-        return GaussianFunction(sigma, 3f)
+        val b = TransitionMath.blur(edges, clock.toLocal(presentationTimeUs), clock.durationUs)
+        return GaussianFunction((b * 25f * frameH / 1080f).coerceAtLeast(0.01f), 3f)
     }
 }
 

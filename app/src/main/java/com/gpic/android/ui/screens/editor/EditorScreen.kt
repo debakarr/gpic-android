@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.image.BitmapFactoryImageDecoder
 import androidx.media3.transformer.CompositionPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -235,7 +236,13 @@ private fun Workspace(state: EditorUiState, vm: EditorViewModel, onBackUp: (Uri)
     val built by vm.preview.collectAsState()
 
     // Player + playhead
-    val player = remember { CompositionPlayer.Builder(context).build() }
+    // Photos are decoded at most this big (Media3's default is 4096 px, ~48 MB for a 12 MP photo): the preview is
+    // 480p, so this is ¼ of the pixels and much quicker at every photo in a slideshow.
+    val player = remember {
+        CompositionPlayer.Builder(context)
+            .setImageDecoderFactory(BitmapFactoryImageDecoder.Factory(context).setMaxOutputSize(EditorViewModel.PREVIEW_PHOTO_PX))
+            .build()
+    }
     var posMs by remember { mutableLongStateOf(0L) }
     var playing by remember { mutableStateOf(false) }
     var seekTo by remember { mutableStateOf<Long?>(null) }

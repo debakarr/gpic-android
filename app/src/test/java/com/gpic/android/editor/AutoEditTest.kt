@@ -44,12 +44,16 @@ class AutoEditTest {
 
     @Test fun styleSetsLookTransitionsAndMix() {
         val music = MusicTrack("u", "song", beatsMs = listOf(300, 800, 1300), startMs = 0)
-        val parts = listOf(Segment(0, 2_000, 0), Segment(0, 2_000, 1))
+        // Smart edit chose the transitions, moves and speeds; the style adds its look and mix and keeps them.
+        val parts = listOf(Segment(0, 2_000, 0, speed = 0.5f, transition = Transition.WHIP_LEFT, motion = Motion.ZOOM_IN),
+            Segment(0, 2_000, 1, transition = Transition.DISSOLVE))
         val p = AutoEdit.plan(EditPlan(music = music), parts, EditStyle.REEL)
         assertEquals(Aspect.VERTICAL, p.aspect)
         assertEquals(Canvas.BLUR, p.canvas)
         assertEquals(Filter.VIVID, p.look.filter)
-        assertEquals(listOf(EditStyle.REEL.transition, Transition.NONE), p.segments.map { it.transition })
+        assertEquals(listOf(Transition.WHIP_LEFT, Transition.NONE), p.segments.map { it.transition })
+        assertEquals(0.5f, p.segments[0].speed)
+        assertEquals(Motion.ZOOM_IN, p.segments[0].motion)
         assertEquals(EditStyle.REEL.cameraVolume, p.originalVolume)
         assertEquals(300L, p.music!!.startMs) // starts on the first beat
         assertEquals(1f, AutoEdit.plan(EditPlan(), parts, EditStyle.REEL).originalVolume)

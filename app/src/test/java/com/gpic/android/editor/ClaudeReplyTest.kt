@@ -60,7 +60,7 @@ class ClaudeReplyTest {
         val p = ClaudeEditPlanner.chatPrompt("make it short", emptyList(), current, emptyList(), withStoryboard = true)
         assertTrue(p.contains("```json"))
         assertTrue(p.contains("\"op\":\"montage\""))
-        assertTrue(p.contains("transition: NONE|FADE_BLACK"))
+        assertTrue(p.contains("transition: NONE|DISSOLVE|FADE_BLACK"))
         assertTrue(p.contains("P1: 0.0–10.0 s ← clip 0 0.0–10.0 s"))
         assertTrue(p.contains("My request: make it short"))
         assertTrue(p.contains("attached image"))

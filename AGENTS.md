@@ -66,6 +66,11 @@ Unit tests: `./gradlew testDebugUnitTest` (JVM; includes vendored osmosis Action
 `GooglePhotosLiveTest` uploads one random image to the real account, so it is skipped unless both
 `GPIC_LIVE_TEST=1` and `G_TOKEN` (photos.native line; `.envrc` is git-ignored, quote the value) are set.
 Run it with `--rerun` — env vars aren't Test-task inputs, so Gradle otherwise reuses a cached skip.
+Device test: `./gradlew connectedDebugAndroidTest` runs `TransitionRenderTest` (androidTest): exports a tour of every
+transition between photos and between decoded videos, checks pixels at each cut, and plays the preview player through
+transitions with seeks (~25 s on an arm64 emulator). Gradle uninstalls the app afterwards; to keep the frames it saves,
+`installDebug installDebugAndroidTest` then `adb shell am instrument -w com.gpic.android.test/androidx.test.runner.AndroidJUnitRunner`
+and pull `/sdcard/Android/data/com.gpic.android/files/transition-frames`.
 Lint is not enforced.
 
 ## Project Structure
@@ -90,6 +95,7 @@ app/src/main/
                 Beats.kt (on-phone beat tracking; detect() pure), AutoEdit.kt (Quick edit styles; pure),
                 CubeLut.kt (.cube parser; pure), LutStore.kt, VideoProbe.kt (metadata, frames, thumbnails, photos),
                 VideoExporter.kt (CompositionBuilder shared by preview + export, effects, Transformer, Encoders),
+                TransitionMath.kt (transition/Ken Burns maths per frame; pure), TransitionFx.kt (the part shader),
                 TextRender.kt (text/sticker bitmaps + animation maths), AudioFx.kt (fades/gain), Openverse.kt (CC music),
                 ProjectStore.kt (drafts), ClaudeEditPlanner.kt (prompts, reply parser, API conversation),
                 ClaudeEdits.kt (Claude's edit list: labels, apply, summary; pure),
@@ -227,8 +233,9 @@ all / ✓. Always dark (`EditorColors`).
 
 Model: `EditPlan.segments` are the main-track parts, each with clip range, speed or `SpeedCurve` (24 constant steps;
 `Timeline` maths matches Media3: a curved part ended at exactly the computed output time), volume, own `Look` or the
-video's, `Motion` (Ken Burns), rotation/mirror and the `Transition` into the next part (effects on both sides of
-the cut, inside the parts, so length never changes). Plus `texts` (titles + emoji stickers, output time, animated),
+video's, `Motion` (Ken Burns), rotation/mirror and the `Transition` into the next part (moves on both sides of the
+cut; dissolves, blur and slides after it; always inside the parts, so length never changes). Plus `texts` (titles +
+emoji stickers, output time, animated),
 `music` (`MusicTrack`: file, credit, length, volume, start, fades, beats), aspect, `Canvas` (crop / black / blur),
 export size + fps. Projects autosave to filesDir/projects/<id> (Google Photos picks and extracted audio copied into
 the project; SAF picks keep a persisted grant). Undo/redo = stacks of plans (`commit()` is one step).
@@ -237,8 +244,24 @@ Rendering: `CompositionBuilder` builds one `Composition` for the preview (`Compo
 text drawn by Compose from the same `TextRender` bitmaps so it can be dragged) and the export (text as a
 composition-level `OverlayEffect`). Per-part chain: baked look LUT → rotate/mirror → fit (crop / letterbox /
 blur: fit to the picture's size, then `GaussianBlurWithFrameOverlaid`, which GROWS the output by 1/scale, then pin
-w×h) → `PartMotion` matrix (motion + moving transitions) → blur transition → `EdgeShade` RgbMatrix → vignette
-overlay. Measured on the Redmi: effects get composition time (part i starts at `Timeline.starts()[i]`) in both
+w×h) → `EdgeBlur` (Blur transition only) → `PartFx` (a part with any transition) or `KenBurnsMotion` matrix (motion
+only) → vignette overlay. Time-independent effects are one instance per setting per composition (`Shared`):
+Media3's `DefaultVideoFrameProcessor` rebuilds every shader at a cut unless the next item's effect list is equal
+(same instances), and `SingleColorLut` frees its texture on release, so never share instances across compositions.
+Transitions (earlier builds eased every move to a stop at the cut, slid the picture out to black, dimmed zoom/spin
+to 35% and had no crossfade): `PartFx` is one GLSL ES 1.00 pass whose per-frame uniforms come from
+`TransitionMath.state` (pure, tested). Moves (zoom in/out, whip, spin) run on both sides of the cut and are fastest at
+it (cubic), with motion blur from a 45 ms virtual shutter (up to 16 taps between the shutter's two sampling matrices)
+and mirrored edges instead of black; spin turns in aspect-correct space. Dissolve, Blur and Slide need both pictures:
+Media3 draws a sequence's items one after another through one pipeline, so the outgoing part's `PartFx` copies its
+input frame (glReadPixels into `CarryOver`, a CPU buffer per composition: GL objects die with each part's program)
+in its last ~2.5 frame gaps, and the incoming part draws it over itself (its Ken Burns move carried on, clamped so no
+edge shows) for the whole transition length (≤ 45% of the part). After a seek into the transition (preview only)
+there's no copy: a plain cut. Fade/Flash/Glitch are colour/sampling on both sides. Camera sound fades 12 ms at every
+cut (clicks), longer under fades and dissolves (`FadeAudioProcessor`, 16-bit and float PCM). Checked on an Android 15
+arm64 emulator (`TransitionRenderTest`, frames looked at), not yet on the Redmi. The preview decodes photos at ≤ 1440
+px (`PREVIEW_PHOTO_PX`; Media3's default is 4096). Measured on the Redmi: effects get composition time (part i starts
+at `Timeline.starts()[i]`) in both
 `CompositionPlayer` and Transformer, with speed applied (`PartClock`). Gotchas: every `EditedMediaItem` needs
 `setDurationUs` (whole media length) or `CompositionPlayer` throws; the music sequence must be declared audio-only
 (`EditedMediaItemSequence.Builder(setOf(TRACK_TYPE_AUDIO))`, and then no `experimentalSetForceAudioTrack`) or the
@@ -279,8 +302,10 @@ S#, slow-mo, title, find_music, audio, cut_on_beats); after GPic was killed mid-
 nothing skipped; on "Check result" it noticed the edit was 12 s of a 15 s request and a flat green part, and fixed both.
 Fixed on the way: `Openverse.download` could return a track's `.json` credit (or a `.part`) as the audio when it had been
 downloaded before, so beats failed and the preview errored.
-Not done: reverse, keyframes, chroma key, voice-over, auto captions, stabilisation, true cross-dissolve (two
-overlapping sequences; too heavy for old phones).
+Not done: reverse, keyframes, chroma key, voice-over, auto captions, stabilisation, a two-track cross-dissolve where
+both clips keep playing (two overlapping sequences; too heavy for old phones: dissolves hold the outgoing frame).
+hypit-ai/hypit was looked at: Node + headless Chromium + FFmpeg (desktop/server, can't run on the phone) under a
+modified Apache licence that bars commercial redistribution of derivatives, so no code from it.
 
 Edit copies (1.6): clips over 720p, over 60 fps or HEVC get a 540p ≤ 30 fps H.264 copy (keyframe every 0.5 s) in
 the project's media/proxies, made one at a time behind a skippable screen with no preview decoding meanwhile (the
@@ -293,14 +318,23 @@ Smart edit (1.6, LightCut's one-tap edit without its models): LightCut's native 
 pipeline — camera-motion shot split (pan/tilt/FPV, "bad jitter"), image aesthetic score, face/person/pet detection
 and shot scale, frame-feature clustering of similar shots, template fill (its Java is packed with AppGuard; not
 read). CapCut's AutoCut has per-media tags/score/face info plus beat fetch/match nodes and runs on its servers.
-GPic: `VideoAnalyzer` samples ~2 fps (≤ 240 a clip; exact frames from originals — nearest-keyframe sampling gave
-identical frames on long-GOP clips — keyframes from edit copies): brightness/contrast, Laplacian sharpness,
+GPic: `VideoAnalyzer` samples every 0.5 s up to 2 min (240; exact frames from originals — nearest-keyframe sampling gave
+identical frames on long-GOP clips — keyframes from edit copies); longer clips get 40–120 bursts of 4 frames 0.5 s
+apart spread over the clip (`sampleTimes`), because motion/shake/action are measured between neighbouring samples
+(a 20-min clip used to be sampled every 5 s and read as shaky noise); a burst's first sample is `FrameStat.gap`
+(motion taken from the next one; skipped for jitter). Results are also saved in cacheDir/analysis (binary, `VERSION`),
+so a long clip is measured once: brightness/contrast, Laplacian sharpness,
 colourfulness, global motion from row/column profile shifts, residual "action", histogram change, and
 `android.media.FaceDetector` about once a second. `SmartEdit` (tested): shots at hard cuts and lasting motion
 changes; quality/interest scores; shaky (motion jitter), blurry (clip-relative, absolute floor, and < ¼ of the
 project's median), dark; near-duplicate groups by cosine of colour histogram + 4×4 grey; slots of the style's
 beat-length cut: good shots one per group first, then other good shots, then second windows, weak ones last;
-story order or best first; ≥ 100 fps shots at half speed; slide transitions follow the camera's pan/tilt.
+story order or best first; ≥ 100 fps shots at half speed; the style's transition on every `transitionEvery`th cut
+only (it used to be on every cut: a flash every 5 s in Vlog), still shots get its slow move; a panning shot cuts with a
+whip that carries the pan on (tilts: slide), not right after another transition; photos take turns with
+`PHOTO_MOVES` and photo-to-photo cuts become the style's `photoTransition` (Dissolve in the calm styles).
+Photos added to a project become a slideshow the same way: changing moves, 0.8 s dissolves; up to `MAX_SEGMENTS` 200
+parts (was 80, silently dropping the rest of a big photo pick).
 Measured on synthetic clips: the shaky clip read motion 0.15 / jitter 0.17, a blur sigma 14 clip 0.0014 sharpness vs
 0.013–0.07; zooms and repeating test patterns can read as shake (needs tuning on real footage; `adb logcat -s GPicSmart`).
 Generated frames: cover suggestions (best frame per group) save at the original's resolution to Pictures/GPic and
@@ -317,8 +351,10 @@ storyboards via SEND_MULTIPLE) but drops EXTRA_TEXT when images come along, so t
 pasting a long prompt becomes a "Pasted content" attachment, which works. Its JSON block's Copy button + Paste
 reply applied the plan. API key requests can choose Opus 5.5 / Sonnet 5.5 / Haiku 5.5 (`claude_model` in gpic_prefs);
 Haiku 5.5 has no server-side fallback, so `fallbacks`/beta header go only to the others.
-Long clips (1.7): Claude gets every shot found (`shotInfo`: clip, range, camera, quality/action, faces, flags,
-look-alike group) as text, and the frames are the peak of the best shots, one per look-alike group first
+Long clips (1.7): Claude gets the shots found (`shotInfo`: clip, range, camera, quality/action, faces, flags,
+look-alike group) as text, at most 120: `SmartEdit.limitShots` gives each clip a share and takes the best shot of
+each stretch, so a long clip is covered end to end (it used to be the first 120 in order, i.e. a long clip's
+first minutes only); the frames are the peak of the best shots, one per look-alike group first
 (`claudeFrames`, up to 32 = two 16-frame storyboards; 24 for the API) instead of evenly spaced samples. Checked on a
 2-minute clip: Haiku chose moments from the start, middle and last seconds. Analysis of a 2-min 720p clip took ~100 s
 on the Redmi (once a session). Google Photos' own "key moments" aren't available: they aren't in the upload API.
@@ -326,8 +362,10 @@ on the Redmi (once a session). Google Photos' own "key moments" aren't available
 Templates (1.7): `VideoTemplate` = music mood (Openverse query), a rhythm of beat-length slots (transition, speed
 curve, camera move each), look, shape, canvas, title/end cards, default length. Applying one: analysis → matching
 music if none (`applyAutoMusic`, awaited so beats are known; 120 BPM assumed otherwise) → `slotPlan` →
-`SmartEdit.pickSlots` (photos fill slots up to 10 s with alternating zooms; ramps get `MusicPicker.sourceMs` of clip,
-the harmonic mean of the step speeds) → snap to beats → cards. With few good shots the edit is shorter than the
+`SmartEdit.pickSlots` (photos fill slots up to 10 s with the slot's move or `PHOTO_MOVES` in turn, and the
+template's `photoTransition` between photos; transition length ≈ a third of the slot, 250–900 ms; ramps get
+`MusicPicker.sourceMs` of clip, the harmonic mean of the step speeds) → snap to beats → cards. With few good shots
+the edit is shorter than the
 template's length. Automatic music elsewhere: Smart edit (switch, on by default) and "Pick for me" / "Another track"
 in Music; `MusicPicker.mood` reads action/brightness/colour/camera motion/faces, photos-only → piano/acoustic;
 `choose` prefers tracks long enough to cover the video, not huge mixes, non-share-alike.

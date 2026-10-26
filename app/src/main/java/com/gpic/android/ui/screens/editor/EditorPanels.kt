@@ -420,7 +420,7 @@ fun QuickEditPanel(state: EditorUiState, vm: EditorViewModel) {
             ChipRow { EditStyle.entries.forEach { st -> Pick(st.label, state.style == st, enabled = !busy) { vm.setStyle(st) } } }
             Text(state.style.blurb, color = Color.White, style = MaterialTheme.typography.bodySmall)
             ChipRow {
-                listOf(15, 30, 60).forEach { sec -> Pick("$sec s", state.targetSec == sec, enabled = !busy) { vm.setTarget(sec) } }
+                listOf(15, 30, 60, 120).forEach { sec -> Pick(if (sec < 120) "$sec s" else "${sec / 60} min", state.targetSec == sec, enabled = !busy) { vm.setTarget(sec) } }
                 com.gpic.android.editor.Arrange.entries.forEach { a -> Pick(a.label, state.arrange == a, enabled = !busy) { vm.setArrange(a) } }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {

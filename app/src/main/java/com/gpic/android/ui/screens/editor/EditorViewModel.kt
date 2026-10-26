@@ -28,13 +28,13 @@ import com.gpic.android.editor.Encoders
 import com.gpic.android.editor.Frame
 import com.gpic.android.editor.LutInfo
 import com.gpic.android.editor.LutStore
-import com.gpic.android.editor.Motion
 import com.gpic.android.editor.MusicTrack
 import com.gpic.android.editor.OpenTrack
 import com.gpic.android.editor.Openverse
 import com.gpic.android.editor.ProjectStore
 import com.gpic.android.editor.ProjectSummary
 import com.gpic.android.editor.Segment
+import com.gpic.android.editor.SmartEdit
 import com.gpic.android.editor.TextItem
 import com.gpic.android.editor.Transition
 import com.gpic.android.editor.Timeline
@@ -365,11 +365,20 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 val dlog = replace && added.any { it.fromDji && it.looksFlat == true }
                 val old = if (replace) EditPlan(look = com.gpic.android.editor.Look(lutId = if (dlog) luts.defaultId else null))
                 else Timeline.materialize(st.plan, st.durations)
+                // Photos become a slideshow: each with its own slow move, dissolving into the next part.
+                var photoNo = old.segments.count { s -> clips.getOrNull(s.clip)?.isImage == true }
                 val newParts = added.mapIndexed { k, v ->
-                    if (v.isImage) Segment(0, VideoProbe.IMAGE_DEFAULT_MS, firstNew + k, motion = Motion.ZOOM_IN)
+                    if (v.isImage) Segment(0, VideoProbe.IMAGE_DEFAULT_MS, firstNew + k, motion = SmartEdit.PHOTO_MOVES[photoNo++ % SmartEdit.PHOTO_MOVES.size],
+                        transition = Transition.DISSOLVE, transitionMs = PHOTO_DISSOLVE_MS)
                     else Segment(0, v.durationMs, firstNew + k)
                 }
-                val plan = old.copy(segments = old.segments + newParts, keepOriginalAudio = clips.any { it.hasAudio })
+                val oldParts = old.segments.mapIndexed { k, s ->
+                    // A photo that was last dissolves into new photos too.
+                    if (k == old.segments.lastIndex && clips[s.clip].isImage && s.transition == Transition.NONE && added.first().isImage)
+                        s.copy(transition = Transition.DISSOLVE, transitionMs = PHOTO_DISSOLVE_MS) else s
+                }
+                val dropped = (oldParts.size + newParts.size - EditPlan.MAX_SEGMENTS).coerceAtLeast(0)
+                val plan = old.copy(segments = oldParts + newParts, keepOriginalAudio = clips.any { it.hasAudio })
                     .sanitized(clips.map { it.durationMs }, st.luts.mapTo(HashSet()) { it.id })
                 if (!replace) { undo.addLast(st.plan); redo.clear() }
                 st.copy(
@@ -380,6 +389,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                     preparing = if (clips.any { it.proxy == null && com.gpic.android.editor.Proxies.needed(it) }) "Preparing edit copies…" else null,
                     canUndo = undo.isNotEmpty(), canRedo = false,
                     message = when {
+                        dropped > 0 -> "An edit holds ${EditPlan.MAX_SEGMENTS} parts: the last ${plural(dropped, "clip")} didn't fit"
                         failed > 0 -> "Couldn't use ${plural(failed, "clip")} (unreadable, or shorter than a second)"
                         dlog -> "Looks like D-Log M footage, so ${st.luts.firstOrNull { it.id == luts.defaultId }?.title ?: "the LUT"} is on. Turn it off under Filters if it isn't."
                         else -> null
@@ -836,13 +846,10 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 return@launch
             }
             _state.update { it.copy(autoProgress = null) }
-            _state.update { it.copy(autoProgress = null) }
             commit { p ->
+                // The shots keep what Smart edit chose: transitions in the style's rhythm (whips that follow the camera),
+                // slow motion, the style's move on still shots and changing moves on photos.
                 var plan = AutoEdit.plan(p, result.parts, st.style)
-                // Keep the shots' own transitions (they follow the camera) and slow motion; still shots get the style's move.
-                plan = plan.copy(segments = result.parts.mapIndexed { i, s ->
-                    plan.segments[i].copy(transition = s.transition, speed = s.speed, motion = if (s.transition in setOf(Transition.SLIDE_LEFT, Transition.SLIDE_RIGHT, Transition.SLIDE_UP, Transition.SLIDE_DOWN)) com.gpic.android.editor.Motion.NONE else st.style.motion)
-                })
                 val m = plan.music
                 if (m != null && m.beatsMs.size > 4) {
                     plan = Timeline.snapToBeats(plan, st.durations, Beats.markers(m.beatsMs, Beats.Pace.FAST, m.startMs, plan.outputMs(st.durations) + 60_000))
@@ -893,7 +900,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
             val music = _state.value.plan.music
             val beatMs = music?.bpm?.takeIf { it > 0 }?.let { (60_000 / it).toLong() } ?: 500L
             val slots = t.slotPlan(t.defaultSec * 1000L, beatMs)
-            val result = com.gpic.android.editor.SmartEdit.pickSlots(analyses, slots, com.gpic.android.editor.Arrange.STORY)
+            val result = SmartEdit.pickSlots(analyses, slots, com.gpic.android.editor.Arrange.STORY, photoTransition = t.photoTransition)
             if (result.parts.isEmpty()) {
                 _state.update { it.copy(autoProgress = null, autoNote = "These clips are too short for this template.") }; return false
             }
@@ -1024,7 +1031,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 val len = CARD_MS
                 if (intro) {
                     p = p.copy(
-                        segments = listOf(Segment(0, len, cardIndex, motion = com.gpic.android.editor.Motion.ZOOM_IN, transition = Transition.FADE_BLACK)) + p.segments,
+                        segments = listOf(Segment(0, len, cardIndex, motion = com.gpic.android.editor.Motion.ZOOM_IN, transition = Transition.DISSOLVE)) + p.segments,
                         texts = p.texts.map { t -> t.copy(startMs = t.startMs + len, endMs = t.endMs + len) } + listOf(
                             TextItem(title, 150, len - 100, y = 0.44f, size = 0.11f, style = com.gpic.android.editor.TextStyle.SHADOW,
                                 font = com.gpic.android.editor.TextFont.CONDENSED, animIn = com.gpic.android.editor.TextAnim.TYPEWRITER),
@@ -1162,7 +1169,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         if (autoJob?.isActive == true) return toast("Wait for the current job to finish")
         val plan = Timeline.materialize(st.plan, st.durations)
         val refs = claudeRefs ?: st.projectId?.let { id -> projects.loadClaudeRefs(id) }?.let { EditRefs.fromJson(it, plan) } ?: EditRefs.of(plan, shotInfo().first)
-        runCatching { ClaudeEditPlanner.parseReply(text, plan, refs, st.durations, st.luts.mapTo(HashSet()) { it.id }) }
+        runCatching { ClaudeEditPlanner.parseReply(text, plan, refs, st.durations, st.luts.mapTo(HashSet()) { it.id }, photoClips(st)) }
             .onSuccess { edit -> autoJob = viewModelScope.launch { applyEdit(edit) } }
             .onFailure { e -> toast(e.message ?: "Couldn't read Claude's reply") }
     }
@@ -1219,15 +1226,21 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         _state.update { it.copy(claudeModel = model) }
     }
 
+    /** Clips that are photos (Claude's montage gives them slow moves when it names none). */
+    private fun photoClips(st: EditorUiState): Set<Int> = st.clips.indices.filterTo(HashSet()) { st.clips[it].isImage }
+
+    /** The shots Claude is told about (S0, S1… in this order), at most 120, spread over long clips; grouped. */
+    private fun claudeShots(analyses: List<com.gpic.android.editor.ClipAnalysis>): List<com.gpic.android.editor.Shot> =
+        SmartEdit.limitShots(analyses.flatMap { SmartEdit.shots(it) }, MAX_CLAUDE_SHOTS).also { SmartEdit.group(it) }
+
     /**
      * Shots found by the analysis (when it has run): labels for Claude's edits (S0, S1…, with the liveliest moment
      * of each) and the same list as text, with what's in long clips between the frames.
      */
     private fun shotInfo(): Pair<List<ShotRef>, String?> {
         val analyses = lastAnalyses ?: return emptyList<ShotRef>() to null
-        val shots = analyses.flatMap { com.gpic.android.editor.SmartEdit.shots(it) }.take(120)
+        val shots = claudeShots(analyses)
         if (shots.isEmpty()) return emptyList<ShotRef>() to null
-        com.gpic.android.editor.SmartEdit.group(shots)
         val refs = shots.map { s ->
             val peak = s.curve.maxByOrNull { it.second }?.first ?: ((s.startMs + s.endMs) / 2)
             ShotRef(s.clip, s.startMs, s.endMs, peak.coerceIn(s.startMs, s.endMs))
@@ -1252,8 +1265,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
             val per = ClaudeEditPlanner.framesPerClip(st.durations)
             return st.clips.flatMapIndexed { i, v -> (0 until per[i]).map { k -> Triple(i, v.durationMs * (2 * k + 1) / (2 * per[i]), "") } }.take(max)
         }
-        val shots = analyses.flatMap { com.gpic.android.editor.SmartEdit.shots(it) }.take(120)
-        com.gpic.android.editor.SmartEdit.group(shots)
+        val shots = claudeShots(analyses)
         val ranked = shots.withIndex().sortedByDescending { it.value.score }
         val picked = mutableListOf<IndexedValue<com.gpic.android.editor.Shot>>()
         val groups = HashSet<Int>()
@@ -1287,7 +1299,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 val boards = withContext(Dispatchers.IO) { if (picks.isEmpty()) emptyList() else storyboards(picks, st).map(::jpeg) }
                 val turns = mutableListOf(Turn(true, ClaudeEditPlanner.chatPrompt(st.request, st.clips, plan, st.luts, boards.isNotEmpty(), shots, refs), boards))
                 val reply = withContext(Dispatchers.IO) { planner.ask(turns) }
-                val first = ClaudeEditPlanner.parseReply(reply, plan, EditRefs.of(plan, refs), st.durations, st.luts.mapTo(HashSet()) { it.id })
+                val first = ClaudeEditPlanner.parseReply(reply, plan, EditRefs.of(plan, refs), st.durations, st.luts.mapTo(HashSet()) { it.id }, photoClips(st))
                 applyEdit(first)
                 if (!st.sendFrames || first.ops.isEmpty()) return@runCatching
                 // Let Claude look at what it made and fix it.
@@ -1298,7 +1310,7 @@ class EditorViewModel(private val context: Context, private val store: Credentia
                 turns += Turn(false, reply)
                 turns += Turn(true, ClaudeEditPlanner.reviewPrompt(st.request, now.clips, plan2, now.luts, now.claudeProblems, shots, refs, fresh = false), listOf(board))
                 val check = withContext(Dispatchers.IO) { planner.ask(turns) }
-                val second = ClaudeEditPlanner.parseReply(check, plan2, EditRefs.of(plan2, refs), now.durations, now.luts.mapTo(HashSet()) { it.id })
+                val second = ClaudeEditPlanner.parseReply(check, plan2, EditRefs.of(plan2, refs), now.durations, now.luts.mapTo(HashSet()) { it.id }, photoClips(now))
                 if (second.ops.isNotEmpty()) applyEdit(second)
                 _state.update { it.copy(claudeNote = first.explanation + "\nChecked: " + second.explanation) }
             }.onFailure { e ->
@@ -1351,6 +1363,8 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         private const val TAG = "GPicEditor"
         /** The preview renders at this short side: smooth on old phones, sharp enough on a phone screen. */
         const val PREVIEW_SHORT_SIDE = 480
+        /** Largest photo side the preview decodes (Media3 halves until it fits: a 12 MP photo comes out ~1000 px). */
+        const val PREVIEW_PHOTO_PX = 1440
         const val THUMB_STEP_MS = 1000L
         const val MAX_THUMBS = 120
         const val THUMB_PX = 96
@@ -1361,5 +1375,9 @@ class EditorViewModel(private val context: Context, private val store: Credentia
         const val STORYBOARD_FRAMES = 32
         /** Frames on the result board Claude checks (one image). */
         const val RESULT_FRAMES = 16
+        /** Shots listed for Claude (each with a line in the prompt). */
+        private const val MAX_CLAUDE_SHOTS = 120
+        /** Photo to photo dissolve when photos are added (they show for 3 s each). */
+        private const val PHOTO_DISSOLVE_MS = 800L
     }
 }

@@ -30,6 +30,11 @@ class FrameStat(
     val faceSize: Float,
     /** Small descriptor (colour histogram + tiny grey image), for near-duplicate detection. */
     val embed: FloatArray,
+    /**
+     * Far from the previous sample (long clips are sampled in short bursts): [dx]/[dy]/[action] are the next sample's,
+     * and the change of motion into this one says nothing about shake. [change] is still against the previous sample.
+     */
+    val gap: Boolean = false,
 )
 
 class ClipAnalysis(val clip: Int, val durationMs: Long, val fps: Float, val frames: List<FrameStat>, val isPhoto: Boolean = false)
@@ -98,7 +103,8 @@ object SmartEdit {
             val w = listOfNotNull(raw.getOrNull(i - 1), raw[i], raw.getOrNull(i + 1))
             w.groupingBy { it }.eachCount().maxByOrNull { it.value }!!.key
         }
-        val step = if (f.size > 1) (f.last().tMs - f.first().tMs) / (f.size - 1) else a.durationMs
+        // The usual spacing (long clips come in bursts with gaps between them).
+        val step = if (f.size > 1) f.zipWithNext { p, q -> q.tMs - p.tMs }.sorted().let { it[it.size / 2] } else a.durationMs
         val bounds = mutableListOf(0)
         for (i in 1 until f.size) {
             val sinceLast = f[i].tMs - f[bounds.last()].tMs
@@ -129,8 +135,10 @@ object SmartEdit {
             val faceSize = fr.maxOf { it.faceSize }
             val curve = fr.map { it.tMs to (min(1f, it.action / actionRef) * 0.7f + (if (it.faces > 0) 0.3f else 0f)) }
             val interest = (curve.map { it.second }.average().toFloat() + (if (faces > 0) 0.15f + min(0.15f, faceSize) else 0f)).coerceIn(0f, 1f)
-            // Shake: the camera's motion jumping around from sample to sample, rather than moving smoothly.
-            val jitter = if (fr.size >= 3) fr.zipWithNext { p, q -> hypot(q.dx - p.dx, q.dy - p.dy) }.average().toFloat() else 0f
+            // Shake: the camera's motion jumping around from sample to sample, rather than moving smoothly (only
+            // between neighbouring samples: across a gap the camera has simply done something else).
+            val jumps = fr.zipWithNext().filter { (p, q) -> !p.gap && !q.gap }.map { (p, q) -> hypot(q.dx - p.dx, q.dy - p.dy) }
+            val jitter = if (jumps.size >= 2) jumps.average().toFloat() else 0f
             val luma = fr.map { it.luma }.average().toFloat()
             val embed = average(fr.map { it.embed })
             val moveCounts = moves.subList(s, e).groupingBy { it }.eachCount()
@@ -176,6 +184,21 @@ object SmartEdit {
         return if (na <= 0f || nb <= 0f) 0f else d / sqrt(na * nb)
     }
 
+    /**
+     * At most [max] of [shots] (for Claude's shot list): each clip keeps a share by its number of shots, taken as the
+     * best shot of each stretch of it, so a long clip is described from start to end, not just its first minutes.
+     * In the given (clip, time) order.
+     */
+    fun limitShots(shots: List<Shot>, max: Int): List<Shot> {
+        if (shots.size <= max) return shots
+        val kept = HashSet<Shot>()
+        for (list in shots.groupBy { it.clip }.values) {
+            val quota = max(1, (max.toLong() * list.size / shots.size).toInt())
+            list.chunked((list.size + quota - 1) / quota).forEach { stretch -> stretch.maxByOrNull { it.score }?.let { kept += it } }
+        }
+        return shots.filter { it in kept }.take(max)
+    }
+
     /** Puts near-identical shots (same scene filmed twice, a long still shot cut in two) in one group. */
     fun group(shots: List<Shot>, similar: Float = 0.96f): Int {
         var groups = 0
@@ -186,32 +209,46 @@ object SmartEdit {
         return groups
     }
 
-    /** Transition that continues the camera's motion out of a shot (a "match cut"), else the style's own. */
+    /**
+     * Transition that continues the camera's motion out of a shot (a "match cut": the picture keeps moving the way the
+     * camera did), else [fallback].
+     */
     fun transitionFor(move: CameraMove, fallback: Transition): Transition = when (move) {
-        CameraMove.PAN_LEFT -> Transition.SLIDE_RIGHT
-        CameraMove.PAN_RIGHT -> Transition.SLIDE_LEFT
+        CameraMove.PAN_LEFT -> Transition.WHIP_RIGHT
+        CameraMove.PAN_RIGHT -> Transition.WHIP_LEFT
         CameraMove.TILT_UP -> Transition.SLIDE_DOWN
         CameraMove.TILT_DOWN -> Transition.SLIDE_UP
         else -> fallback
     }
 
+    /** Photos take turns with these moves, so a slideshow doesn't zoom the same way every time. */
+    val PHOTO_MOVES = listOf(Motion.ZOOM_IN, Motion.PAN_RIGHT, Motion.ZOOM_OUT, Motion.PAN_LEFT)
+
+    /** A transition about a third of its part (shorter on quick beats, up to 0.9 s on long ones). */
+    fun transitionMsFor(partMs: Long): Long = (partMs * 35 / 100).coerceIn(250, 900)
+
     /**
      * Picks shots for about [targetMs] of [cutMs] slots. Shaky, blurry and dark shots are used only when nothing
      * better is left; one shot per near-duplicate group until every group has had a turn; a long, good shot can
-     * give a second slot. High-frame-rate shots play at half speed (LightCut's slow shots).
+     * give a second slot. High-frame-rate shots play at half speed (LightCut's slow shots). The style's transition
+     * goes on every few cuts only (a transition on every cut looks cheap); still shots get its slow move.
      */
     fun pick(analyses: List<ClipAnalysis>, targetMs: Long, cutMs: Long, arrange: Arrange, style: EditStyle): SmartResult {
         val cut0 = cutMs.coerceAtLeast(EditPlan.MIN_SEGMENT_MS)
         val n = max(1, ((targetMs + cut0 / 2) / cut0).toInt())
-        return pickSlots(analyses, List(n) { TemplateSlot(0, style.transition) to cut0 }, arrange, followCamera = true)
+        val every = style.transitionEvery.coerceAtLeast(1)
+        val slots = List(n) { i -> TemplateSlot(0, if ((i + 1) % every == 0) style.transition else Transition.NONE, motion = style.motion) to cut0 }
+        return pickSlots(analyses, slots, arrange, followCamera = true, photoTransition = style.photoTransition, varyPhotos = true)
     }
 
     /**
      * Fills template slots (output length each, with their transition, speed ramp and camera move) with the best
-     * shots, in [arrange] order. A slot's transition NONE follows the camera's motion when [followCamera]. Photos fill
-     * any slot up to 10 s, with a slow zoom when the slot has no move of its own.
+     * shots, in [arrange] order. A panning shot cuts with a whip that carries its motion on when [followCamera] (not
+     * right after another transition). Photos fill any slot up to 10 s with a slow move (the slot's, or taking turns
+     * when it has none or [varyPhotos]), and a hard cut between two photos becomes [photoTransition].
      */
-    fun pickSlots(analyses: List<ClipAnalysis>, slots: List<Pair<TemplateSlot, Long>>, arrange: Arrange, followCamera: Boolean = true): SmartResult {
+    fun pickSlots(analyses: List<ClipAnalysis>, slots: List<Pair<TemplateSlot, Long>>, arrange: Arrange, followCamera: Boolean = true,
+                  photoTransition: Transition = Transition.NONE, varyPhotos: Boolean = false): SmartResult {
         val shots = analyses.flatMap { shots(it) }
         // Across clips: a shot far softer than the project's typical one is blurry even if its own clip is all soft.
         if (shots.size >= 3) {
@@ -237,22 +274,32 @@ object SmartEdit {
             Arrange.STORY -> chosen.sortedWith(compareBy({ it.first.clip }, { it.first.startMs }, { it.second }))
             Arrange.BEST_FIRST -> chosen
         }
-        val parts = ordered.mapIndexed { i, (shot, win) ->
+        val parts = mutableListOf<Segment>()
+        var photos = 0
+        for ((i, pick) in ordered.withIndex()) {
+            val (shot, win) = pick
             val (slot, slotMs) = slots[i]
             // High-frame-rate shots play at half speed (not under a ramp, which has its own slow part).
             val speed = if (shot.slowMo && slot.curve == SpeedCurve.NONE && !shot.photo) 0.5f else 1f
             val need = if (shot.photo) slotMs.coerceAtMost(VideoProbe.IMAGE_MAX_MS) else MusicPicker.sourceMs(slotMs, speed, slot.curve)
             val sourceLen = min(shot.durationMs, need).coerceAtLeast(EditPlan.MIN_SEGMENT_MS)
             val (s, e) = window(shot, sourceLen, win)
+            val pans = followCamera && shot.move in PANS && !shot.photo
+            val afterTransition = parts.lastOrNull()?.transition?.let { it != Transition.NONE } == true
             val transition = when {
                 i == ordered.lastIndex -> Transition.NONE
-                slot.transition != Transition.NONE && !(followCamera && shot.move in PANS) -> slot.transition
-                followCamera -> transitionFor(shot.move, slot.transition)
-                else -> slot.transition
+                pans && !(slot.transition == Transition.NONE && afterTransition) -> transitionFor(shot.move, slot.transition)
+                slot.transition != Transition.NONE -> slot.transition
+                shot.photo && ordered[i + 1].first.photo -> photoTransition
+                else -> Transition.NONE
             }
-            val motion = if (slot.motion == Motion.NONE && shot.photo) (if (i % 2 == 0) Motion.ZOOM_IN else Motion.ZOOM_OUT) else slot.motion
-            Segment(s, e, shot.clip, speed = speed, curve = if (shot.photo) SpeedCurve.NONE else slot.curve, transition = transition,
-                motion = if (shot.move in PANS && !shot.photo) Motion.NONE else motion)
+            val motion = when {
+                shot.photo -> if (slot.motion != Motion.NONE && !varyPhotos) slot.motion else PHOTO_MOVES[photos++ % PHOTO_MOVES.size]
+                shot.move in PANS -> Motion.NONE // the camera already moves
+                else -> slot.motion
+            }
+            parts += Segment(s, e, shot.clip, speed = speed, curve = if (shot.photo) SpeedCurve.NONE else slot.curve, transition = transition,
+                transitionMs = if (transition == Transition.NONE) Segment.DEFAULT_TRANSITION_MS else transitionMsFor(slotMs), motion = motion)
         }
         return SmartResult(parts, shots.size, shots.count { it.shaky }, shots.count { it.blurry }, shots.size - groups,
             parts.count { it.speed < 1f }, chosen.size)

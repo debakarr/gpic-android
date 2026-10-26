@@ -14,16 +14,20 @@ enum class EditStyle(
     val beatsPerCut: Int,
     val aspect: Aspect,
     val filter: Filter?,
+    /** The style's transition, on every [transitionEvery]th cut: the rest are hard cuts (on the beat) or match cuts. */
     val transition: Transition,
+    val transitionEvery: Int,
+    /** Between two photos where the rhythm has a hard cut (NONE: keep the hard cut). */
+    val photoTransition: Transition,
     val motion: Motion,
     val cameraVolume: Float,
     val musicVolume: Float,
 ) {
-    ACTION("Action", "Quick cuts on the beat, punchy colour", 1_500, 2, Aspect.ORIGINAL, Filter.PUNCH, Transition.ZOOM_IN, Motion.NONE, 0.3f, 1.0f),
-    TRAVEL("Travel", "3 s moments, soft fades, warm colour", 3_000, 4, Aspect.ORIGINAL, Filter.GOLDEN, Transition.FADE_BLACK, Motion.ZOOM_IN, 0.4f, 0.9f),
-    CINEMATIC("Cinematic", "Long shots, 21:9, film colour", 4_500, 8, Aspect.CINEMA, Filter.FILM, Transition.DISSOLVE_BLUR, Motion.PAN_RIGHT, 0.2f, 1.0f),
-    REEL("Reel", "Vertical 9:16, fast cuts, vivid", 2_000, 2, Aspect.VERTICAL, Filter.VIVID, Transition.SLIDE_LEFT, Motion.NONE, 0.3f, 1.0f),
-    VLOG("Vlog", "Keeps the talking, light fades", 5_000, 8, Aspect.ORIGINAL, Filter.WARM, Transition.FADE_WHITE, Motion.NONE, 1.0f, 0.4f),
+    ACTION("Action", "Quick cuts on the beat, zoom hits, punchy colour", 1_500, 2, Aspect.ORIGINAL, Filter.PUNCH, Transition.ZOOM_IN, 4, Transition.NONE, Motion.NONE, 0.3f, 1.0f),
+    TRAVEL("Travel", "3 s moments, soft dissolves, warm colour", 3_000, 4, Aspect.ORIGINAL, Filter.GOLDEN, Transition.DISSOLVE, 2, Transition.DISSOLVE, Motion.ZOOM_IN, 0.4f, 0.9f),
+    CINEMATIC("Cinematic", "Long shots, 21:9, film colour, dissolves", 4_500, 8, Aspect.CINEMA, Filter.FILM, Transition.DISSOLVE, 1, Transition.DISSOLVE, Motion.PAN_RIGHT, 0.2f, 1.0f),
+    REEL("Reel", "Vertical 9:16, fast cuts, whips, vivid", 2_000, 2, Aspect.VERTICAL, Filter.VIVID, Transition.WHIP_LEFT, 3, Transition.NONE, Motion.NONE, 0.3f, 1.0f),
+    VLOG("Vlog", "Keeps the talking, light dissolves", 5_000, 8, Aspect.ORIGINAL, Filter.WARM, Transition.DISSOLVE, 3, Transition.DISSOLVE, Motion.NONE, 1.0f, 0.4f),
 }
 
 /** How "interesting" each moment of one clip is: one score per [stepMs], from frame-to-frame change and colour. */
@@ -92,19 +96,15 @@ object AutoEdit {
     }
 
     /**
-     * The plan for [style]: the picked parts plus its look, transitions, motion and audio mix. With beats, the
-     * music starts on a beat so cuts of [beatCutMs] land on the beat.
+     * The plan for [style]: the picked parts (with the transitions, moves and speeds [SmartEdit] chose for them) plus
+     * the style's look and audio mix. With beats, the music starts on a beat so cuts of [beatCutMs] land on the beat.
      */
     fun plan(base: EditPlan, parts: List<Segment>, style: EditStyle): EditPlan {
         val music = base.music
         val hasMusic = music != null
         return base.copy(
             segments = parts.mapIndexed { i, s ->
-                s.copy(
-                    speed = 1f, curve = SpeedCurve.NONE, look = null,
-                    motion = style.motion,
-                    transition = if (i == parts.lastIndex) Transition.NONE else style.transition,
-                )
+                s.copy(curve = SpeedCurve.NONE, look = null, transition = if (i == parts.lastIndex) Transition.NONE else s.transition)
             },
             aspect = style.aspect,
             canvas = if (style.aspect == Aspect.ORIGINAL) base.canvas else Canvas.BLUR,

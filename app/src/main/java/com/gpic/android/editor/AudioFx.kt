@@ -22,22 +22,26 @@ class FadeAudioProcessor(
     private var frames = 0L
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) throw AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT && inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT) {
+            throw AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
+        }
         return inputAudioFormat
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val rate = inputAudioFormat.sampleRate
         val ch = inputAudioFormat.channelCount
+        val float = inputAudioFormat.encoding == C.ENCODING_PCM_FLOAT
+        val bytes = if (float) 4 else 2
         val remaining = inputBuffer.remaining()
         val out = replaceOutputBuffer(remaining).order(ByteOrder.nativeOrder())
         val input = inputBuffer.order(ByteOrder.nativeOrder())
-        while (input.remaining() >= 2 * ch) {
+        while (input.remaining() >= bytes * ch) {
             val tUs = frames * 1_000_000L / rate
             val g = envelope(tUs)
             repeat(ch) {
-                val s = (input.short * g).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                out.putShort(s.toShort())
+                if (float) out.putFloat(input.float * g)
+                else out.putShort((input.short * g).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
             }
             frames++
         }

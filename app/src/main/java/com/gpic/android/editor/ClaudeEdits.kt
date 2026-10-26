@@ -83,7 +83,8 @@ object ClaudeEdits {
      * Applies [ops] to [current] (parts written out, see [Timeline.materialize]) in order. Labels resolve through
      * [refs]. The result is [EditPlan.sanitized]; follow-ups (music, template, beats) are for the caller to run.
      */
-    fun apply(ops: List<JSONObject>, current: EditPlan, refs: EditRefs, durations: List<Long>, lutIds: Set<String>, explanation: String): ClaudeEdit {
+    fun apply(ops: List<JSONObject>, current: EditPlan, refs: EditRefs, durations: List<Long>, lutIds: Set<String>, explanation: String,
+              photos: Set<Int> = emptySet()): ClaudeEdit {
         var plan = current
         val problems = mutableListOf<String>()
         val follow = mutableListOf<FollowUp>()
@@ -94,7 +95,7 @@ object ClaudeEdits {
             val issues = mutableListOf<String>()
             val next: EditPlan? = runCatching {
                 when (name) {
-                    "montage" -> montage(o, plan, refs, durations, issues)
+                    "montage" -> montage(o, plan, refs, durations, issues, photos)
                     "set_part" -> setPart(o, plan, refs, durations, issues)
                     "remove_part" -> part(o, plan, refs, issues)?.let { id ->
                         if (plan.segments.size <= 1) { issues += "it's the only part left"; null }
@@ -228,11 +229,13 @@ object ClaudeEdits {
     /**
      * Replaces the main track with shots in order. A shot part is [DEFAULT_PART_MS] (or length_s) of output, cut
      * around the shot's liveliest moment (or from start_s) and kept inside the shot; a plain clip range works too.
+     * Parts of [photos] (clip indices) without a motion get changing slow moves.
      */
-    private fun montage(o: JSONObject, plan: EditPlan, refs: EditRefs, durations: List<Long>, issues: MutableList<String>): EditPlan? {
+    private fun montage(o: JSONObject, plan: EditPlan, refs: EditRefs, durations: List<Long>, issues: MutableList<String>, photos: Set<Int>): EditPlan? {
         val items = o.optJSONArray("shots") ?: o.optJSONArray("parts") ?: o.optJSONArray("items")
             ?: run { issues += "no \"shots\" list"; return null }
         val parts = mutableListOf<Segment>()
+        var photoNo = 0
         for (k in 0 until items.length()) {
             val it = items.optJSONObject(k) ?: JSONObject().put("shot", items.opt(k))
             val where = "shot ${k + 1}"
@@ -266,6 +269,8 @@ object ClaudeEdits {
             val like = plan.segments.firstOrNull { s -> s.clip == clip }
             parts += partFields(it, Segment(r.first, r.second, clip, rotation = like?.rotation ?: 0, mirror = like?.mirror ?: false))
                 .copy(speed = speed, curve = curve)
+                // A photo Claude gave no move would sit still: it gets the slideshow's moves in turn.
+                .let { p -> if (clip in photos && !it.has("motion")) p.copy(motion = SmartEdit.PHOTO_MOVES[photoNo++ % SmartEdit.PHOTO_MOVES.size]) else p }
         }
         if (parts.isEmpty()) { issues += "no usable shots"; return null }
         return plan.copy(segments = parts)
@@ -377,7 +382,9 @@ object ClaudeEdits {
         - Use good, steady shots. Skip ones flagged shaky, blurry or dark unless nothing else shows that moment.
         - Don't use two shots from the same look-alike group back to back.
         - High frame rate shots make good slow motion (speed 0.5, or curve HERO/BULLET on the best action).
-        - Transitions: mostly NONE (hard cuts); a few ZOOM/SLIDE on action, FADE_BLACK for the ending. Too many feels cheap.
+        - Transitions: mostly NONE (hard cuts, on the beat). DISSOLVE between photos and calm scenes; now and then
+          ZOOM_IN, WHIP_LEFT/WHIP_RIGHT (following a pan) or GLITCH on action; FADE_BLACK for the ending. A transition
+          on every cut feels cheap. Photos: give each a motion, and vary it.
         - Text: short (5 words or fewer), size 0.06-0.12, y between 0.15 and 0.85 so it stays on screen in every aspect;
           not over faces. Captions at y about 0.85. Give each text at least 1.5 s.
     """.trimIndent()

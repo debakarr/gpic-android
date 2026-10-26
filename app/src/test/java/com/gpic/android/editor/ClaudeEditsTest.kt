@@ -52,6 +52,12 @@ class ClaudeEditsTest {
         assertTrue(r.problems.toString(), r.problems.isEmpty())
     }
 
+    @Test fun photosInAMontageMoveUnlessClaudeSaysOtherwise() {
+        val ops = """{"op":"montage","shots":[{"shot":"S2","length_s":2},{"shot":"S0","length_s":2},{"shot":"S2","length_s":2,"motion":"NONE"},{"shot":"S2","length_s":2}]}"""
+        val r = ClaudeEdits.apply(listOf(JSONObject(ops)), current, refs, durations, emptySet(), "ok", photos = setOf(1))
+        assertEquals(listOf(SmartEdit.PHOTO_MOVES[0], Motion.NONE, Motion.NONE, SmartEdit.PHOTO_MOVES[1]), r.plan.segments.map { it.motion })
+    }
+
     @Test fun slowMotionTakesLessClipForTheSameLength() {
         val r = run("""{"op":"montage","shots":[{"shot":"S1","length_s":2,"speed":0.5}]}""")
         val s = r.plan.segments.single()

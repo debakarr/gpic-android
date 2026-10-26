@@ -215,12 +215,12 @@ class ClaudeEditPlanner(apiKey: String, private val model: String = MODEL) {
          * {...}. An "edits" list is applied with [refs]; an old whole-plan reply still works. Throws
          * [ClaudeException] with a readable reason when there's no usable JSON.
          */
-        fun parseReply(text: String, current: EditPlan, refs: EditRefs, durations: List<Long>, lutIds: Set<String>): ClaudeEdit {
+        fun parseReply(text: String, current: EditPlan, refs: EditRefs, durations: List<Long>, lutIds: Set<String>, photos: Set<Int> = emptySet()): ClaudeEdit {
             val json = extractJson(text) ?: throw ClaudeException("Couldn't find Claude's JSON in what was pasted. Copy Claude's whole reply.")
             val o = runCatching { JSONObject(json) }.getOrElse { throw ClaudeException("Claude's JSON isn't valid (${it.message?.take(80)}). Ask it to send the JSON again.") }
             val note = o.optString("explanation").ifBlank { text.substringAfterLast("```").trim().take(300) }
             val ops = ClaudeEdits.ops(o)
-            if (ops != null) return ClaudeEdits.apply(ops, current, refs, durations, lutIds, note.ifBlank { if (ops.isEmpty()) "Claude is happy with the edit." else "Applied Claude's edits." })
+            if (ops != null) return ClaudeEdits.apply(ops, current, refs, durations, lutIds, note.ifBlank { if (ops.isEmpty()) "Claude is happy with the edit." else "Applied Claude's edits." }, photos)
             val plan = fromClaude(o, current).sanitized(durations, lutIds)
             return ClaudeEdit(plan, note.ifBlank { "Applied Claude's plan." }, emptyList(), emptyList(), 1, emptyList())
         }

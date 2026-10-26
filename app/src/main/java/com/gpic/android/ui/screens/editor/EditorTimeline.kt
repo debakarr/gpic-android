@@ -181,9 +181,11 @@ fun EditorTimeline(
                     val step = clip?.let { thumbStep(p.clip) } ?: 1000L
                     Canvas(Modifier.fillMaxSize()) {
                         val tileW = size.height * 16f / 9f
-                        var tx = 0f
+                        // Only the tiles on screen: a long clip is millions of pixels wide when zoomed in.
+                        val visibleTo = minOf(size.width, widthPx - x)
+                        var tx = kotlin.math.floor((-x).coerceAtLeast(0f) / tileW) * tileW
                         clipRect {
-                            while (tx < size.width) {
+                            while (tx < visibleTo) {
                                 val outMs = ((tx + tileW / 2) / pxPerMs).toLong()
                                 val clipMs = Timeline.clipTime(p, outMs)
                                 val bmp = list?.getOrNull((clipMs / step).toInt().coerceIn(0, (list.size - 1).coerceAtLeast(0)))
@@ -318,11 +320,14 @@ fun EditorTimeline(
                     val wave = state.waveform
                     Canvas(Modifier.fillMaxSize()) {
                         val songMs = m.durationMs.takeIf { it > 0 } ?: Long.MAX_VALUE
+                        // Only what's on screen (a long video's lane is far wider than the screen).
+                        val visibleFrom = (-x).coerceAtLeast(0f)
+                        val visibleTo = minOf(size.width, widthPx - x)
                         if (wave != null && wave.isNotEmpty()) {
                             // 10 samples a second of the song; the video plays the song from startMs (repeating).
                             val stepPx = 3f
-                            var px = 0f
-                            while (px < size.width) {
+                            var px = kotlin.math.floor(visibleFrom / stepPx) * stepPx
+                            while (px < visibleTo) {
                                 val outMs = (px / pxPerMs).toLong()
                                 var songT = m.startMs + outMs
                                 if (songMs != Long.MAX_VALUE && songT >= songMs) songT = (outMs - (songMs - m.startMs)) % songMs
@@ -334,7 +339,7 @@ fun EditorTimeline(
                         }
                         beatMarks.forEach { b ->
                             val bx = b * pxPerMs
-                            if (bx in 0f..size.width) drawCircle(Color.White, 2.5f.dp.toPx(), Offset(bx, size.height - 4.dp.toPx()))
+                            if (bx in visibleFrom..visibleTo) drawCircle(Color.White, 2.5f.dp.toPx(), Offset(bx, size.height - 4.dp.toPx()))
                         }
                     }
                     Text("♪ " + m.title, Modifier.align(Alignment.CenterStart).padding(start = 4.dp), fontSize = 10.sp, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)

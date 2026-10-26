@@ -7,30 +7,99 @@ import android.graphics.Paint
 import android.media.FaceDetector
 import android.media.MediaMetadataRetriever
 import android.os.Build
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.security.MessageDigest
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * Measures clips for [SmartEdit] on the phone (nothing leaves it): frames every ~0.5 s from the edit copy (at most
- * [MAX_SAMPLES] a clip), 96 px wide for the picture statistics and motion, plus Android's built-in face detector on
- * a 240 px frame about once a second. Results are kept per clip for the session.
+ * Measures clips for [SmartEdit] on the phone (nothing leaves it): frames every 0.5 s from the edit copy (bursts of
+ * them spread over a clip longer than [DENSE_MAX_MS], so motion is always measured between frames 0.5 s apart),
+ * 96 px wide for the picture statistics and motion, plus Android's built-in face detector on a 240 px frame about
+ * once a second. Results are kept per clip, in memory and in the cache folder (a long clip takes a minute or two).
  */
 object VideoAnalyzer {
     private const val W = 96
-    private const val MAX_SAMPLES = 240
+    private const val STEP_MS = 500L
+    /** Up to this long, every 0.5 s (240 samples); longer clips get [MAX_BURSTS] bursts of [BURST] samples. */
+    private const val DENSE_MAX_MS = 120_000L
+    private const val BURST = 4
+    private const val MAX_BURSTS = 120
     private const val MAX_SHIFT = 24
+    /** Bump when the measurements change, so old saved results are measured again. */
+    private const val VERSION = 2
     private val cache = HashMap<String, ClipAnalysis>()
 
     private fun key(v: VideoInfo) = "${v.uri}|${v.durationMs}|${v.sizeBytes}"
 
     fun analyze(context: Context, clip: Int, v: VideoInfo, onProgress: (Float) -> Unit = {}): ClipAnalysis {
         synchronized(cache) { cache[key(v)]?.let { return ClipAnalysis(clip, it.durationMs, it.fps, it.frames, it.isPhoto) } }
-        val result = if (v.isImage) analyzeImage(context, clip, v) else analyzeVideo(context, clip, v, onProgress)
+        val saved = if (v.isImage) null else savedFile(context, v)
+        val result = saved?.let { load(it, clip) }
+            ?: (if (v.isImage) analyzeImage(context, clip, v) else analyzeVideo(context, clip, v, onProgress)).also { a -> saved?.let { save(it, a) } }
         synchronized(cache) { cache[key(v)] = result }
         return result
     }
+
+    /**
+     * When to sample a clip of [durationMs] (ms). Long clips: bursts 0.5 s apart inside, spread evenly, so shake and
+     * camera moves are measured between close frames however long the clip is.
+     */
+    internal fun sampleTimes(durationMs: Long): List<Long> {
+        if (durationMs <= DENSE_MAX_MS) return (0 until max(1, (durationMs / STEP_MS).toInt())).map { it * STEP_MS + STEP_MS / 2 }
+        val bursts = (durationMs / 3_000).toInt().coerceIn(40, MAX_BURSTS)
+        val span = (BURST - 1) * STEP_MS
+        return (0 until bursts).flatMap { b ->
+            val centre = durationMs * (2 * b + 1) / (2 * bursts)
+            val start = ((centre - span / 2) / STEP_MS * STEP_MS + STEP_MS / 2).coerceIn(STEP_MS / 2, durationMs - span - STEP_MS / 2)
+            (0 until BURST).map { start + it * STEP_MS }
+        }
+    }
+
+    private fun savedFile(context: Context, v: VideoInfo): File {
+        val hash = MessageDigest.getInstance("SHA-1").digest(key(v).toByteArray()).joinToString("") { "%02x".format(it) }
+        return File(File(context.cacheDir, "analysis"), "$hash.bin")
+    }
+
+    private fun save(f: File, a: ClipAnalysis) = runCatching {
+        f.parentFile?.mkdirs()
+        val tmp = File(f.parentFile, f.name + ".part")
+        DataOutputStream(BufferedOutputStream(FileOutputStream(tmp))).use { o ->
+            o.writeInt(VERSION); o.writeLong(a.durationMs); o.writeFloat(a.fps); o.writeInt(a.frames.size)
+            for (s in a.frames) {
+                o.writeLong(s.tMs)
+                for (x in floatArrayOf(s.luma, s.contrast, s.sharpness, s.colorful, s.dx, s.dy, s.action, s.change, s.faceSize)) o.writeFloat(x)
+                o.writeInt(s.faces); o.writeBoolean(s.gap); o.writeInt(s.embed.size)
+                s.embed.forEach(o::writeFloat)
+            }
+        }
+        if (!tmp.renameTo(f)) tmp.delete()
+    }.onFailure { android.util.Log.w("GPicSmart", "couldn't save the analysis: ${it.message}") }
+
+    private fun load(f: File, clip: Int): ClipAnalysis? = if (!f.exists()) null else runCatching {
+        DataInputStream(BufferedInputStream(FileInputStream(f))).use { i ->
+            if (i.readInt() != VERSION) return@use null
+            val duration = i.readLong()
+            val fps = i.readFloat()
+            val frames = List(i.readInt()) {
+                val t = i.readLong()
+                val v = FloatArray(9) { i.readFloat() }
+                val faces = i.readInt()
+                val gap = i.readBoolean()
+                val embed = FloatArray(i.readInt()) { i.readFloat() }
+                FrameStat(t, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], faces, v[8], embed, gap)
+            }
+            ClipAnalysis(clip, duration, fps, frames)
+        }
+    }.getOrNull()
 
     private fun analyzeImage(context: Context, clip: Int, v: VideoInfo): ClipAnalysis {
         val bmp = VideoProbe.thumbnail(context, v, 0, 240)
@@ -40,21 +109,32 @@ object VideoAnalyzer {
     }
 
     private fun analyzeVideo(context: Context, clip: Int, v: VideoInfo, onProgress: (Float) -> Unit): ClipAnalysis {
-        val step = max(500L, v.durationMs / MAX_SAMPLES)
-        val n = max(1, (v.durationMs / step).toInt())
-        val frames = ArrayList<FrameStat>(n)
+        val times = sampleTimes(v.durationMs)
+        val frames = ArrayList<FrameStat>(times.size)
         val r = MediaMetadataRetriever()
         try {
             r.setDataSource(context, v.editUri)
             var prev: Gray? = null
-            for (i in 0 until n) {
-                val t = i * step + step / 2
+            var lastT = 0L
+            // A sample far from the one before (or the first) takes its motion from the next one, which is close.
+            var pendingGap = -1
+            for ((i, t) in times.withIndex()) {
                 val big = frame(r, t, 240, v) ?: continue
-                val stat = measure(big, prev, t, faces = i % 2 == 0)
-                prev = stat.second
-                frames += stat.first
+                val gap = prev == null || t - lastT > STEP_MS * 3 / 2
+                val (stat, gray) = measure(big, prev, t, faces = i % 2 == 0)
+                if (!gap && pendingGap >= 0) {
+                    frames[pendingGap] = frames[pendingGap].let { g ->
+                        FrameStat(g.tMs, g.luma, g.contrast, g.sharpness, g.colorful, stat.dx, stat.dy, stat.action, g.change, g.faces, g.faceSize, g.embed, gap = true)
+                    }
+                    pendingGap = -1
+                }
+                frames += if (gap) FrameStat(stat.tMs, stat.luma, stat.contrast, stat.sharpness, stat.colorful, 0f, 0f, 0f, stat.change,
+                    stat.faces, stat.faceSize, stat.embed, gap = true) else stat
+                if (gap) pendingGap = frames.lastIndex
+                prev = gray
+                lastT = t
                 big.recycle()
-                onProgress((i + 1f) / n)
+                onProgress((i + 1f) / times.size)
             }
         } finally {
             r.release()
@@ -62,7 +142,7 @@ object VideoAnalyzer {
         if (frames.isNotEmpty()) android.util.Log.i("GPicSmart", "${v.name}: ${frames.size} samples, sharp mean %.5f min %.5f, luma %.2f, motion %.3f, jitter %.3f, faces %d".format(
             frames.map { it.sharpness }.average(), frames.minOf { it.sharpness }, frames.map { it.luma }.average(),
             frames.map { kotlin.math.hypot(it.dx, it.dy) }.average(),
-            frames.zipWithNext { p, q -> kotlin.math.hypot(q.dx - p.dx, q.dy - p.dy) }.average().let { if (it.isNaN()) 0.0 else it },
+            frames.zipWithNext().filter { (p, q) -> !p.gap && !q.gap }.map { (p, q) -> kotlin.math.hypot(q.dx - p.dx, q.dy - p.dy) }.average().let { if (it.isNaN()) 0.0 else it },
             frames.count { it.faces > 0 }))
         return ClipAnalysis(clip, v.durationMs, v.frameRate ?: 30f, frames)
     }
