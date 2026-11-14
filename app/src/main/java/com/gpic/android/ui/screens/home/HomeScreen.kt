@@ -112,6 +112,7 @@ fun HomeScreen(
         if (mediaAccess || promptBlocked()) launch() else { pendingPick = what; requestMedia() }
     }
     var confirmCleanup by remember { mutableStateOf(false) }
+    var confirmClearStaged by remember { mutableStateOf(false) }
     // Upload proceeds either way; the permission only controls whether progress shows in the shade.
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.startUpload() }
     val startUpload = {
@@ -300,6 +301,7 @@ fun HomeScreen(
                     onScan = startCameraScan,
                     onConnect = { vm.cameraLink?.connect(it) },
                     onDisconnect = { vm.cameraLink?.disconnect() },
+                    onClearStaged = { confirmClearStaged = true },
                 )
             } else item(key = "source") {
                 SourceSection(
@@ -417,6 +419,25 @@ fun HomeScreen(
                 Button(onClick = { confirmCleanup = false; startUpload() }) { Text("Back up & delete") }
             },
             dismissButton = { TextButton(onClick = { confirmCleanup = false }) { Text("Cancel") } },
+        )
+    }
+
+    if (confirmClearStaged) {
+        AlertDialog(
+            onDismissRequest = { confirmClearStaged = false },
+            icon = { Icon(Icons.Default.SdStorage, null) },
+            title = { Text("Delete camera downloads?") },
+            text = {
+                Text(
+                    "GPic keeps camera files it downloaded on this phone (${plural(state.stagedCount, "file")}, " +
+                        "${formatSize(state.stagedBytes)}) so a cancelled or failed upload can retry without the camera. " +
+                        "This frees that space. The files stay on the camera, and uploading them again downloads them again."
+                )
+            },
+            confirmButton = {
+                Button(onClick = { confirmClearStaged = false; vm.clearStagedDownloads() }) { Text("Delete copies") }
+            },
+            dismissButton = { TextButton(onClick = { confirmClearStaged = false }) { Text("Cancel") } },
         )
     }
 }
@@ -815,6 +836,7 @@ private fun CameraSection(
     onScan: () -> Unit,
     onConnect: (FoundCamera) -> Unit,
     onDisconnect: () -> Unit,
+    onClearStaged: () -> Unit,
 ) {
     val busy = state.uploadRunning
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -889,9 +911,26 @@ private fun CameraSection(
                 }
             }
         }
-        // Staged files left from an interrupted run, with the camera already disconnected.
-        if (state.camera !is CameraState.Ready && state.files.isNotEmpty()) {
-            Text("${plural(state.files.size, "file")} downloaded from the camera and waiting to upload.", style = MaterialTheme.typography.bodySmall)
+        // Copies from a cancelled or failed run: they stay on the phone until cleared, so show what they take.
+        if (state.stagedBytes > 0) {
+            OutlinedCard(Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp).fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Default.SdStorage, null)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("${plural(state.stagedCount, "camera download")} on this phone", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "${formatSize(state.stagedBytes)} — kept so a cancelled or failed upload can retry without the camera. " +
+                                "Delete them if you don't need that.",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(onClick = onClearStaged, enabled = !busy) { Text("Clear") }
+                }
+            }
         }
         if (permDenied) {
             Text("GPic needs Nearby devices permission to find and pair with the camera.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)

@@ -93,6 +93,9 @@ data class HomeUiState(
     val relocated: Int = 0,
     /** Originals deleted from the phone/camera after upload. */
     val deleted: Int = 0,
+    /** Camera downloads kept on this phone: complete copies for a retry plus partial downloads. */
+    val stagedCount: Int = 0,
+    val stagedBytes: Long = 0L,
     val cleanup: CleanupState = CleanupState(),
     /** File types to back up; applies to every source. Never empty. */
     val typeFilter: Set<MediaKind> = MediaKind.entries.toSet(),
@@ -167,6 +170,7 @@ class HomeViewModel(
         refreshUsb()
         _state.update { it.copy(cleanup = loadCleanupPrefs(), typeFilter = loadTypeFilter()) }
         restoreDeviceSelection()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) refreshStaged()
     }
 
     /** Last folder / files picked on the Phone / USB tab (re-resolved; permissions may have lapsed). */
@@ -553,6 +557,8 @@ class HomeViewModel(
                 statsJob?.cancel()
                 UploadService.stop(context)
                 _state.value = _state.value.copy(uploadRunning = false, cancelling = false, wasCancelled = _state.value.cancelling)
+                // A cancel or a failure can leave a full or partial camera copy behind.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) refreshStaged()
             }
         }
     }
@@ -685,7 +691,8 @@ class HomeViewModel(
         // Free phone storage for everything that made it; keep failures for a retry.
         // Refused files would only be refused again, so their downloads go too.
         val done = staged.filter { result[it.key]?.status in setOf(UploadStatus.COMPLETED, UploadStatus.SKIPPED, UploadStatus.REJECTED) }
-        stager(link).clean(done)
+        stager().clean(done)
+        refreshStaged()
         val left = _state.value.djiFiles.filter { f -> done.none { it.key == f.key } }
         _state.update { it.copy(djiFiles = left, totalBytes = left.sumOf { f -> f.sizeBytes }) }
         if (left.isNotEmpty()) notice("${left.size} files not uploaded yet; downloaded copies are kept for a retry.")
@@ -693,18 +700,43 @@ class HomeViewModel(
 
     private fun stagingDir() = File(context.getExternalFilesDir(null) ?: context.filesDir, "camera-staging")
 
-    @RequiresApi(Build.VERSION_CODES.Q)
-    private fun stager(link: CameraLink) = CameraStager(link, stagingDir())
+    private fun stager() = CameraStager(stagingDir())
+
+    /** Size of the camera downloads kept on the phone (nothing else lists them after a restart). */
+    private fun refreshStaged() = viewModelScope.launch {
+        val (count, bytes) = withContext(Dispatchers.IO) {
+            val files = stager().filesOnDisk()
+            files.size to files.sumOf { it.length() }
+        }
+        _state.update { it.copy(stagedCount = count, stagedBytes = bytes) }
+    }
+
+    /** Deletes the camera copies kept on the phone; the files themselves stay on the camera. */
+    fun clearStagedDownloads() {
+        if (_state.value.uploadRunning) return
+        viewModelScope.launch {
+            val freed = withContext(Dispatchers.IO) { stager().clearAll() }
+            _state.update { st ->
+                st.copy(
+                    // Still on the camera, just without a local copy: uploading again downloads them.
+                    djiFiles = st.djiFiles.map { f -> if (f.file != null) f.copy(file = null) else f },
+                    stagedCount = 0,
+                    stagedBytes = 0,
+                    notice = if (freed > 0) "Freed ${formatSize(freed)}. The files are still on the camera." else "No downloaded camera copies to clear.",
+                )
+            }
+        }
+    }
 
     /** Download every file; returns local copies of the ones that completed, or null if it couldn't start. */
     @RequiresApi(Build.VERSION_CODES.Q)
     private suspend fun stageFromCamera(link: CameraLink, files: List<DjiFile>): List<DjiFile>? = withContext(Dispatchers.IO) {
-        val stager = stager(link)
+        val stager = stager()
         val dir = stagingDir().apply { mkdirs() }
         val need = stager.bytesNeeded(files)
         val free = StatFs(dir.path).availableBytes
         if (need > free - FREE_SPACE_MARGIN) {
-            notice("Not enough space on the phone: need ${formatSize(need)}, ${formatSize(free)} free. Pick fewer files or use stream mode.")
+            notice("Not enough space on the phone: need ${formatSize(need)}, ${formatSize(free)} free. Pick fewer files, clear the downloaded copies below, or use stream mode.")
             return@withContext null
         }
         val tracker = ProgressTracker()
@@ -719,7 +751,7 @@ class HomeViewModel(
             notice("Downloading ${i + 1} of ${files.size} from the camera")
             UploadService.update(context, "Downloading ${f.displayName} from the camera", i, files.size)
             try {
-                val local = stager.download(f, { batchCancelled }) { got ->
+                val local = stager.download(link, f, { batchCancelled }) { got ->
                     if (fp.trackUpload(got, f.sizeBytes)) emit()
                 }
                 fp.status = UploadStatus.QUEUED
@@ -736,6 +768,7 @@ class HomeViewModel(
         // Remember the local copies so a failed or cancelled upload can be retried without the camera.
         val stagedKeys = staged.associateBy { it.key }
         _state.update { st -> st.copy(djiFiles = st.djiFiles.map { stagedKeys[it.key] ?: it }) }
+        refreshStaged()
         staged
     }
 

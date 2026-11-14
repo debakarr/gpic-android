@@ -125,10 +125,14 @@ class CameraHttpSource(
 }
 
 /** Download-first mode: copy camera files into app storage, resuming partial files. */
-@RequiresApi(Build.VERSION_CODES.Q)
-class CameraStager(private val link: CameraLink, private val dir: File) {
+class CameraStager(private val dir: File) {
 
     fun stagedFile(f: DjiFile): File = File(dir, f.displayName)
+
+    /** Complete copies kept for a retry, plus partial downloads, left in [dir]. */
+    fun filesOnDisk(): List<File> = dir.listFiles()?.filter { it.isFile }.orEmpty()
+
+    fun bytesOnDisk(): Long = filesOnDisk().sumOf { it.length() }
 
     /** Bytes still to download for [files] (partial files count only their remainder). */
     fun bytesNeeded(files: List<DjiFile>): Long =
@@ -138,7 +142,8 @@ class CameraStager(private val link: CameraLink, private val dir: File) {
      * Download [f] (or finish a partial copy). [onBytes] gets the file's running total.
      * @return the complete local file.
      */
-    fun download(f: DjiFile, isCancelled: () -> Boolean, onBytes: (Long) -> Unit): File {
+    @RequiresApi(Build.VERSION_CODES.Q)
+    fun download(link: CameraLink, f: DjiFile, isCancelled: () -> Boolean, onBytes: (Long) -> Unit): File {
         // Nothing to compare a download against: an empty "copy" would only fail later as a missing file.
         if (f.sizeBytes <= 0) throw IOException("The camera didn't report the size of ${f.displayName}")
         dir.mkdirs()
@@ -166,6 +171,14 @@ class CameraStager(private val link: CameraLink, private val dir: File) {
 
     /** Remove staged copies (after upload, or when the user clears the camera selection). */
     fun clean(files: List<DjiFile>) = files.forEach { stagedFile(it).delete() }
+
+    /** Delete every downloaded copy, complete or partial; returns the bytes freed. */
+    fun clearAll(): Long {
+        val files = filesOnDisk()
+        val freed = files.sumOf { it.length() }
+        files.forEach { it.delete() }
+        return freed
+    }
 }
 
 const val DELETE_UNSUPPORTED = "deleting from the camera over WiFi isn't supported yet"

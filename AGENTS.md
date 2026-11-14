@@ -8,7 +8,7 @@
 
 - **Package:** `com.gpic.android`
 - **App entry:** `MainActivity` → Compose NavHost (home/auth/settings)
-- **Current version:** `1.9.0 (22)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
+- **Current version:** `1.9.1 (23)` — see `app/build.gradle.kts` (`versionCode`/`versionName` + `releaseVersion`)
 - **Repo:** `github.com/debakarr/gpic-android` (private), branch `main`
 
 ## Tech Stack
@@ -146,6 +146,10 @@ Sizes: the DUML manifest's size is u32, so videos over 4 GB (an 8-min 4K60 clip 
 total of a 1-byte Range read, HEAD Content-Length) and `SizeProbe` (pure, tested) checks a candidate with Range reads
 at size−1 / size (a wrapped size fails: the byte after it exists), else finds the end by doubling + bisection. Run for
 0-byte files after listing and for every selected video before a transfer. Not yet tried on a real > 4 GB file.
+Downloaded copies live in `getExternalFilesDir(null)/camera-staging` (Android's "Clear cache" doesn't touch it), are
+resumed by file length, and are deleted per file only after a completed/skipped/rejected upload. A cancelled or failed
+run leaves whole files and partial downloads there, so the Camera tab shows their count/size with a Clear action
+(`CameraStager.clearAll`, removed copies make the next upload download them again).
 
 ### Photo location (GPS) — read originals
 Android 10+ zero-fills GPS in photos it hands to apps without `ACCESS_MEDIA_LOCATION`, so a plain
